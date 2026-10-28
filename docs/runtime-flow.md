@@ -1,6 +1,6 @@
 # 运行逻辑说明（v0.4 动态编排）
 
-> 当前对话主链为 Intent Enricher → Planner → Tool → Observation → Replan。第 3、15、17、26 节中出现的固定 Router 流程属于 v0.3 历史实现；当前实现以 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) 为准。
+> 当前对话主链为 Intent Enricher → Planner → Tool → Observation → Replan。本文件描述 v0.4 当前实现，不再混入旧 Router 主链。
 
 ## 1. 启动
 
@@ -30,33 +30,29 @@ sequenceDiagram
     participant U as User
     participant W as Web
     participant C as ConversationService
-    participant R as Router Agent
-    participant RS as RunService
-    participant A as Chat Agent
-    participant G as DS Workflow
+    participant O as OrchestratorService
+    participant P as Planner
+    participant T as Tool Registry
+    participant E as Tool Handler
     participant DB as SQLite
     U->>W: 消息 + 可选文档
     W->>C: POST /conversations/{id}/messages
-    C->>R: 判断 chat / DS / RTL / EDA / testcase
-    alt 普通讨论
-        R-->>C: chat
-        C->>A: 最近对话、项目、模块、文档
-        A-->>W: 普通回答
-    else 明确 DS 交付
-        R-->>C: ds_workflow
-        C->>RS: 先创建 ds_design Run
-        RS->>G: 创建专业 DS Task
-        G-->>C: delivered 或 interrupt
-        RS->>DB: Run + RunEvent + Task 快照
-        C-->>W: RunView + 兼容 TaskView
-    else RTL 或工程任务
-        R-->>C: rtl/lint/sim/cdc/synthesis/sta/test
-        C->>RS: 创建对应 Run
-        RS-->>W: 执行、等待审批或能力缺失
+    C->>O: message + history + documents
+    O->>O: enrich TaskIntent
+    O->>DB: create Unified Run
+    loop 最多 6 个 Planner Step
+        O->>P: Intent + Tool Schema + Observations
+        P-->>O: ToolSelection
+        O->>T: 解析 Tool + Policy 校验
+        T->>E: 调用受控 Handler
+        E-->>O: Observation / 专业对象 ID
+        O->>DB: RunEvent + result/status
     end
+    O-->>C: orchestrated ChatResponse
+    C-->>W: assistant + RunView + 可选 TaskView
 ```
 
-上传文件只增加上下文，不自动触发流程。用户决定任务阶段；Router 只识别明确动作，不会因存在文档自动推进。明确 DS 任务必须至少包含 AS。
+上传文件只增加上下文，不自动触发流程。用户决定任务目标和研发阶段；Intent Enricher 只整理有证据的信息，Planner 根据目标选择 Tool。明确 DS 任务必须至少包含 AS，否则 `ask_user` 让 Run 进入 `waiting_for_user`。
 
 统一 Run 和专业执行记录分层：
 
@@ -146,7 +142,7 @@ sequenceDiagram
 - `custom`：保存自定义原则；当前版本尚未自动重新生成 Patch；
 - `explain`：保持当前问题活跃。
 
-因此 v0.2 已实现“单问题展示和决策记录”，但“自动修复 → 应用 → 最小复验 → resolved/reopened”仍是下一步。
+当前 v0.4 已实现“单问题展示和决策记录”，但“自动修复 → 应用 → 最小复验 → resolved/reopened”仍是下一步。
 
 ## 8. 模型选择
 
@@ -308,11 +304,11 @@ flowchart TD
 ## 15. 普通聊天详细流程
 
 1. 前端截取最近 20 条消息，连同项目、模块、当前问题和可选文档发送；
-2. ConversationService 调用 Runtime 的 Router；
-3. Deterministic Router 使用明确动作词和 DS/RTL/EDA/用例目标词组合判断；真实 Router 使用结构化 JSON；
-4. route 为 chat 时，不校验 AS，也不创建 Task；
-5. Chat Agent 接收历史、项目、模块和文档上下文；
-6. 返回 `ChatResponse`，其中 `task=null`，前端显示“普通聊天”标签。
+2. ConversationService 将请求统一交给 OrchestratorService；
+3. Runtime 形成 TaskIntent，Planner 从完整 Tool Schema 中选择下一步；
+4. 普通问答选择 `reply_to_user`，不校验 AS，也不创建 DS Task；
+5. Chat Tool 接收历史、项目、模块和文档上下文并形成 Observation；
+6. Run 以 `run_type=chat` 完成，返回 `ChatResponse`，其中 `route=orchestrated`、`task=null`。
 
 聊天历史目前只由浏览器提交，后端没有 Conversation 表。`session_id` 用于响应关联，但尚未形成可恢复的服务端会话。
 
@@ -342,7 +338,7 @@ Architecture、Design、Verification 从 `prepare_context` 扇出，三者全部
 
 ### 16.3 模型调用数量
 
-真实模型模式下，一次无冲突、无自定义 Reviewer 的 DS 通常包括 Router、三个分析、冲突检测、DS 生成和四个 Review。实际调用数会随路径和格式修复增加，因此生产化需要按节点记录 Token、耗时和费用。
+真实模型模式下，一次无冲突、无自定义 Reviewer 的 DS 通常包括 Intent Enricher、Planner、三个分析、冲突检测、DS 生成和四个 Review。实际调用数会随重新规划、讨论和格式修复增加，因此生产化需要按步骤记录 Token、耗时和费用。
 
 ## 17. DS 正常路径时序
 
@@ -602,8 +598,9 @@ stateDiagram-v2
 ```text
 用户上传 FS/AS/ICD
 → 发送“生成 dma_ctrl DS”
-→ Router 选择 ds_workflow
-→ RunService 创建 ds_design Run
+→ Intent Enricher 形成 TaskIntent
+→ Planner 选择 create_ds_candidate
+→ Orchestrator 创建并更新 ds_design Run
 → 三角色分析、冲突检测
 → 无冲突：生成 DS、四类评审、保存 Task
 → 用户打开工程工作台
@@ -641,7 +638,7 @@ stateDiagram-v2
 
 `tests/conftest.py` 在测试收集阶段设置 `CHIP_AGENT_MODEL_ENABLED=false`。因此：
 
-- Router、Chat、DS、RTL 都走 Deterministic Runtime；
+- Intent Enricher、Planner、Chat、DS、RTL 都走 Deterministic Runtime；
 - 不读取用户保存的启用状态发起模型请求；
 - 测试结果不受网络、配额或模型版本影响；
 - Provider JSON 测试通过 Mock 单独验证格式修复；
@@ -661,4 +658,4 @@ stateDiagram-v2
 | Patch Ready | 是 | 可批准/拒绝 | 是，但依赖目标未变化 |
 | 已应用 Patch | 是 | 不自动回滚 | 历史保留 |
 
-“可查询”“可继续”和“精确恢复”是三个不同能力。当前 v0.2 主要完成前两者的一部分，不能描述为完整容错工作流。
+“可查询”“可继续”和“精确恢复”是三个不同能力。当前 v0.4 完成了专业对象的查询和部分恢复，但仍不能描述为完整容错工作流。

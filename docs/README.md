@@ -7,7 +7,7 @@
 | 文档 | 关注内容 | 推荐读者 |
 |---|---|---|
 | [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) | Intent Enricher、Planner–Executor Loop、Chat Tool 和动态 Tool Calling | 所有人，建议首先阅读 |
-| [architecture-overview-v0.4.md](architecture-overview-v0.4.md) | v0.4 系统上下文、动态编排、控制面、数据与安全边界 | 架构师、技术负责人 |
+| [architecture-overview.md](architecture-overview.md) | 系统上下文、动态编排、控制面、数据与安全边界 | 架构师、技术负责人 |
 | [codebase-guide.md](codebase-guide.md) | 目录结构、文件职责、扩展入口 | 开发和维护人员 |
 | [runtime-flow.md](runtime-flow.md) | 对话、DS、RTL、ToolRun、Issue 与恢复流程 | 开发、测试、问题定位人员 |
 | [components-and-interfaces.md](components-and-interfaces.md) | 组件、角色、HTTP API、领域对象和配置 | 前后端和集成人员 |
@@ -53,7 +53,7 @@ ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：所�
 ## 推荐阅读顺序
 
 1. [v0.4 动态编排](dynamic-orchestration-v0.4.md)；
-2. [总体架构](architecture-overview-v0.4.md)；
+2. [总体架构](architecture-overview.md)；
 3. [运行逻辑](runtime-flow.md)；
 4. [组件与接口](components-and-interfaces.md)；
 5. [编排与 Skill](orchestration-and-skills.md)；

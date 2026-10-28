@@ -21,16 +21,18 @@
 
 ```text
 POST /conversations/{session_id}/messages
-→ Router 输出结构化 route
-→ RunService 进行确定性校验和落库
-→ DS Workflow / RTLService / ToolRunService
+→ OrchestratorService 形成 TaskIntent 并创建 Run
+→ Planner 通过原生 Function Calling 选择 Tool
+→ Registry / Policy 校验权限、参数和审批
+→ Tool Handler 执行并返回 Observation
+→ 重新规划、等待用户或完成
 ```
 
 `/tasks/ds`、`/rtl/candidates`、`/tool-runs` 继续保留，用于自动化测试、调试和其他系统集成；它们不是普通用户需要理解的主要入口。
 
 ## 3. 为什么模型不能直接执行
 
-路由模型只返回任务类别和理由。真正执行前，由确定性代码检查：
+模型只返回 ToolSelection，不直接执行动作。真正执行前，由确定性代码检查：
 
 - 用户是否明确要求动作；
 - 是否有 AS、已确认 DS、Workspace 等必需输入；

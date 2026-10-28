@@ -35,10 +35,10 @@ git diff --check
 文档与 PDF 检查结果：
 
 - 面试题标题计数为 100，未丢题或重复编号；
-- 架构 PDF 共 14 页，页面尺寸统一为 A4（595.3 × 841.9 pt）；
+- 架构 PDF 共 15 页，页面尺寸统一为 A4（595.3 × 841.9 pt）；
 - PDF 元数据标题为 `ChipFlow Architecture Overview v0.4`；
 - 文本提取未发现 Unicode 替换字符，也没有异常短页；
-- 14 页全部渲染为 PNG 进行联系表检查，系统上下文、控制面、信任边界和 Windows 部署图均完整可读；
+- 15 页全部渲染为 PNG 进行联系表检查；系统上下文已拆成入口边界、统一编排、Tool 执行边界和依赖表，控制面、信任边界与 Windows 部署图均完整可读；
 - PDF 中未残留旧版 `Router` 架构表述。
 
 测试环境强制设置 `CHIP_AGENT_MODEL_ENABLED=false`，不会读取开发者保存的 API Key 或消耗模型额度。Provider 的两种原生 Tool Calling 协议使用模拟 SDK 返回值进行单元测试。

@@ -9,7 +9,8 @@
 | React Workspace | 用户输入、上传文件 | 对话、DS、Diff、Run、Issue | 浏览器内存 |
 | API Router | HTTP | JSON/结构化错误 | 无 |
 | ConversationService | 消息、历史、文档和工程上下文 | 普通回答或统一 Run | 间接 |
-| RunService | 结构化路由、用户指令 | Run、事件、专业执行记录关联 | SQLite |
+| OrchestratorService | 消息、历史、文档、Tool Catalog | TaskIntent、Tool Call、Observation、Run | SQLite（经 RunService） |
+| RunService | Intent、Tool 执行结果、用户指令 | Run、事件、专业执行记录关联 | SQLite |
 | TaskService | DS 请求/用户结论 | TaskView | SQLite 快照 + 热内存 |
 | DS Workflow | DSWorkflowState | delivered/interrupt | MemorySaver |
 | Agent Runtime | 角色请求 | 文本或结构化输出 | 无 |
@@ -27,9 +28,8 @@
 
 | ID | 职责 | 当前使用位置 |
 |---|---|---|
-| `orchestrator` | 根据用户明确目标选择 Workflow/Tool，不决定研发阶段 | ConversationService + RunService |
-| `conversation_router` | chat/DS/RTL/EDA/用例任务分类 | `/chat`、`/conversations/{id}/messages` |
-| `chat` | 普通技术问答 | `/chat` |
+| `orchestrator` | 整理 TaskIntent、动态选择 Tool，不决定研发阶段 | OrchestratorService + Planner Loop |
+| `chat` | 普通技术问答 | `reply_to_user` Tool |
 | `architecture_advisor` | 解释和质疑规格，不修改 FS/AS/ICD | DS Workflow |
 | `design` | DS/RTL 候选及设计侧工具判断 | DS Workflow、RTLService |
 | `verification` | 可验证性分析、已有用例与验证侧工具 | DS Workflow、Tool 权限 |
@@ -45,10 +45,16 @@
 
 | Tool | 允许角色 | Mutability | 需批准 | 行为 |
 |---|---|---|---|---|
+| `reply_to_user` | Orchestrator/Chat | read | 否 | 普通问答、解释和总结 |
+| `ask_user` | Orchestrator | read | 否 | 缺少关键输入时暂停 Run |
+| `consult_*_agent` | Orchestrator、对应生产角色 | analysis | 否 | 获得架构、设计或验证 Observation |
+| `create_ds_candidate` | Orchestrator、Design | candidate_write | 否 | 启动 DS 候选与评审子流程 |
+| `create_rtl_candidate` | Orchestrator、Design | candidate_write | 否 | 生成 RTL Candidate 与 Patch |
+| `report_capability_gap` | Orchestrator | read | 否 | 明确报告 Adapter 未接入并暂停 |
 | `discover_testcases` | Design、Verification | read | 否 | 扫描 Workspace 的已有验证文件 |
 | `verilator_lint` | Design、Verification | execution | 是 | 受控执行 Verilator `--lint-only -Wall` |
 
-注册契约还包括幂等性和超时。新增 Sim/CDC/综合/STA 应沿用同一接口，不应把工具决策硬编码在 Agent 提示词中。
+注册契约还包括 `when_to_use`、`when_not_to_use`、输入/输出 JSON Schema、前置条件、副作用、执行类型、幂等性和超时。新增 Sim/CDC/综合/STA 应沿用同一接口，不应把工具决策硬编码在 Agent 提示词中。
 
 ## 4. HTTP API
 
@@ -200,7 +206,7 @@
 
 ## 7. SQLite Schema
 
-v0.3 新增：
+统一控制面表：
 
 | 表 | 作用 |
 |---|---|
@@ -243,5 +249,5 @@ OPENAI_API_KEY / OPENAI_BASE_URL
 | 安全 | DPAPI、Workspace 隔离、无 Shell 拼接、Patch 审批；无用户 ACL |
 | 可观测 | 请求编号、事件、Tool 日志、自检；无指标和 Trace |
 | 扩展 | Registry/Adapter 结构已具备；商业 EDA 尚未接入 |
-| 测试 | 40 项后端测试 + TypeScript/Vite 构建 |
+| 测试 | 51 项后端测试 + TypeScript/Vite 构建 |
 | 审计 | 来源、Diff、日志、用户决策已保存；缺少统一 Actor/时间线 |

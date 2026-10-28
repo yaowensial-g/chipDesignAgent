@@ -34,6 +34,8 @@ chipDesignAgent/
 ├─ PRD_v0.2.md       当前需求基线
 ├─ SELF_VALIDATION_v0.1.md
 ├─ SELF_VALIDATION_v0.2.md
+├─ SELF_VALIDATION_v0.3.md
+├─ SELF_VALIDATION_v0.4.md
 └─ pyproject.toml
 ```
 
@@ -43,7 +45,7 @@ chipDesignAgent/
 
 ### `app/main.py`
 
-- FastAPI v0.2.0；
+- FastAPI 应用入口，项目版本 v0.4.0；
 - CORS；
 - 请求编号；
 - 模型、配置和未知异常的结构化错误；
@@ -55,7 +57,7 @@ chipDesignAgent/
 
 ### `app/domain/models.py` 与 `enums.py`
 
-除 v0.1 的文档、Task、Issue、Finding、模型设置外，新增：
+除文档、Task、Issue、Finding、模型设置等既有契约外，v0.4 还包含：
 
 - `WorkspaceView`、`ArtifactView`；
 - `RTLCandidateRequest/Response`；
@@ -70,12 +72,20 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ## 3. 编排、Agent 与 DS 工作流
 
+### `app/services/orchestrator_service.py`
+
+- 接收所有聊天入口请求并形成 `TaskIntent`；
+- 创建 Unified Run；
+- 把 Tool Catalog 交给真实模型 Function Calling 或 Deterministic Planner；
+- 执行最多六步的 Planner → Tool → Observation 循环；
+- 将普通聊天、角色咨询、DS、RTL 和工程 Tool 纳入同一控制面。
+
 ### `app/services/run_service.py`
 
 统一控制面服务，负责：
 
-- 将 Router 输出映射为 `RunType`；
-- 先落库 Run，再调用 DS Workflow、RTLService 或 ToolRunService；
+- 接收 Orchestrator 的 Tool 执行结果并维护 `RunType`；
+- 先落库 Run，再关联 DS Workflow、RTLService 或 ToolRunService 的专业记录；
 - 把 `Task/ToolRun/Patch` ID 关联到 Run，而不是复制专业执行逻辑；
 - 保存等待用户、等待审批、能力缺失和执行完成等状态；
 - 持久化 RunEvent；
@@ -93,13 +103,13 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 - `DeterministicAgentRuntime`：离线测试和演示；
 - `LLMChipDesignRuntime`：真实提示词和结果归一化；
 - `ConfigurableAgentRuntime`：按当前设置动态选择；
-- 支持聊天、DS 分析/生成/评审和 RTL 候选生成。
+- 支持 TaskIntent、ToolSelection、聊天、DS 分析/生成/评审和 RTL 候选生成。
 
 真实模型 Runtime 会通过 `app/skills/registry.py` 加载根目录 `skills/**/*.md`。Skill 提供专业分析步骤和禁止事项，但没有 Workspace、数据库或进程执行权限；确定性测试 Runtime 不依赖模型 Skill 才能运行。
 
 ### `app/workflows/ds_workflow.py`
 
-保留 v0.1 的 LangGraph DS 流程：三个生产角色分析、冲突检测、固定轮次讨论、用户 Interrupt、DS 生成及并行评审。内部 Checkpointer 仍是 `MemorySaver`。
+作为 `create_ds_candidate` 的内部兼容执行器，保留已验证的 LangGraph DS 子流程：三个生产角色分析、冲突检测、有限轮次讨论、用户 Interrupt、DS 生成及并行评审。内部 Checkpointer 仍是 `MemorySaver`，但它不再承担顶层请求路由。
 
 ### `app/services/task_service.py`
 
