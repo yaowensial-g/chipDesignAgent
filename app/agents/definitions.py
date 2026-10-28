@@ -1,0 +1,99 @@
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class AgentDefinition:
+    agent_id: str
+    display_name: str
+    prompt_version: str
+    read_only: bool
+    purpose: str
+
+
+AGENTS: dict[str, AgentDefinition] = {
+    "orchestrator": AgentDefinition(
+        agent_id="orchestrator",
+        display_name="Orchestrator Agent",
+        prompt_version="v2",
+        read_only=True,
+        purpose="依据用户明确目标编排生产角色、评审角色和 Tool，不自行决定研发阶段。",
+    ),
+    "conversation_router": AgentDefinition(
+        agent_id="conversation_router",
+        display_name="对话路由 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="判断用户请求应进入普通聊天还是 DS Multi-Agent 工作流。",
+    ),
+    "chat": AgentDefinition(
+        agent_id="chat",
+        display_name="聊天 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="结合会话、项目和已上传文档上下文回答普通问题。",
+    ),
+    "architecture_advisor": AgentDefinition(
+        agent_id="architecture_advisor",
+        display_name="Architecture Agent",
+        prompt_version="v2",
+        read_only=True,
+        purpose="解释并质疑 FS、AS 和 ICD，不作正式架构决策。",
+    ),
+    "design": AgentDefinition(
+        agent_id="design",
+        display_name="Design Agent",
+        prompt_version="v2",
+        read_only=False,
+        purpose="在架构基线约束下生成 DS、RTL 候选并调用设计侧工程 Tool。",
+    ),
+    "verification": AgentDefinition(
+        agent_id="verification",
+        display_name="Verification Agent",
+        prompt_version="v2",
+        read_only=True,
+        purpose="理解验证环境、执行已有用例并在明确验证任务下维护验证资产。",
+    ),
+    "spec_reviewer": AgentDefinition(
+        agent_id="spec_reviewer",
+        display_name="规格一致性评审 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="独立检查规格与 DS 的一致性。",
+    ),
+    "microarchitecture_reviewer": AgentDefinition(
+        agent_id="microarchitecture_reviewer",
+        display_name="微架构评审 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="独立检查电路设计的完整性和可实现性。",
+    ),
+    "verification_reviewer": AgentDefinition(
+        agent_id="verification_reviewer",
+        display_name="可验证性评审 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="独立检查 DS 是否具备可验证行为。",
+    ),
+    "interface_reviewer": AgentDefinition(
+        agent_id="interface_reviewer",
+        display_name="接口一致性评审 Agent",
+        prompt_version="v1",
+        read_only=True,
+        purpose="独立检查外部接口引用和内部接口定义。",
+    ),
+    "specialist_reviewer": AgentDefinition(
+        agent_id="specialist_reviewer",
+        display_name="Specialist Reviewer",
+        prompt_version="v2",
+        read_only=True,
+        purpose="按任务加载 CDC、低功耗、安全、DFT、PPA 或时序专项检查清单。",
+    ),
+}
+
+
+DEFAULT_AGENT_IDS = tuple(
+    agent_id
+    for agent_id in AGENTS
+    if agent_id not in {"orchestrator", "conversation_router", "chat", "specialist_reviewer"}
+)
+

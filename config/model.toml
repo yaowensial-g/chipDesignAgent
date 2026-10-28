@@ -1,0 +1,10 @@
+[model]
+# The deterministic runtime remains active until a key is configured and this is enabled.
+enabled = false
+provider = "deepseek"
+api_style = "responses"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+timeout_seconds = 120
+max_output_tokens = 6000
+

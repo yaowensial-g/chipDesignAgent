@@ -1,0 +1,163 @@
+import json
+import os
+import threading
+import tomllib
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from uuid import uuid4
+
+from app.config.secret_protection import protect_secret, unprotect_secret
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "model.toml"
+SAVED_CONFIG_PATH = PROJECT_ROOT / "data" / "model_settings.json"
+
+
+@dataclass(frozen=True)
+class EffectiveModelSettings:
+    enabled: bool
+    provider: str
+    api_style: str
+    model: str
+    base_url: str
+    api_key: str
+    timeout_seconds: int
+    max_output_tokens: int
+    api_key_source: str
+
+    @property
+    def ready(self) -> bool:
+        return self.enabled and bool(self.api_key.strip())
+
+
+class ModelSettingsService:
+    """Loads defaults and persists local overrides without exposing secrets."""
+
+    def __init__(
+        self,
+        default_path: Path = DEFAULT_CONFIG_PATH,
+        saved_path: Path = SAVED_CONFIG_PATH,
+    ) -> None:
+        self.default_path = default_path
+        self.saved_path = saved_path
+        self._lock = threading.RLock()
+
+    def effective(self) -> EffectiveModelSettings:
+        with self._lock:
+            defaults = self._load_defaults()
+            saved = self._load_saved()
+
+        provider = str(value_from_sources(saved, defaults, "provider", "CHIP_AGENT_MODEL_PROVIDER"))
+        key_environment_name = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPENAI_API_KEY"
+        base_url_environment_name = "DEEPSEEK_BASE_URL" if provider == "deepseek" else "OPENAI_BASE_URL"
+        environment_key = os.getenv(key_environment_name, "").strip()
+        saved_key = ""
+        provider_key_field = f"{provider}_api_key_protected"
+        if saved.get(provider_key_field):
+            saved_key = unprotect_secret(str(saved[provider_key_field])).strip()
+        elif provider == "openai" and saved.get("api_key_protected"):
+            saved_key = unprotect_secret(str(saved["api_key_protected"])).strip()
+        elif provider == "openai" and saved.get("api_key"):
+            # One-time compatibility for an earlier local development format.
+            saved_key = str(saved["api_key"]).strip()
+        api_key = environment_key or saved_key
+        key_source = "environment" if environment_key else ("saved" if saved_key else "none")
+
+        def value(name: str, environment_name: str | None = None):
+            return value_from_sources(saved, defaults, name, environment_name)
+
+        return EffectiveModelSettings(
+            enabled=_as_bool(value("enabled", "CHIP_AGENT_MODEL_ENABLED")),
+            provider=provider,
+            api_style=str(value("api_style", "CHIP_AGENT_API_STYLE")),
+            model=str(value("model", "CHIP_AGENT_MODEL")),
+            base_url=str(value("base_url", base_url_environment_name)).rstrip("/"),
+            api_key=api_key,
+            timeout_seconds=int(value("timeout_seconds", "CHIP_AGENT_MODEL_TIMEOUT")),
+            max_output_tokens=int(value("max_output_tokens", "CHIP_AGENT_MAX_OUTPUT_TOKENS")),
+            api_key_source=key_source,
+        )
+
+    def save(self, updates: dict[str, object]) -> EffectiveModelSettings:
+        with self._lock:
+            current = self._load_saved()
+            updates = dict(updates)
+            clear_api_key = bool(updates.pop("clear_api_key", False))
+            api_key = updates.pop("api_key", None)
+            current.update({key: value for key, value in updates.items() if value is not None})
+            provider = str(current.get("provider", self._load_defaults()["provider"]))
+            provider_key_field = f"{provider}_api_key_protected"
+            if clear_api_key:
+                current.pop(provider_key_field, None)
+                if provider == "openai":
+                    current.pop("api_key", None)
+                    current.pop("api_key_protected", None)
+            elif isinstance(api_key, str) and api_key.strip():
+                current[provider_key_field] = protect_secret(api_key.strip())
+                if provider == "openai":
+                    current.pop("api_key", None)
+                    current.pop("api_key_protected", None)
+
+            self.saved_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.saved_path.with_name(f"model_settings.{uuid4().hex}.tmp")
+            temporary.write_text(
+                json.dumps(current, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(self.saved_path)
+        return self.effective()
+
+    def public_view(self) -> dict[str, object]:
+        settings = self.effective()
+        view = asdict(settings)
+        view.pop("api_key")
+        view["has_api_key"] = bool(settings.api_key)
+        view["api_key_masked"] = _mask_key(settings.api_key)
+        view["ready"] = settings.ready
+        return view
+
+    def _load_defaults(self) -> dict[str, object]:
+        with self.default_path.open("rb") as stream:
+            payload = tomllib.load(stream)
+        return payload["model"]
+
+    def _load_saved(self) -> dict[str, object]:
+        if not self.saved_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.saved_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("Saved model settings are not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Saved model settings must be a JSON object")
+        return payload
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def value_from_sources(
+    saved: dict[str, object],
+    defaults: dict[str, object],
+    name: str,
+    environment_name: str | None = None,
+):
+    if environment_name and os.getenv(environment_name) is not None:
+        return os.environ[environment_name]
+    return saved.get(name, defaults[name])
+
+
+def _mask_key(api_key: str) -> str | None:
+    if not api_key:
+        return None
+    if len(api_key) <= 8:
+        return "•" * len(api_key)
+    return f"{api_key[:3]}{'•' * 8}{api_key[-4:]}"
+
+
+model_settings_service = ModelSettingsService()
+
