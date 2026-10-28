@@ -28,43 +28,13 @@ class DeterministicAgentRuntime:
         ]
 
     @staticmethod
-    def route_conversation(request: dict[str, Any]) -> dict[str, str]:
-        message = re.sub(r"\s+", "", request["message"].lower())
-        create_action = r"生成|编写|撰写|完成|输出|创建|评审|审查|修改|更新|实现|review"
-        execute_action = r"执行|运行|开始|跑一下|run"
-
-        routes = (
-            ("ds_workflow", create_action, r"ds|详细设计|设计说明"),
-            ("rtl_workflow", create_action, r"rtl|systemverilog|verilog|硬件代码"),
-            ("lint_workflow", execute_action, r"lint|verilator|静态检查"),
-            ("simulation_workflow", execute_action, r"simulation|sim|仿真"),
-            ("cdc_workflow", execute_action, r"cdc|跨时钟"),
-            ("synthesis_workflow", execute_action, r"synthesis|综合"),
-            ("sta_workflow", execute_action, r"sta|时序分析|静态时序"),
-            ("test_execution_workflow", execute_action, r"testcase|用例|回归"),
-        )
-        for route, action, target in routes:
-            if re.search(rf"(?:{action}).{{0,16}}(?:{target})", message):
-                return {
-                    "route": route,
-                    "reason": f"检测到用户明确要求启动 {route}",
-                }
-        for route, action, target in routes:
-            if re.search(rf"(?:{target}).{{0,16}}(?:{action})", message):
-                return {
-                    "route": route,
-                    "reason": f"检测到用户明确要求启动 {route}",
-                }
-        return {"route": "chat", "reason": "普通问答或讨论请求"}
-
-    @staticmethod
     def chat(request: dict[str, Any]) -> str:
         message = request["message"].strip()
         lowered = message.lower()
         if any(token in lowered for token in ("你好", "hello", "hi", "嗨")):
             return "你好。你可以直接和我讨论芯片架构、RTL、验证方法或这个项目本身；只有明确要求完成 DS、RTL 或执行工程任务时，我才会创建统一 Run。"
         if any(token in message for token in ("能做什么", "功能", "怎么用")):
-            return "我可以进行普通技术问答，也可以结合文档讨论规格；当你明确要求完成 DS、RTL、Lint 或已有用例任务时，我会路由到相应 Workflow、角色 Agent 和 Tool。"
+            return "我可以进行普通技术问答，也可以结合文档讨论规格；所有请求都会进入统一编排，普通回答使用 Chat Tool，工程任务由 Planner 动态选择角色 Agent 和受控 Tool。"
         documents = request.get("documents", [])
         document_note = ""
         if documents:
@@ -74,6 +44,113 @@ class DeterministicAgentRuntime:
             "当前处于模拟运行时，聊天路由已经生效，但模拟 Chat Agent 不具备开放式语义推理能力。"
             "请启用 DeepSeek 等真实模型后再次提问。" + document_note
         )
+
+    @staticmethod
+    def enrich_intent(request: dict[str, Any], tool_names: list[str]) -> dict[str, Any]:
+        message = request["message"].strip()
+        compact = re.sub(r"\s+", "", message.lower())
+        candidates: list[str] = []
+        mappings = (
+            ("create_rtl_candidate", r"rtl|systemverilog|verilog|硬件代码"),
+            ("create_ds_candidate", r"ds|详细设计|设计说明"),
+            ("verilator_lint", r"lint|verilator|静态检查"),
+            ("discover_testcases", r"testcase|用例|回归"),
+        )
+        for name, pattern in mappings:
+            if name in tool_names and re.search(pattern, compact):
+                candidates.append(name)
+        if not candidates:
+            candidates.append("reply_to_user")
+        missing_information: list[str] = []
+        if re.search(r"检查一下|看一下|看看|处理一下|帮我弄", compact) and not re.search(
+            r"ds|详细设计|rtl|systemverilog|verilog|lint|仿真|simulation|cdc|综合|synthesis|sta|时序|用例|回归",
+            compact,
+        ):
+            missing_information.append("希望检查的对象和检查方式尚不明确")
+        evidence = [f"用户原始请求：{message}"]
+        if request.get("documents"):
+            evidence.append("当前会话包含受控设计文档")
+        if request.get("workspace_id"):
+            evidence.append("当前会话已选择 Workspace")
+        return {
+            "raw_request": message,
+            "goal": message,
+            "deliverables": [],
+            "target_module": request.get("module_name"),
+            "known_context": {
+                "document_names": [item["name"] for item in request.get("documents", [])],
+                "workspace_id": request.get("workspace_id"),
+                "has_confirmed_ds": bool(request.get("ds_markdown")),
+            },
+            "assumptions": [],
+            "missing_information": missing_information,
+            "candidate_tools": candidates,
+            "acceptance_criteria": [],
+            "evidence": evidence,
+            "confidence": 6,
+        }
+
+    def select_tool(
+        self,
+        request: dict[str, Any],
+        intent: dict[str, Any],
+        tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if intent.get("missing_information"):
+            return {
+                "name": "ask_user",
+                "arguments": {
+                    "question": "你希望我从哪个角度检查：阅读代码并评审、执行 Lint，还是结合规格检查设计一致性？",
+                    "required_fields": ["检查方式"],
+                },
+                "reason": "任务意图存在会显著改变执行路径的缺失信息",
+            }
+        if observations:
+            summaries = [str(item.get("summary", "")) for item in observations if item.get("summary")]
+            return {
+                "name": "reply_to_user",
+                "arguments": {"message": "\n\n".join(summaries) or self.chat(request)},
+                "reason": "已有角色观察结果，向用户汇总",
+            }
+        message = re.sub(r"\s+", "", request["message"].lower())
+        create_action = r"生成|编写|撰写|完成|输出|创建|评审|审查|修改|更新|实现|review"
+        execute_action = r"执行|运行|开始|跑一下|run"
+        choices = (
+            ("create_rtl_candidate", create_action, r"rtl|systemverilog|verilog|硬件代码"),
+            ("create_ds_candidate", create_action, r"ds|详细设计|设计说明"),
+            ("verilator_lint", execute_action, r"lint|verilator|静态检查"),
+            ("discover_testcases", execute_action, r"testcase|用例|回归"),
+        )
+        available = {tool["name"] for tool in tools}
+        for name, action, target in choices:
+            if name in available and (
+                re.search(rf"(?:{action}).{{0,16}}(?:{target})", message)
+                or re.search(rf"(?:{target}).{{0,16}}(?:{action})", message)
+            ):
+                arguments: dict[str, Any] = {}
+                if name == "verilator_lint":
+                    arguments = dict(request.get("tool_arguments") or {})
+                return {"name": name, "arguments": arguments, "reason": "模拟 Planner 选择匹配 Tool"}
+        unsupported = (
+            ("simulation", r"仿真|simulation|sim"),
+            ("cdc", r"cdc|跨时钟"),
+            ("synthesis", r"综合|synthesis"),
+            ("sta", r"sta|时序分析|静态时序"),
+        )
+        if re.search(execute_action, message):
+            for capability, target in unsupported:
+                if re.search(target, message):
+                    return {
+                        "name": "report_capability_gap",
+                        "arguments": {"capability": capability},
+                        "reason": "请求的真实 Tool Adapter 尚未注册",
+                    }
+        return {
+            "name": "reply_to_user",
+            "arguments": {"message": self.chat(request)},
+            "reason": "普通讨论由 Chat Tool 完成",
+        }
 
     def architecture_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -284,44 +361,76 @@ class LLMChipDesignRuntime:
             "history": request.get("history", [])[-20:],
         }
 
-    def route_conversation(self, request: dict[str, Any]) -> dict[str, str]:
-        payload = {
-            "message": request["message"],
-            "recent_history": request.get("history", [])[-8:],
-            "available_documents": [
-                {"kind": document["kind"], "name": document["name"], "version": document["version"]}
-                for document in request.get("documents", [])
-            ],
-        }
-        result = self._provider().generate_json(
-            """你是 ChipFlow 的编排路由 Agent。只识别用户明确要求，不回答问题，也不能自行决定进入下一研发阶段。可选 route：chat、ds_workflow、rtl_workflow、lint_workflow、simulation_workflow、cdc_workflow、synthesis_workflow、sta_workflow、test_execution_workflow。只有用户明确使用生成、实现、执行、运行等动作词并指定交付物或工程阶段时才进入工作流；知识问答、讨论、解释、建议和意图不清晰的请求必须 route=chat。不要因为存在文档就启动任务。输出 JSON 对象：{\"route\":\"上述值之一\",\"reason\":\"简短中文理由\"}。""",
-            payload,
-            operation="对话路由 Agent",
-            expected_shape='{"route":"chat|ds_workflow|rtl_workflow|lint_workflow|simulation_workflow|cdc_workflow|synthesis_workflow|sta_workflow|test_execution_workflow","reason":"中文理由"}',
-        )
-        if not isinstance(result, dict):
-            raise ValueError("路由 Agent 输出必须是 JSON 对象")
-        route = str(result.get("route", "chat"))
-        if route not in {
-            "chat",
-            "ds_workflow",
-            "rtl_workflow",
-            "lint_workflow",
-            "simulation_workflow",
-            "cdc_workflow",
-            "synthesis_workflow",
-            "sta_workflow",
-            "test_execution_workflow",
-        }:
-            route = "chat"
-        return {"route": route, "reason": str(result.get("reason", "路由 Agent 判定"))}
-
     def chat(self, request: dict[str, Any]) -> str:
         payload = self._context(request)
         payload["current_message"] = request["message"]
         return self._provider().generate_text(
             """你是 ChipFlow 的通用聊天 Agent，也熟悉数字芯片架构、RTL 设计和验证。直接回答用户当前问题，不要求用户先上传 FS/AS。若已提供文档，可以把文档作为只读上下文；明确区分文档事实、你的推断和建议，不得虚构文档内容。你可以解释、讨论和提出建议，但不能代表真实架构师修改或批准 FS、AS、ICD。使用中文，回答应清晰且适度简洁。""",
             json_payload(payload),
+        )
+
+    def enrich_intent(self, request: dict[str, Any], tool_names: list[str]) -> dict[str, Any]:
+        payload = self._context(request)
+        payload["raw_request"] = request["message"]
+        payload["workspace_id"] = request.get("workspace_id")
+        payload["has_confirmed_ds"] = bool(request.get("ds_markdown"))
+        payload["available_tools"] = tool_names
+        result = self._provider().generate_json(
+            """你是任务意图完善 Agent。把用户不完整的表达整理成结构化任务意图，但绝不能补造 FS、AS、ICD 中没有的工程事实。保留 raw_request；可从对话、文档清单和 Workspace 得到的内容写入 known_context；低风险默认值写入 assumptions；会显著改变结果的缺失项写入 missing_information。confidence 为 1 到 10。只返回 JSON。""",
+            payload,
+            operation="任务意图完善 Agent",
+            expected_shape='{"raw_request":"原话","goal":"目标","deliverables":[],"target_module":"模块","known_context":{},"assumptions":[],"missing_information":[],"candidate_tools":[],"acceptance_criteria":[],"evidence":[],"confidence":1}',
+        )
+        if not isinstance(result, dict):
+            raise ValueError("任务意图完善 Agent 输出必须是 JSON 对象")
+        result["raw_request"] = request["message"]
+        result.setdefault("goal", request["message"])
+        result.setdefault("target_module", request.get("module_name"))
+        for field in ("deliverables", "assumptions", "missing_information", "candidate_tools", "acceptance_criteria", "evidence"):
+            value = result.get(field, [])
+            result[field] = value if isinstance(value, list) else [str(value)]
+        if not isinstance(result.get("known_context"), dict):
+            result["known_context"] = {}
+        try:
+            result["confidence"] = max(1, min(10, int(result.get("confidence", 5))))
+        except (TypeError, ValueError):
+            result["confidence"] = 5
+        return result
+
+    def select_tool(
+        self,
+        request: dict[str, Any],
+        intent: dict[str, Any],
+        tools: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        payload = self._context(request)
+        payload.update(
+            {
+                "raw_request": request["message"],
+                "task_intent": intent,
+                "workspace_id": request.get("workspace_id"),
+                "has_confirmed_ds": bool(request.get("ds_markdown")),
+                "previous_observations": observations,
+                "already_called_tools": [item.get("tool_name") for item in observations],
+            }
+        )
+        schemas = []
+        for tool in tools:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool["function_description"],
+                        "parameters": tool["input_schema"],
+                    },
+                }
+            )
+        return self._provider().choose_tool(
+            """你是 ChipFlow 的统一任务编排 Agent。所有请求都必须通过 Tool 完成，普通聊天也调用 reply_to_user。根据用户明确目标动态选择一个最合适的下一步 Tool，不得强制套用固定 Workflow，不得自行推进用户未要求的研发阶段。可以先调用角色咨询 Tool 获取观察，再重新规划。若缺失的是权威规格事实、目标文件或必要授权，调用 ask_user；不要猜测。不得重复调用 already_called_tools 中的分析 Tool。候选写入和本地进程必须遵守 Tool 描述及审批策略。""",
+            payload,
+            schemas,
         )
 
     def architecture_analysis(self, request: dict[str, Any]) -> dict[str, Any]:

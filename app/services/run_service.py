@@ -23,17 +23,6 @@ from app.services.workspace_service import WorkspaceService, utc_now, workspace_
 from app.storage.database import Database, database
 
 
-ROUTE_TO_RUN_TYPE = {
-    "ds_workflow": RunType.DS_DESIGN,
-    "rtl_workflow": RunType.RTL_IMPLEMENTATION,
-    "lint_workflow": RunType.LINT,
-    "simulation_workflow": RunType.SIMULATION,
-    "cdc_workflow": RunType.CDC,
-    "synthesis_workflow": RunType.SYNTHESIS,
-    "sta_workflow": RunType.STA,
-    "test_execution_workflow": RunType.TEST_EXECUTION,
-}
-
 TOOL_BY_RUN_TYPE = {
     RunType.LINT: "verilator_lint",
     RunType.TEST_EXECUTION: "discover_testcases",
@@ -63,24 +52,103 @@ class RunService:
         self.tools = tools
         self.workspaces = workspaces
 
-    async def start_from_chat(
+    def create_orchestration_run(
         self,
         session_id: str,
         request: ChatRequest,
-        route: str,
-        reason: str,
-    ) -> tuple[RunView, TaskView | None, str]:
-        run_type = ROUTE_TO_RUN_TYPE[route]
-        run_id = self._create(session_id, request, run_type, reason)
-        self.append_event(run_id, "run_created", f"已创建 {run_type.value} Run。", "orchestrator")
+        intent: dict[str, Any],
+    ) -> str:
+        run_id = self._create(
+            session_id,
+            request,
+            RunType.ORCHESTRATION,
+            "统一 Orchestrator 动态选择 Tool",
+        )
+        self._update(run_id, status=RunStatus.RUNNING, result={"intent": intent, "tool_calls": [], "observations": []})
+        self.append_event(run_id, "run_created", "已创建统一编排 Run。", "orchestrator")
+        self.append_event(run_id, "intent_enriched", "已完成用户意图结构化，原始请求保持不变。", "orchestrator")
+        return run_id
 
-        if run_type == RunType.DS_DESIGN:
-            return await self._start_ds(run_id, request)
-        if run_type == RunType.RTL_IMPLEMENTATION:
-            return self._start_rtl(run_id, request)
-        if run_type in TOOL_BY_RUN_TYPE:
-            return self._start_tool(run_id, request, run_type)
-        return self._unsupported_tool_run(run_id, run_type)
+    def record_orchestration(
+        self,
+        run_id: str,
+        *,
+        intent: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+    ) -> None:
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        result = dict(run.result)
+        result["intent"] = intent
+        result["tool_calls"] = tool_calls
+        result["observations"] = observations
+        self._update(run_id, result=result)
+
+    def complete_reply(self, run_id: str, message: str) -> RunView:
+        self._set_run_type(run_id, RunType.CHAT)
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        result = dict(run.result)
+        result["assistant_message"] = message
+        self._update(run_id, status=RunStatus.COMPLETED, pending=None, result=result)
+        self.append_event(run_id, "tool_completed", "reply_to_user 已完成。", "orchestrator")
+        return self.get(run_id)  # type: ignore[return-value]
+
+    def pause_for_user(
+        self,
+        run_id: str,
+        *,
+        pending_type: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> RunView:
+        pending = {"type": pending_type, "message": message, **(details or {})}
+        self._update(run_id, status=RunStatus.WAITING_FOR_USER, pending=pending)
+        self.append_event(run_id, "input_required", message, "orchestrator")
+        return self.get(run_id)  # type: ignore[return-value]
+
+    async def execute_ds_tool(
+        self, run_id: str, request: ChatRequest
+    ) -> tuple[RunView, TaskView | None, str]:
+        self._set_run_type(run_id, RunType.DS_DESIGN)
+        return await self._start_ds(run_id, request)
+
+    def execute_rtl_tool(
+        self, run_id: str, request: ChatRequest
+    ) -> tuple[RunView, None, str]:
+        self._set_run_type(run_id, RunType.RTL_IMPLEMENTATION)
+        return self._start_rtl(run_id, request)
+
+    def execute_engineering_tool(
+        self,
+        run_id: str,
+        request: ChatRequest,
+        run_type: RunType,
+    ) -> tuple[RunView, None, str]:
+        self._set_run_type(run_id, run_type)
+        return self._start_tool(run_id, request, run_type)
+
+    def report_capability_gap(self, run_id: str, capability: str) -> RunView:
+        mapping = {
+            "simulation": RunType.SIMULATION,
+            "cdc": RunType.CDC,
+            "synthesis": RunType.SYNTHESIS,
+            "sta": RunType.STA,
+        }
+        run_type = mapping.get(capability.lower())
+        if run_type:
+            self._set_run_type(run_id, run_type)
+        pending = {
+            "type": "tool_adapter_required",
+            "capability": capability,
+            "message": f"当前尚未为 {capability} 注册真实 Tool Adapter。",
+        }
+        self._update(run_id, status=RunStatus.WAITING_FOR_USER, pending=pending)
+        self.append_event(run_id, "capability_missing", pending["message"], "orchestrator")
+        return self.get(run_id)  # type: ignore[return-value]
 
     async def _start_ds(
         self, run_id: str, request: ChatRequest
@@ -243,18 +311,6 @@ class RunService:
         self.append_event(run_id, "tool_started", f"已启动 {tool_name}。", "design")
         label = "已有用例发现" if run_type == RunType.TEST_EXECUTION else run_type.value
         return self.get(run_id), None, f"{label} Run 已启动，可在任务面板查看进度。"  # type: ignore[return-value]
-
-    def _unsupported_tool_run(
-        self, run_id: str, run_type: RunType
-    ) -> tuple[RunView, None, str]:
-        pending = {
-            "type": "tool_adapter_required",
-            "run_type": run_type.value,
-            "message": f"当前尚未为 {run_type.value} 注册真实 Tool Adapter。",
-        }
-        self._update(run_id, status=RunStatus.WAITING_FOR_USER, pending=pending)
-        self.append_event(run_id, "capability_missing", pending["message"], "orchestrator")
-        return self.get(run_id), None, pending["message"]  # type: ignore[return-value]
 
     async def resume(self, run_id: str, request: RunResumeRequest) -> RunView:
         run = self.get(run_id)
@@ -463,6 +519,12 @@ class RunService:
                 utc_now(),
                 run_id,
             ),
+        )
+
+    def _set_run_type(self, run_id: str, run_type: RunType) -> None:
+        self.db.execute(
+            "UPDATE runs SET run_type = ?, updated_at = ? WHERE run_id = ?",
+            (run_type.value, utc_now(), run_id),
         )
 
     def _refresh_tool_status(self, row: dict[str, Any]) -> None:

@@ -32,15 +32,7 @@ import type { CandidatePatch, ChatMessage, DiagnosticReport, DocumentKind, Extra
 type InspectorTab = "ds" | "findings" | "activity";
 
 const workflowLabels: Record<WorkflowRoute, string> = {
-  chat: "普通聊天",
-  ds_workflow: "DS 任务",
-  rtl_workflow: "RTL 任务",
-  lint_workflow: "Lint 任务",
-  simulation_workflow: "仿真任务",
-  cdc_workflow: "CDC 任务",
-  synthesis_workflow: "综合任务",
-  sta_workflow: "STA 任务",
-  test_execution_workflow: "用例任务",
+  orchestrated: "动态编排",
 };
 
 const defaultModelSettings: ModelSettings = {

@@ -2,7 +2,7 @@
 
 完整技术文档入口：[docs/README.md](docs/README.md)，包含总体架构、代码结构、运行逻辑及组件与接口说明。
 
-当前代码已升级到 v0.2，产品基线见 [PRD_v0.2.md](PRD_v0.2.md)。在 v0.1 的对话与 DS 工作流之上，新增了面向 RTL 和 EDA 闭环的 Windows 优先工程骨架：
+当前代码已升级到 v0.4，产品基线见 [PRD_v0.2.md](PRD_v0.2.md)。主交互已经从固定路由升级为统一 Orchestrator + 动态 Tool Calling：
 
 - FastAPI 服务；
 - LangGraph DS 工作流；
@@ -17,7 +17,9 @@
 - 网页模型配置、连接测试和 API Key 持久化；
 - 网页系统自检、结构化错误分类和请求编号；
 - React 正式前端工作台；
-- 路由 Agent、普通聊天 Agent 与对话式任务入口；
+- 任务意图完善、原生 Function Calling 和 Planner–Executor Loop；
+- 普通聊天作为 `reply_to_user` Tool，不再是独立路由分支；
+- Architecture、Design、Verification 角色作为可编排咨询 Tool；
 - PDF、DOCX、Markdown 和文本文件上传；
 - DS、评审意见和执行过程展示。
 - Architecture、Design、Verification 和独立 Reviewer 角色定义；

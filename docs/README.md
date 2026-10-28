@@ -1,28 +1,31 @@
 # ChipFlow Agent 技术文档
 
-本文档集描述当前代码库的实际实现，技术基线为 **v0.3 控制面增量（2026-10-28）**，产品需求以根目录的 [PRD_v0.2.md](../PRD_v0.2.md) 为准。`PRD_v0.1.md` 和 `SELF_VALIDATION_v0.1.md` 仅作为历史记录保留。
+本文档集描述当前代码库的实际实现，技术基线为 **v0.4 动态 Tool Calling（2026-10-28）**，产品需求以根目录的 [PRD_v0.2.md](../PRD_v0.2.md) 为准。
 
 ## 文档导航
 
 | 文档 | 关注内容 | 推荐读者 |
 |---|---|---|
-| [architecture-overview.md](architecture-overview.md) | 系统边界、分层架构、数据与安全边界 | 架构师、技术负责人 |
+| [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) | Intent Enricher、Planner–Executor Loop、Chat Tool 和动态 Tool Calling | 所有人，建议首先阅读 |
+| [architecture-overview-v0.4.md](architecture-overview-v0.4.md) | v0.4 系统上下文、动态编排、控制面、数据与安全边界 | 架构师、技术负责人 |
 | [codebase-guide.md](codebase-guide.md) | 目录结构、文件职责、扩展入口 | 开发和维护人员 |
 | [runtime-flow.md](runtime-flow.md) | 对话、DS、RTL、ToolRun、Issue 与恢复流程 | 开发、测试、问题定位人员 |
 | [components-and-interfaces.md](components-and-interfaces.md) | 组件、角色、HTTP API、领域对象和配置 | 前后端和集成人员 |
 | [orchestration-and-skills.md](orchestration-and-skills.md) | Orchestrator、Run、Workflow、Skill 与 Tool 的边界 | 架构设计、面试答辩 |
 | [interview-100-questions.md](interview-100-questions.md) | 基于当前代码的 100 个面试追问与参考答案 | 求职准备、项目答辩 |
-| [../SELF_VALIDATION_v0.3.md](../SELF_VALIDATION_v0.3.md) | v0.3 统一 Run、Skill 和兼容流程验收结果 | 测试和交付人员 |
+| [../SELF_VALIDATION_v0.4.md](../SELF_VALIDATION_v0.4.md) | v0.4 动态编排、Function Calling 和兼容流程验收结果 | 测试和交付人员 |
 
 ## 当前版本一句话说明
 
-ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：用户主要通过聊天表达目标，Orchestrator 只编排用户明确指定的任务；DS、RTL、Lint、仿真、CDC、综合、STA 和已有用例执行统一建模为 `Run`，具体工作由角色 Agent、Workflow、Skill/提示词和受权限约束的 Tool 协作完成。
+ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：所有用户输入进入统一 Orchestrator，模型先完善任务意图，再通过原生 Function Calling 动态选择 Tool；普通聊天也是只有 `reply_to_user` 的 Run，工程副作用仍由确定性权限、审批和 Workspace 规则约束。
 
 ## 已实现能力
 
 - React 正式网页、普通聊天、文件上传和 DS Multi-Agent 流程；
 - 统一 Run 控制面、RunEvent、查询/恢复/取消接口和前端状态展示；
-- 聊天路由可识别 DS、RTL、Lint、仿真、CDC、综合、STA 和用例执行；
+- 统一 Intent Enricher 与 Planner–Executor Tool Loop；
+- DeepSeek Chat Completions 和 OpenAI Responses 原生 Function Calling；
+- Chat、角色咨询、DS、RTL、Lint 和用例能力统一注册为 Tool；
 - DS Task、RTL Patch、ToolRun 作为专业执行记录关联到统一 Run；
 - Architecture、Design、Verification、Reviewer 和 Orchestrator 角色定义；
 - DeepSeek/OpenAI 真实模型及不联网的 Deterministic Runtime；
@@ -49,9 +52,10 @@ ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：用�
 
 ## 推荐阅读顺序
 
-1. [总体架构](architecture-overview.md)；
-2. [运行逻辑](runtime-flow.md)；
-3. [组件与接口](components-and-interfaces.md)；
-4. [编排与 Skill](orchestration-and-skills.md)；
-5. [代码结构](codebase-guide.md)；
-6. [自验证报告](../SELF_VALIDATION_v0.3.md)。
+1. [v0.4 动态编排](dynamic-orchestration-v0.4.md)；
+2. [总体架构](architecture-overview-v0.4.md)；
+3. [运行逻辑](runtime-flow.md)；
+4. [组件与接口](components-and-interfaces.md)；
+5. [编排与 Skill](orchestration-and-skills.md)；
+6. [代码结构](codebase-guide.md)；
+7. [自验证报告](../SELF_VALIDATION_v0.4.md)。

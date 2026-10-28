@@ -45,7 +45,7 @@ def test_chat_created_ds_is_linked_to_unified_run() -> None:
     response = client.post("/api/v1/chat", json=_chat("请完成 scheduler 的 DS"))
     assert response.status_code == 200
     payload = response.json()
-    assert payload["route"] == "ds_workflow"
+    assert payload["route"] == "orchestrated"
     assert payload["run"]["run_type"] == "ds_design"
     assert payload["run"]["status"] == "completed"
     assert payload["run"]["legacy_task_id"] == payload["task"]["task_id"]
@@ -64,7 +64,32 @@ def test_conversation_endpoint_uses_path_session_id() -> None:
     )
     assert response.status_code == 200
     assert response.json()["session_id"] == session_id
-    assert response.json()["run"] is None
+    run = response.json()["run"]
+    assert run["run_type"] == "chat"
+    assert run["result"]["tool_calls"][0]["tool_name"] == "reply_to_user"
+
+
+def test_incomplete_request_is_enriched_and_paused_for_clarification() -> None:
+    response = client.post("/api/v1/chat", json=_chat("帮我检查一下 scheduler"))
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["status"] == "waiting_for_user"
+    assert payload["run"]["pending_user_request"]["type"] == "clarification_required"
+    assert payload["run"]["result"]["intent"]["raw_request"] == "帮我检查一下 scheduler"
+    assert payload["run"]["result"]["intent"]["missing_information"]
+    assert payload["run"]["result"]["tool_calls"][0]["tool_name"] == "ask_user"
+
+
+def test_tool_catalog_exposes_planning_metadata() -> None:
+    response = client.get("/api/v1/tools")
+    assert response.status_code == 200
+    tools = {item["name"]: item for item in response.json()}
+    assert {"reply_to_user", "ask_user", "create_ds_candidate", "verilator_lint"} <= set(tools)
+    assert tools["reply_to_user"]["execution_kind"] == "orchestration"
+    assert tools["create_ds_candidate"]["when_to_use"]
+    assert tools["verilator_lint"]["input_schema"]["required"] == ["files"]
+    assert tools["verilator_lint"]["requires_user_approval"] is True
 
 
 def test_rtl_chat_creates_reviewable_patch_run() -> None:

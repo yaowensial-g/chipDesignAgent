@@ -1,4 +1,6 @@
-# 代码结构说明（v0.3 控制面）
+# 代码结构说明（v0.4 动态编排）
+
+> v0.4 新增 `app/services/orchestrator_service.py` 和 `app/tools/orchestration.py`。`ConversationService` 已成为兼容门面，主链不再调用固定 Conversation Router；详见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
 
 ## 1. 目录
 
@@ -84,7 +86,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ### `app/agents/definitions.py`
 
-角色目录包括 Orchestrator、Conversation Router、Chat、Architecture、Design、Verification、四类默认 Reviewer 和 Specialist Reviewer。Agent 是职责边界，不是独立进程。
+角色目录包括 Orchestrator、Chat、Architecture、Design、Verification、四类默认 Reviewer 和 Specialist Reviewer。旧 Conversation Router 已退出主链；Agent 是职责边界，不是独立进程。
 
 ### `app/agents/runtime.py`
 

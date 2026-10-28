@@ -1,4 +1,6 @@
-# 总体架构说明（v0.3 控制面）
+# 总体架构说明（v0.4 动态编排）
+
+> v0.4 已取消主链上的 Chat/Workflow 前置二分路由。当前准确的统一编排细节见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。本文第 2 节中出现的 Conversation Router 和固定 route 描述保留为 v0.3 迁移背景，不再代表当前主调用链。
 
 ## 1. 架构目标
 

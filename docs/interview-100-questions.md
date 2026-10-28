@@ -1,6 +1,6 @@
 # ChipFlow 项目面试拷打 100 问
 
-本文档基于当前 **v0.2.0** 代码，而不是只基于 PRD。每题第一段给出可以直接用于面试的核心回答，第二段继续展开实现、取舍、风险或后续方案。回答时要主动区分“已经实现”“只具备接口骨架”和“下一阶段规划”，避免把原型包装成生产级平台。
+本文档基于当前 **v0.4.0** 代码，而不是只基于 PRD。每题第一段给出可以直接用于面试的核心回答，第二段继续展开实现、取舍、风险或后续方案。回答时要主动区分“已经实现”“只具备接口骨架”和“下一阶段规划”，避免把原型包装成生产级平台。
 
 ## 一、产品定位与需求（1～10）
 
@@ -26,7 +26,7 @@
 
 芯片项目阶段受组织流程、依赖成熟度和风险接受度影响，不能仅由模型根据文档推断。系统只响应用户明确目标，例如“生成 DS”或“执行 Lint”，Orchestrator 负责组织角色和 Tool，不替用户宣布阶段完成。
 
-如果系统自动推进阶段，很可能把“生成了候选 DS”误判为“DS 已批准”，或把“一次 Lint 通过”误判为“RTL 可以 Sign-off”。产品因此区分任务完成和项目阶段完成：前者由系统状态表示，后者仍由用户和真实流程决定。当前自然语言路由主要覆盖 Chat/DS，RTL 与 ToolRun 还需要用户从工程工作台显式发起。
+如果系统自动推进阶段，很可能把“生成了候选 DS”误判为“DS 已批准”，或把“一次 Lint 通过”误判为“RTL 可以 Sign-off”。产品因此区分任务完成和项目阶段完成：前者由统一 Run 和专业记录表示，后者仍由用户和真实流程决定。当前所有聊天输入都进入同一个 Orchestrator；Planner 可以动态选择聊天、角色咨询、DS、RTL、Lint 和用例发现 Tool，但不会替用户改变项目阶段。
 
 ### 5. 为什么 FS、AS、ICD 被视为只读资料？
 
@@ -34,11 +34,11 @@
 
 这种约束也为未来的记忆失效传播提供基础：任何从规格形成的 Reflection 都应保存来源和版本，规格变更后才能定位受影响的 DS、RTL 和验证结论。当前版本只保存部分来源信息，还没有完整依赖图，因此宁可不开放原始文档修改，也不制造无法追踪的隐式变更。
 
-### 6. v0.1 和 v0.2 的区别是什么？
+### 6. v0.1 到 v0.4 的架构演进是什么？
 
-v0.1 聚焦聊天、文档上传、FS/AS 到 DS、多角色评审和人工冲突恢复。v0.2 新增 SQLite 快照、Workspace、Artifact、RTL Candidate、Patch Review、Tool Registry、异步 ToolRun、日志解析和逐条 Issue 交互。
+v0.1 聚焦聊天、文档上传、FS/AS 到 DS、多角色评审和人工冲突恢复；v0.2 增加 SQLite、Workspace、Artifact、Patch、ToolRun 和 Issue；v0.3 引入统一 Run；v0.4 删除 Chat/Workflow 二分 Router，加入 Intent Enricher、Planner–Executor Loop、原生 Function Calling，并把聊天也注册成 Tool。
 
-架构上的关键变化，是系统从“模型工作流”扩展为“工程状态机”。v0.1 的主要状态位于 LangGraph 和前端；v0.2 开始把 Workspace、Patch、Run、Issue、用户决策落到 SQLite 和文件系统。需要说明的是，v0.2 仍是第二阶段骨架：真正接入的 EDA Tool 只有 Verilator Lint，自动修复与复验尚未完成。
+这条演进线体现了两个变化：一是从“模型工作流”走向可恢复、可审计的工程状态机；二是从预设场景路由走向模型按 Tool Schema 动态规划。v0.4 的顶层编排已经落地，但执行面仍诚实受限：真实 EDA Adapter 只有 Verilator Lint，Sim、CDC、综合、STA 和自动修复复验仍待接入。
 
 ### 7. 当前产品最有价值的设计是什么？
 
@@ -86,15 +86,15 @@ Agent 负责语义理解、方案权衡、根因判断和自然语言解释；To
 
 ### 14. Orchestrator Agent 做什么？
 
-设计目标是根据用户明确目标选择角色、评审视角和 Tool，并维护执行计划。当前代码已经定义该角色，但通用动态编排尚未完全接入；DS 仍主要由固定 LangGraph 编排，RTL/ToolRun 由工程工作台显式调用。
+Orchestrator 接收所有对话请求，先把零散表达整理为 `TaskIntent`，再创建统一 Run，由 Planner 读取 Tool Catalog 并通过原生 Function Calling 决定下一步调用。每次 Tool 结果会作为 Observation 回到规划循环，直到完成、等待用户、失败或达到步骤上限。
 
-完整实现时，Orchestrator 应输出结构化计划，例如目标、前置条件、角色、Tool、批准点和失败恢复策略，而不是自由文本。它还应读取 Tool Registry 元数据做权限过滤。当前不能声称已经实现 LLM 原生 Function Calling 编排，这一点在面试中应主动说明。
+当前 `OrchestratorService`、`TaskIntent`、`ToolSelection` 和最多 6 步的 Planner–Executor Loop 已实现；DeepSeek Chat Completions 与 OpenAI Responses 都支持原生 Tool Call。需要强调，模型只负责选择候选动作，Tool Registry、Policy Gate、路径校验和审批仍由确定性后端执行，模型不能自授予权限。
 
-### 15. Conversation Router 和 Orchestrator 有什么区别？
+### 15. 为什么删除 Conversation Router，并把 Chat 也做成 Tool？
 
-Router 只做轻量意图分类，目前主要判断普通聊天或 DS 工作流。Orchestrator 的范围更大，应拆解工程目标、选择角色和 Tool、处理依赖与重试。当前 Router 已实际使用，完整 Orchestrator 仍是演进项。
+旧 Router 先把请求分成“聊天”或“工程 Workflow”，容易把真实开发压缩成几条固定路径，也会产生两套运行与观测逻辑。v0.4 将 `reply_to_user` 注册成普通 Tool：概念问答就是只调用一个聊天 Tool 的短 Run，复杂任务则由同一 Planner 组合多个 Tool。
 
-将两者分开可以降低普通聊天的开销：每次用户问一个概念都不需要生成复杂执行计划。只有检测到工程目标后才需要 Orchestrator。当前 Router 的输出只有 route 和 reason，便于前端展示为何进入某条路径。
+统一入口让聊天与工程动作共享 Intent、RunEvent、错误处理和审计链路，同时保留清晰安全边界。代价是普通聊天也要经过一次轻量规划，因此后续可以使用小模型、计划缓存或确定性 fast path 优化成本，但不再恢复两套互相割裂的业务路由。
 
 ### 16. Architecture Agent 为什么没有修改 FS/AS 的权限？
 
@@ -208,21 +208,21 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 ### 34. 当前有多少 API？
 
-OpenAPI 当前包含 22 个 Path，覆盖健康与诊断、模型设置、文档抽取、聊天与 DS、Workspace/Artifact、RTL/Patch、ToolRun 和 Issue 决策。
+当前路由模块定义 30 个 HTTP Endpoint，覆盖健康与诊断、模型设置、文档抽取、统一对话与 Run、DS 兼容入口、Workspace/Artifact、RTL/Patch、ToolRun 和 Issue 决策。数量会随版本变化，面试时更应说明资源边界而不是死记数字。
 
 面试时比记数量更重要的是能按资源边界解释：Task 是模型工作流状态，Workspace/Artifact 是工程资产，Patch 是候选修改，ToolRun 是一次执行，EngineeringIssue 是执行结果的标准化问题。API 采用这些资源而不是按页面按钮随意设计。
 
 ### 35. 为什么文档上传不直接触发工作流？
 
-上传只是增加上下文，不代表用户授权生成或修改工程资产。Router 只有检测到明确的 DS 交付动作才启动工作流，普通文档提问仍由 Chat Agent 回答。
+上传只是增加上下文，不代表用户授权生成或修改工程资产。Intent Enricher 会识别用户目标和缺失信息，Planner 只有在目标明确且 Tool 前置条件满足时才选择 DS、RTL 或执行类 Tool；普通文档提问会选择 `reply_to_user`。
 
 这也避免用户刚上传敏感文档就触发多次付费模型调用。前端会让用户修正文档类型和版本，再通过自然语言明确任务。当前上传抽取文本主要保存在浏览器状态，尚未成为正式文档库资产。
 
 ### 36. 为什么没有把所有流程都塞进一个 LangGraph？
 
-当前 DS 是成熟的图流程，而 RTL 和 ToolRun 更适合先通过独立 Service 和状态机落地。强行放入一个巨型图会增加耦合。后续 Orchestrator 可以组合子图，而不必让所有任务共享同一 State。
+当前 DS 是成熟的内部图流程，而 RTL 和 ToolRun 通过独立 Service 和状态机落地。强行放入一个巨型图会增加耦合；v0.4 Orchestrator 在顶层按 Tool 动态组合这些执行器，不要求所有任务共享同一 State。
 
-图适合表达推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。将其分开还能独立扩展可靠队列和 Worker。未来可以由顶层 Orchestrator 启动 DS 子图、RTL Service 或 ToolRun，而不是把所有细节节点平铺在一张图里。
+图适合表达 DS 内部稳定的推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。v0.4 顶层 Orchestrator 已经可以动态启动 DS 子图、RTL Service 或 ToolRun；它组合专业执行器，而不是把所有细节节点平铺进一张巨型图。
 
 ### 37. 事件列表有什么作用？
 
@@ -282,15 +282,15 @@ Runtime 每次调用时读取有效设置，因此网页保存后无需重启后
 
 ### 46. 如何处理模型返回非法 JSON？
 
-Provider 会去除代码 Fence，并尝试从附加说明中提取 JSON；首次失败时发起一次仅修复格式的请求；仍失败则抛出包含具体 Agent 名称的 `ModelInvocationError`，不会把错误结果当作有效结论。
+角色分析等结构化文本输出会去除代码 Fence，并尝试提取 JSON；首次失败时发起一次只修格式的请求，仍失败则抛出带 Agent 名称的 `ModelInvocationError`。Planner 的动作选择不再依赖自由文本 JSON，而是使用供应商原生 Tool Call，并对参数再次做本地解析和 Schema 校验。
 
 修复请求必须强调只修格式、不修改结论，否则第二次调用可能悄悄改变业务答案。即使解析成功，还要通过代码检查对象/数组结构和字段类型。对高风险结果，未来应使用供应商 Structured Outputs 或本地 Schema 校验。
 
-### 47. 为什么不用原生 Structured Outputs？
+### 47. 原生 Function Calling 和 Structured Outputs 在项目中如何分工？
 
-项目需要兼容 DeepSeek 和不同 API 风格，首版采用提示词契约加 Python 校验。缺点是仍需修复和错误处理；未来供应商能力稳定后可按 Provider 使用 JSON Schema。
+v0.4 已将原生 Function Calling 用于 Planner 的动作选择，因为 Tool 名称和参数天然适合函数契约；Architecture、Design、Review 等复杂结论目前仍采用提示词 JSON 加 Pydantic/Python 校验，因为不同供应商对严格 Structured Outputs 的支持并不一致。
 
-Structured Outputs 能降低格式失败，但不能解决语义错误、幻觉和权限问题。因此即使升级为严格 Schema，来源校验、人工审批和 Tool 权限仍然必要，不能把格式可靠性等同于工程正确性。
+两者解决的问题不同：Function Calling 解决“调用哪个动作、传什么参数”，Structured Outputs 解决“一个语义结论如何严格成形”。即使未来角色输出升级为严格 Schema，来源校验、人工审批和 Tool 权限仍然必要，不能把格式可靠性等同于工程正确性。
 
 ### 48. 如何控制超长文档？
 
@@ -306,9 +306,9 @@ Structured Outputs 能降低格式失败，但不能解决语义错误、幻觉�
 
 ### 50. 如何控制模型成本？
 
-当前通过按需路由、讨论轮次上限、确定性测试和上下文裁剪控制。尚未实现 Token 预算、缓存、角色模型分级和成本面板，这些是生产化必须补充的能力。
+当前通过 Intent 整理、最多 6 步的规划上限、讨论轮次上限、确定性测试和上下文裁剪控制。尚未实现 Token 预算、计划缓存、Tool 检索、角色模型分级和成本面板，这些是生产化必须补充的能力。
 
-进一步可以给任务设置总预算，普通 Router 使用小模型，关键架构/评审使用强模型；相同文档摘要按版本缓存；超过预算时暂停并让用户选择继续。成本指标应与接受率和缺陷发现价值一起看，不能只追求最低 Token。
+进一步可以给任务设置总预算，Intent Enricher 和简单聊天使用小模型，关键架构/评审使用强模型；相同文档摘要和稳定计划按版本缓存；超过预算时暂停并让用户选择继续。成本指标应与接受率和缺陷发现价值一起看，不能只追求最低 Token。
 
 ## 五、持久化、记忆与一致性（51～60）
 
@@ -440,7 +440,7 @@ Workspace 创建 `rtl`、`dv`、`constraints`、`candidates`、`artifacts` 和 `
 
 名称、说明、允许角色、Mutability、是否要求用户批准、幂等性、超时和执行器。它让编排层在运行前检查权限，而不是只依赖提示词。
 
-Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入，为后续统一审批策略提供基础。当前 Tool 参数还没有独立 JSON Schema 字段，而是在执行器内校验，未来 Function Calling 应补齐机器可读 Schema。
+Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入。v0.4 的 Tool Metadata 已包含机器可读 `input_schema`、`output_schema`、`when_to_use` 和前置条件，可直接转换为 DeepSeek/OpenAI 的 Function Calling 定义；执行器仍会二次校验，不能只信模型参数。
 
 ### 72. 当前真实接入了哪些 Tool？
 
@@ -586,13 +586,13 @@ React 页面还能表达禁用按钮、真实模型状态、任务时间线和�
 
 ### 95. 当前测试覆盖哪些关键风险？
 
-覆盖聊天路由、DS、冲突暂停恢复、模型配置、JSON 修复、上传解析、路径穿越、Patch 审批、RTL Candidate、Tool 授权、日志去重和 SQLite 重启恢复。当前基线是 40 项测试。
+覆盖统一编排、普通聊天 Tool、DeepSeek/OpenAI 原生 Tool Call、DS、冲突暂停恢复、模型配置、JSON 修复、上传解析、路径穿越、Patch 审批、RTL Candidate、Tool 授权、日志去重和 SQLite 重启恢复。当前基线是 51 项测试。
 
 高价值测试集中在安全不变量：审批前文件不得变化、路径不得逃逸、未授权 Tool 不得运行、模拟测试不得调用真实模型。相比只测 200 状态，这些断言更能防止工程风险回归。
 
 ### 96. 还缺哪些测试？
 
-缺真实 Verilator 成功案例、并发 Patch 冲突压力、长时间 Tool 超时/取消、数据库损坏恢复、真实模型端到端契约、浏览器自动化回归和安全模糊测试。
+缺真实 Verilator 成功案例、Planner 多轮真实模型评测、缺参后通用 Resume、并发 Patch 冲突压力、长时间 Tool 超时/取消、数据库损坏恢复、浏览器自动化回归和安全模糊测试。
 
 还应加入 Windows 路径边界、符号链接、超大日志、非 UTF-8 输出、多个 Run 并发、进程崩溃恢复和模型超时测试。真实模型评估应与确定性 CI 分开，并记录模型版本。
 
@@ -600,7 +600,7 @@ React 页面还能表达禁用按钮、真实模型状态、任务时间线和�
 
 DS 的多次模型请求和长上下文通常是首要瓶颈；其次是大日志写库和前端轮询。应增加每节点耗时、Token、Run 时长和数据库操作指标，再决定并行、缓存或流式化。
 
-优化必须基于测量：如果 Router 和简单 Review 占大量调用，可使用小模型；如果文档重复发送，可缓存版本摘要；如果轮询压力高，可切换 SSE。不能先上分布式架构再寻找问题。
+优化必须基于测量：如果 Intent Enricher、Planner 和简单 Review 占大量调用，可使用小模型或安全 fast path；如果文档重复发送，可缓存版本摘要；如果 Tool 数量增长导致上下文膨胀，可增加 Tool 检索；如果轮询压力高，可切换 SSE。
 
 ### 98. 如何将它生产化部署？
 
@@ -610,13 +610,13 @@ DS 的多次模型请求和长上下文通常是首要瓶颈；其次是大日�
 
 ### 99. 如果让你继续开发，优先级是什么？
 
-第一优先是完成一个真实闭环：安装 Verilator，用实际 RTL 复现错误，由 Design Agent 生成候选 Patch，用户批准后执行最小 Lint 复验并推进 resolved/reopened。之后再扩展 Sim、CDC、综合和 STA，而不是先增加更多空接口。
+第一优先是完成一个真实闭环：用实际 RTL 复现 Verilator 错误，由 Design Agent 生成候选 Patch，用户批准后执行最小 Lint 复验并推进 resolved/reopened。第二优先是完善 Planner 评测、缺参恢复和 Tool 检索，再按统一 Adapter 协议扩展 Sim、CDC、综合和 STA。
 
 这条纵向闭环能同时验证 Agent 判断、Patch 安全、Issue 状态和工具复验，并暴露公共抽象是否合理。若它稳定，再抽象 Adapter；如果先横向注册很多 Tool，只会得到看似完整但无法交付的系统。
 
 ### 100. 这个项目你最大的技术收获是什么？
 
-LLM 工程系统的核心不是 Prompt 数量，而是把不确定推理放入确定性的权限、状态、证据、审批和恢复协议中。Agent 能力决定上限，Workspace、Tool、Patch、Issue 和测试决定它是否可以进入真实工程流程。
+LLM 工程系统的核心不是 Prompt 或固定 Workflow 的数量，而是让模型动态规划、让 Tool 确定执行，再把不确定推理放入权限、状态、证据、审批和恢复协议中。Agent 决定语义能力上限，Tool Schema、Workspace、Patch、Issue 和测试决定系统能否进入真实工程流程。
 
 项目也体现了“诚实边界”的重要性：Deterministic Runtime 只验证协议，不冒充真实设计；SQLite 快照不冒充持久化 Checkpointer；Tool 接口不冒充商业 EDA 已接入。能够清楚说明这些差异，本身就是系统设计能力的体现。
 

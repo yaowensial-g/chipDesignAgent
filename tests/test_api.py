@@ -285,10 +285,11 @@ def test_chat_without_documents_asks_for_upload() -> None:
     payload = response.json()
     assert payload["task"] is None
     assert "上传" in payload["assistant_message"]
-    assert payload["route"] == "ds_workflow"
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["result"]["tool_calls"][0]["tool_name"] == "create_ds_candidate"
 
 
-def test_chat_with_as_runs_ds_workflow() -> None:
+def test_chat_with_as_uses_ds_tool() -> None:
     body = _request()
     response = client.post(
         "/api/v1/chat",
@@ -303,7 +304,8 @@ def test_chat_with_as_runs_ds_workflow() -> None:
     payload = response.json()
     assert payload["task"]["status"] == "delivered"
     assert "DS 候选已经生成" in payload["assistant_message"]
-    assert payload["route"] == "ds_workflow"
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["result"]["intent"]["raw_request"] == "请生成 DS 并进行多视角评审"
 
 
 def test_general_chat_does_not_require_documents() -> None:
@@ -319,7 +321,9 @@ def test_general_chat_does_not_require_documents() -> None:
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["route"] == "chat"
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["run_type"] == "chat"
+    assert payload["run"]["result"]["tool_calls"][0]["tool_name"] == "reply_to_user"
     assert payload["task"] is None
     assert "普通技术问答" in payload["assistant_message"]
     assert "请先上传" not in payload["assistant_message"]
@@ -342,7 +346,8 @@ def test_document_question_routes_to_chat_with_context() -> None:
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["route"] == "chat"
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["run_type"] == "chat"
     assert payload["task"] is None
     assert "DMA AS" in payload["assistant_message"]
 
@@ -358,5 +363,7 @@ def test_asking_what_ds_is_does_not_start_workflow() -> None:
         },
     )
     assert response.status_code == 200
-    assert response.json()["route"] == "chat"
+    payload = response.json()
+    assert payload["route"] == "orchestrated"
+    assert payload["run"]["result"]["tool_calls"][0]["tool_name"] == "reply_to_user"
 

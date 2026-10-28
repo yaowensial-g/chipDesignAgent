@@ -55,16 +55,7 @@ export interface ChatResponse {
   run: RunView | null;
 }
 
-export type WorkflowRoute =
-  | "chat"
-  | "ds_workflow"
-  | "rtl_workflow"
-  | "lint_workflow"
-  | "simulation_workflow"
-  | "cdc_workflow"
-  | "synthesis_workflow"
-  | "sta_workflow"
-  | "test_execution_workflow";
+export type WorkflowRoute = "orchestrated";
 
 export interface RunEvent {
   event_id: string;

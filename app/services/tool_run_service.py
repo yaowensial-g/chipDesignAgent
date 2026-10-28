@@ -35,6 +35,8 @@ class ToolRunService:
             raise PermissionError(f"Role {request.role.value} cannot call {request.tool_name}")
         if registered.definition.requires_user_approval and not request.user_approved:
             raise PermissionError("Tool requires explicit user approval")
+        if registered.executor is None:
+            raise ValueError(f"Tool {request.tool_name} is orchestrator-managed and cannot run as a local process")
         run_id = str(uuid4())
         now = utc_now()
         self.db.execute(
@@ -57,6 +59,8 @@ class ToolRunService:
         self._set_status(run_id, ToolRunStatus.RUNNING)
         registered = self.registry.get(request.tool_name)
         try:
+            if registered.executor is None:
+                raise ValueError(f"Tool {request.tool_name} has no engineering executor")
             command, exit_code, stdout, stderr = registered.executor(
                 request.workspace_id, request.arguments
             )

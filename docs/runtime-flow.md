@@ -1,4 +1,6 @@
-# 运行逻辑说明（v0.3 控制面）
+# 运行逻辑说明（v0.4 动态编排）
+
+> 当前对话主链为 Intent Enricher → Planner → Tool → Observation → Replan。第 3、15、17、26 节中出现的固定 Router 流程属于 v0.3 历史实现；当前实现以 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) 为准。
 
 ## 1. 启动
 
@@ -350,14 +352,17 @@ sequenceDiagram
     participant Conv as ConversationService
     participant Task as TaskService
     participant Graph as LangGraph
-    participant Runtime as Agent Runtime
+    participant Orch as OrchestratorService
+    participant Planner as LLM Planner
     participant DB as SQLite
 
     UI->>Conv: POST /chat（明确生成 DS）
-    Conv->>Runtime: route_conversation
-    Runtime-->>Conv: ds_workflow
-    Conv->>Conv: 验证至少一份 AS
-    Conv->>Task: create_ds_task
+    Conv->>Orch: orchestrate(message, documents)
+    Orch->>Orch: enrich TaskIntent + create Unified Run
+    Orch->>Planner: Tool Catalog + 当前 Observation
+    Planner-->>Orch: create_ds_candidate(args)
+    Orch->>Orch: Policy / 前置条件校验
+    Orch->>Task: create_ds_task
     Task->>Graph: ainvoke(initial_state, thread_id)
     par 角色分析
         Graph->>Runtime: architecture_analysis
@@ -378,7 +383,7 @@ sequenceDiagram
     Task-->>UI: TaskView
 ```
 
-如果用户直接调用 `/tasks/ds`，则跳过 Conversation Router，其余路径相同。
+如果外部集成直接调用 `/tasks/ds`，则绕过统一对话编排并直接创建兼容 DS Task；正式网页主入口始终通过 Orchestrator。
 
 ## 18. 冲突、Interrupt 与恢复细节
 

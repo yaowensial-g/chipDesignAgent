@@ -11,7 +11,7 @@ ToolExecutor = Callable[[str, dict], tuple[list[str], int, str, str]]
 @dataclass(frozen=True)
 class RegisteredTool:
     definition: ToolDefinitionView
-    executor: ToolExecutor
+    executor: ToolExecutor | None
 
 
 class ToolRegistry:
@@ -23,12 +23,19 @@ class ToolRegistry:
         *,
         name: str,
         description: str,
+        when_to_use: str = "",
+        when_not_to_use: str = "",
         allowed_roles: list[AgentRole],
         mutability: Mutability,
         requires_user_approval: bool,
         idempotent: bool,
         timeout_seconds: int,
-        executor: ToolExecutor,
+        executor: ToolExecutor | None = None,
+        input_schema: dict | None = None,
+        output_schema: dict | None = None,
+        preconditions: list[str] | None = None,
+        side_effect: str = "none",
+        execution_kind: str = "engineering",
     ) -> None:
         if name in self._tools:
             raise ValueError(f"Tool already registered: {name}")
@@ -36,11 +43,18 @@ class ToolRegistry:
             definition=ToolDefinitionView(
                 name=name,
                 description=description,
+                when_to_use=when_to_use,
+                when_not_to_use=when_not_to_use,
                 allowed_roles=allowed_roles,
                 mutability=mutability,
                 requires_user_approval=requires_user_approval,
                 idempotent=idempotent,
                 timeout_seconds=timeout_seconds,
+                input_schema=input_schema or {"type": "object", "properties": {}},
+                output_schema=output_schema or {"type": "object"},
+                preconditions=preconditions or [],
+                side_effect=side_effect,
+                execution_kind=execution_kind,
             ),
             executor=executor,
         )
@@ -53,6 +67,9 @@ class ToolRegistry:
 
     def list(self) -> list[ToolDefinitionView]:
         return [tool.definition for tool in self._tools.values()]
+
+    def for_role(self, role: AgentRole) -> list[ToolDefinitionView]:
+        return [tool.definition for tool in self._tools.values() if role in tool.definition.allowed_roles]
 
 
 tool_registry = ToolRegistry()

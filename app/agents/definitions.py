@@ -14,23 +14,16 @@ AGENTS: dict[str, AgentDefinition] = {
     "orchestrator": AgentDefinition(
         agent_id="orchestrator",
         display_name="Orchestrator Agent",
-        prompt_version="v2",
+        prompt_version="v3",
         read_only=True,
-        purpose="依据用户明确目标编排生产角色、评审角色和 Tool，不自行决定研发阶段。",
-    ),
-    "conversation_router": AgentDefinition(
-        agent_id="conversation_router",
-        display_name="对话路由 Agent",
-        prompt_version="v1",
-        read_only=True,
-        purpose="判断用户请求应进入普通聊天还是 DS Multi-Agent 工作流。",
+        purpose="完善任务意图并通过 Function Calling 动态编排角色和 Tool，不自行决定研发阶段。",
     ),
     "chat": AgentDefinition(
         agent_id="chat",
         display_name="聊天 Agent",
         prompt_version="v1",
         read_only=True,
-        purpose="结合会话、项目和已上传文档上下文回答普通问题。",
+        purpose="作为 reply_to_user Tool 的推理实现，结合上下文回答普通问题。",
     ),
     "architecture_advisor": AgentDefinition(
         agent_id="architecture_advisor",
@@ -94,6 +87,6 @@ AGENTS: dict[str, AgentDefinition] = {
 DEFAULT_AGENT_IDS = tuple(
     agent_id
     for agent_id in AGENTS
-    if agent_id not in {"orchestrator", "conversation_router", "chat", "specialist_reviewer"}
+    if agent_id not in {"orchestrator", "chat", "specialist_reviewer"}
 )
 

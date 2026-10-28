@@ -124,8 +124,7 @@ h2 { font-size: 15px; }
 .message-meta strong { font-size: 11px; }
 .message-meta time { color: #61747e; font-size: 9px; }
 .message-route { padding: 2px 6px; border: 1px solid; border-radius: 999px; font-size: 8px; line-height: 1; letter-spacing: .02em; }
-.route-chat { color: #8eb6ca; background: rgba(97, 167, 202, .08); border-color: rgba(97, 167, 202, .25); }
-.route-ds_workflow { color: #8ee8d7; background: rgba(85, 214, 190, .08); border-color: rgba(85, 214, 190, .25); }
+.route-orchestrated { color: #d5b8ff; background: rgba(155, 104, 220, .09); border-color: rgba(155, 104, 220, .28); }
 .message-body p { margin: 0; color: #b9c7ce; font-size: 13px; line-height: 1.72; white-space: pre-wrap; }
 .thinking { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
 .spin { animation: spin 1s linear infinite; }

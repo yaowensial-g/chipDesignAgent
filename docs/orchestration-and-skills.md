@@ -1,10 +1,12 @@
 # 编排、Workflow、Skill 与 Tool 设计
 
+> v0.4 已将主链升级为统一动态 Tool Calling。固定 Workflow 正在迁移为 Skill/Playbook + Tool，安全 Policy 继续由确定性代码强制；实现位置见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
+
 ## 1. 核心分工
 
 | 概念 | 解决的问题 | 当前实现 |
 |---|---|---|
-| Orchestrator/Router | 用户明确要求做什么 | `runtime.route_conversation()` |
+| Orchestrator + Intent | 用户想做什么、还缺什么信息 | `OrchestratorService`、`TaskIntent` |
 | Run | 一次用户任务现在处于什么状态 | `RunService`、`runs`、`run_events` |
 | Workflow | 多步骤任务怎样推进和中断 | DS 使用 LangGraph；工程任务由 RunService 协调 ToolRun |
 | Role Agent | 由哪个生产角色判断 | Architecture、Design、Verification、Reviewer |

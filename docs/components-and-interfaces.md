@@ -1,4 +1,6 @@
-# 组件与接口说明（v0.3 控制面）
+# 组件与接口说明（v0.4 动态编排）
+
+> Tool Catalog 现在同时包含编排 Tool 和工程 Tool，并提供适用/禁用条件、JSON Schema、前置条件、副作用与执行类型。完整清单见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
 
 ## 1. 组件
 
@@ -56,7 +58,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 状态和 v0.3.0 |
+| GET | `/health` | 状态和 v0.4.0 |
 | GET | `/diagnostics` | 本机无费用自检 |
 | GET/PUT | `/settings/model` | 读取/保存公开模型设置 |
 | POST | `/settings/model/test` | 真实连接探针 |

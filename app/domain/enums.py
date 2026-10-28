@@ -22,6 +22,8 @@ class TaskStatus(str, Enum):
 
 
 class RunType(str, Enum):
+    ORCHESTRATION = "orchestration"
+    CHAT = "chat"
     DS_DESIGN = "ds_design"
     RTL_IMPLEMENTATION = "rtl_implementation"
     SIMULATION = "simulation"

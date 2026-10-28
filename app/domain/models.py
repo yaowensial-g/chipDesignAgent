@@ -141,6 +141,28 @@ class ChatRequest(BaseModel):
     user_approved: bool = False
 
 
+class TaskIntent(BaseModel):
+    """A derived interpretation of a user turn; the raw request remains immutable."""
+
+    raw_request: str
+    goal: str
+    deliverables: list[str] = Field(default_factory=list)
+    target_module: str | None = None
+    known_context: dict[str, Any] = Field(default_factory=dict)
+    assumptions: list[str] = Field(default_factory=list)
+    missing_information: list[str] = Field(default_factory=list)
+    candidate_tools: list[str] = Field(default_factory=list)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    confidence: int = Field(default=5, ge=1, le=10)
+
+
+class ToolSelection(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str = ""
+
+
 class RunEventView(BaseModel):
     event_id: str
     run_id: str
@@ -190,17 +212,7 @@ class RunResumeRequest(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     assistant_message: str
-    route: Literal[
-        "chat",
-        "ds_workflow",
-        "rtl_workflow",
-        "lint_workflow",
-        "simulation_workflow",
-        "cdc_workflow",
-        "synthesis_workflow",
-        "sta_workflow",
-        "test_execution_workflow",
-    ]
+    route: str = "orchestrated"
     route_reason: str | None = None
     task: TaskView | None = None
     run: RunView | None = None
@@ -289,11 +301,36 @@ class ArtifactView(BaseModel):
 class ToolDefinitionView(BaseModel):
     name: str
     description: str
+    when_to_use: str = ""
+    when_not_to_use: str = ""
     allowed_roles: list[AgentRole]
     mutability: Mutability
     requires_user_approval: bool
     idempotent: bool
     timeout_seconds: int
+    input_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    output_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
+    preconditions: list[str] = Field(default_factory=list)
+    side_effect: str = "none"
+    execution_kind: Literal["orchestration", "engineering"] = "engineering"
+
+    def as_function_tool(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": " ".join(
+                    part
+                    for part in (
+                        self.description,
+                        f"适用：{self.when_to_use}" if self.when_to_use else "",
+                        f"不适用：{self.when_not_to_use}" if self.when_not_to_use else "",
+                    )
+                    if part
+                ),
+                "parameters": self.input_schema,
+            },
+        }
 
 
 class ToolRunRequest(BaseModel):

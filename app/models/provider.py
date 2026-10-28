@@ -89,6 +89,89 @@ class OpenAIModelProvider:
             raise ModelInvocationError(f"{operation}的 JSON 输出类型不符合约定")
         return parsed
 
+    def choose_tool(
+        self,
+        instructions: str,
+        payload: dict[str, Any],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Ask the provider for exactly one next tool call.
+
+        Both OpenAI Responses and DeepSeek-compatible Chat Completions are
+        normalized to {name, arguments, reason}. A textual answer becomes the
+        reply_to_user tool so the orchestration path remains uniform.
+        """
+
+        input_text = json.dumps(payload, ensure_ascii=False)
+        try:
+            if self.settings.api_style == "chat_completions":
+                messages = [
+                    {
+                        "role": "system" if self.settings.provider == "deepseek" else "developer",
+                        "content": instructions,
+                    },
+                    {"role": "user", "content": input_text},
+                ]
+                options: dict[str, Any] = {
+                    "model": self.settings.model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                }
+                if self.settings.provider == "deepseek":
+                    options["max_tokens"] = self.settings.max_output_tokens
+                else:
+                    options["max_completion_tokens"] = self.settings.max_output_tokens
+                completion = self.client.chat.completions.create(**options)
+                message = completion.choices[0].message
+                if message.tool_calls:
+                    call = message.tool_calls[0]
+                    return {
+                        "name": call.function.name,
+                        "arguments": _parse_tool_arguments(call.function.arguments),
+                        "reason": "模型 Function Calling",
+                    }
+                return {
+                    "name": "reply_to_user",
+                    "arguments": {"message": message.content or ""},
+                    "reason": "模型直接回答已归一化为 Chat Tool",
+                }
+
+            response_tools = [
+                {
+                    "type": "function",
+                    "name": tool["function"]["name"],
+                    "description": tool["function"].get("description", ""),
+                    "parameters": tool["function"]["parameters"],
+                }
+                for tool in tools
+            ]
+            options = {
+                "model": self.settings.model,
+                "instructions": instructions,
+                "input": input_text,
+                "tools": response_tools,
+                "tool_choice": "auto",
+                "max_output_tokens": self.settings.max_output_tokens,
+            }
+            if self.settings.provider == "openai":
+                options["store"] = False
+            response = self.client.responses.create(**options)
+            for item in response.output:
+                if getattr(item, "type", "") == "function_call":
+                    return {
+                        "name": item.name,
+                        "arguments": _parse_tool_arguments(item.arguments),
+                        "reason": "模型 Function Calling",
+                    }
+            return {
+                "name": "reply_to_user",
+                "arguments": {"message": response.output_text or ""},
+                "reason": "模型直接回答已归一化为 Chat Tool",
+            }
+        except Exception as exc:
+            raise ModelInvocationError(f"模型 Tool Calling 失败：{_safe_error(exc)}") from exc
+
     def test_connection(self) -> str:
         result = self.generate_text(
             "你是连接检查器。严格按要求回答。",
@@ -102,6 +185,20 @@ class OpenAIModelProvider:
 def _safe_error(exc: Exception) -> str:
     message = str(exc).replace("\n", " ").strip()
     return message[:500] or exc.__class__.__name__
+
+
+def _parse_tool_arguments(value: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ModelInvocationError("模型返回了无法解析的 Tool 参数") from exc
+    if not isinstance(parsed, dict):
+        raise ModelInvocationError("模型 Tool 参数必须是 JSON 对象")
+    return parsed
 
 
 def _parse_json_output(text: str) -> dict[str, Any] | list[Any] | None:
