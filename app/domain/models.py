@@ -1,3 +1,9 @@
+"""跨 API、Service 和前端使用的领域数据契约。
+
+这里的 Pydantic Model 负责“数据长什么样”，不负责“业务下一步怎么走”。
+把契约集中在此处可以让 FastAPI 自动校验输入，并防止 Service 之间传递结构不明的字典。
+"""
+
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -128,6 +134,7 @@ class ChatHistoryMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    """网页每次发送消息时提交的完整上下文快照。"""
     session_id: str | None = None
     project_id: str = Field(min_length=1)
     module_name: str = Field(min_length=1)
@@ -161,22 +168,26 @@ class TaskIntent(BaseModel):
 
 
 class ToolSelection(BaseModel):
+    """主 Agent 第二阶段的输出：选择一个 Tool，并填写其参数。"""
     name: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     reason: str = ""
 
 
 class ToolShortlist(BaseModel):
+    """轻量 Selector 第一阶段的输出，只含候选名称，不含执行参数。"""
     selected_tools: list[str] = Field(default_factory=list)
     reason: str = ""
     used_fallback: bool = False
 
 
 class ConversationRoleUpdate(BaseModel):
+    """显式切换会话工作角色的 API 请求。"""
     user_role: UserRole
 
 
 class ConversationView(BaseModel):
+    """会话级角色元数据；``primary_agent`` 由后端根据用户角色计算。"""
     session_id: str
     project_id: str
     user_role: UserRole
@@ -186,11 +197,13 @@ class ConversationView(BaseModel):
 
 
 class DelegationArtifactRef(BaseModel):
+    """专家任务引用的制品名称/路径和版本，不复制制品正文。"""
     path: str
     version: str = ""
 
 
 class DelegationRequest(BaseModel):
+    """主 Agent 发给专家的结构化任务合同。"""
     parent_run_id: str
     from_agent: AgentRole
     to_agent: AgentRole
@@ -202,6 +215,7 @@ class DelegationRequest(BaseModel):
 
 
 class DelegationResult(BaseModel):
+    """持久化专家结果；失败时 conclusion 可空，但 status/error 必须可追踪。"""
     task_id: str
     parent_run_id: str
     from_agent: AgentRole
@@ -228,6 +242,7 @@ class RunEventView(BaseModel):
 
 
 class RunView(BaseModel):
+    """统一用户任务视图，关联 DS Task、Patch、ToolRun 和 Delegate。"""
     run_id: str
     session_id: str
     project_id: str
@@ -274,6 +289,7 @@ class ChatResponse(BaseModel):
 
 
 class ModelSettingsUpdate(BaseModel):
+    """模型设置写入请求；API Key 只用于写入，绝不会出现在 View 中。"""
     enabled: bool
     provider: Literal["openai", "deepseek"] = "openai"
     api_style: Literal["responses", "chat_completions"] = "responses"
@@ -289,6 +305,7 @@ class ModelSettingsUpdate(BaseModel):
 
 
 class ModelSettingsView(BaseModel):
+    """可安全返回前端的模型配置，仅包含 Key 是否存在及掩码。"""
     enabled: bool
     provider: str
     api_style: str
@@ -360,6 +377,10 @@ class ArtifactView(BaseModel):
 
 
 class ToolDefinitionView(BaseModel):
+    """模型可见的 Tool 契约和后端权限元数据。
+
+    ``as_function_tool`` 只负责协议转换；是否允许执行仍由 Registry/Service 判断。
+    """
     name: str
     description: str
     when_to_use: str = ""

@@ -1,3 +1,9 @@
+"""工程 Tool 的异步执行、日志落盘和 Issue 队列。
+
+顶层 Run 表示用户任务；ToolRun 表示一次真实进程执行。二者分开后，同一个用户任务
+可以关联工具命令、退出码和原始日志，而不会把进程细节塞进通用 Run 状态机。
+"""
+
 import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +23,7 @@ from app.tools.registry import ToolRegistry, tool_registry
 
 
 class ToolRunService:
+    """校验调用权限，在后台执行 Tool，并把日志标准化为逐条 Issue。"""
     def __init__(
         self,
         db: Database = database,
@@ -29,6 +36,8 @@ class ToolRunService:
             register_builtin_tools()
 
     def start(self, request: ToolRunRequest) -> ToolRunView:
+        """校验 Workspace、角色、审批和 executor，然后创建 queued ToolRun。"""
+        # resolve_path(".") 同时验证 Workspace 存在且根路径仍在受控目录中。
         workspace_service.resolve_path(request.workspace_id, ".")
         registered = self.registry.get(request.tool_name)
         if request.role not in registered.definition.allowed_roles:
@@ -52,10 +61,12 @@ class ToolRunService:
                 now,
             ),
         )
+        # 进程执行放在线程池，HTTP 请求可以立即返回 run_id 给前端轮询。
         self.executor.submit(self._execute, run_id, request)
         return self.get(run_id)  # type: ignore[return-value]
 
     def _execute(self, run_id: str, request: ToolRunRequest) -> None:
+        """后台执行器：运行 Tool、截断数据库日志、保存原始日志并解析 Issue。"""
         self._set_status(run_id, ToolRunStatus.RUNNING)
         registered = self.registry.get(request.tool_name)
         try:
@@ -74,6 +85,8 @@ class ToolRunService:
         except Exception as exc:
             command, exit_code, stdout, stderr = [], 1, "", f"TOOL_INTERNAL: {exc}"
             status = ToolRunStatus.FAILED
+        # 先进入 parsing，表示外部进程已经结束但 Issue 尚未完全生成。
+        # 数据库只保留末尾 1MB，完整原始输出另外写入 Workspace/logs。
         self.db.execute(
             "UPDATE tool_runs SET status = ?, command_json = ?, exit_code = ?, stdout = ?, stderr = ?, updated_at = ? WHERE run_id = ?",
             (
@@ -128,6 +141,7 @@ class ToolRunService:
         return [self._issue_view(row) for row in rows]
 
     def next_issue(self, run_id: str) -> EngineeringIssueView | None:
+        """一次只激活队列中的一个问题，避免同时向用户抛出大量错误。"""
         row = self.db.fetch_one(
             "SELECT * FROM engineering_issues WHERE run_id = ? AND status IN (?, ?, ?) ORDER BY queue_index LIMIT 1",
             (
@@ -148,6 +162,7 @@ class ToolRunService:
         return self._issue_view(row)
 
     def decide(self, issue_id: str, decision: IssueDecisionRequest) -> EngineeringIssueView:
+        """记录按建议、跳过、自定义或继续解释；当前不会自动修改 RTL。"""
         row = self.db.fetch_one(
             "SELECT * FROM engineering_issues WHERE issue_id = ?", (issue_id,)
         )
@@ -171,6 +186,7 @@ class ToolRunService:
     def _store_issues(
         self, run_id: str, tool_name: str, text: str, raw_log_ref: str
     ) -> None:
+        """解析日志、生成稳定指纹，并用唯一索引忽略同 Run 内重复问题。"""
         parsed = parse_tool_issues(tool_name, text)
         for index, item in enumerate(parsed, start=1):
             analysis = issue_analysis(item)
@@ -231,6 +247,7 @@ VERILATOR_PATTERN = re.compile(
 
 
 def parse_tool_issues(tool_name: str, text: str) -> list[dict]:
+    """把 Verilator/环境错误文本解析成不含业务建议的基础 Issue。"""
     results: list[dict] = []
     seen: set[str] = set()
     for line in text.splitlines():
@@ -248,6 +265,7 @@ def parse_tool_issues(tool_name: str, text: str) -> list[dict]:
             message = message.strip()
         else:
             continue
+        # 指纹不使用随机 ID，而使用工具、位置和消息；同一错误重复打印只保留一次。
         fingerprint = hashlib.sha256(
             f"{tool_name}|{code}|{file}|{line_number}|{message}".encode("utf-8")
         ).hexdigest()
@@ -269,6 +287,10 @@ def parse_tool_issues(tool_name: str, text: str) -> list[dict]:
 
 
 def issue_analysis(issue: dict) -> dict:
+    """为常见错误生成可解释的初步分析；未知错误采用保守建议。
+
+    这里的规则是候选建议，不会直接创建或应用 Patch。用户仍需要逐条确认。
+    """
     code = str(issue.get("code") or "").upper()
     location = (
         f"{issue['file']}:{issue['line']}"

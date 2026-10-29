@@ -1,3 +1,10 @@
+"""Candidate Patch 与人工 Diff 审批。
+
+模型或 Agent 不能直接覆盖 RTL/DS 文件。它只能提供 after_content，本服务保存创建时
+的 before_content 并生成 unified diff。用户批准时还会检查目标文件是否被别人修改，
+从而避免把过期 Patch 覆盖到新的代码上。
+"""
+
 import difflib
 from uuid import uuid4
 
@@ -7,6 +14,7 @@ from app.storage.database import Database, database
 
 
 class PatchService:
+    """创建、查询和审批候选 Patch。"""
     def __init__(
         self,
         workspaces: WorkspaceService = workspace_service,
@@ -16,6 +24,7 @@ class PatchService:
         self.db = db
 
     def create(self, request: PatchCreateRequest) -> PatchView:
+        """读取目标当前内容，生成 Diff，并以 ``patch_ready`` 状态落库。"""
         target = self.workspaces.resolve_path(request.workspace_id, request.target_path)
         before = target.read_text(encoding="utf-8") if target.exists() else ""
         diff = "".join(
@@ -46,6 +55,7 @@ class PatchService:
         return self.get(patch_id)  # type: ignore[return-value]
 
     def get(self, patch_id: str) -> PatchView | None:
+        """返回公开 PatchView；before/after 原文不直接暴露给普通查询接口。"""
         row = self.db.fetch_one("SELECT * FROM patches WHERE patch_id = ?", (patch_id,))
         if not row:
             return None
@@ -62,6 +72,11 @@ class PatchService:
         )
 
     def decide(self, patch_id: str, decision: PatchDecisionRequest) -> PatchView:
+        """处理 approve/reject/custom 三种人工决定。
+
+        approve 才会写目标文件；reject 只记录拒绝；custom 表示用户希望按新要求
+        重新生成候选，而不是在原 Patch 上静默修改。
+        """
         row = self.db.fetch_one("SELECT * FROM patches WHERE patch_id = ?", (patch_id,))
         if not row:
             raise KeyError(patch_id)
@@ -79,6 +94,8 @@ class PatchService:
         else:
             target = self.workspaces.resolve_path(row["workspace_id"], row["target_path"])
             current = target.read_text(encoding="utf-8") if target.exists() else ""
+            # 乐观并发检查：Patch 创建后若文件变化，旧 Diff 的行和语义都可能过期。
+            # 此时必须创建新 Patch，不能直接覆盖用户或其他工具的新修改。
             if current != row["before_content"]:
                 raise ValueError("Target changed after patch creation; create a new patch")
             self.workspaces.write_text(

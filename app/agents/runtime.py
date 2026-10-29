@@ -1,3 +1,13 @@
+"""Agent 推理运行时。
+
+这个文件提供两套实现，但暴露相同方法：
+- ``DeterministicAgentRuntime``：离线测试和无 Key 演示，结果可预测；
+- ``LLMChipDesignRuntime``：调用 DeepSeek/OpenAI 等真实模型。
+
+业务 Service 只依赖底部的 ``ConfigurableAgentRuntime``，因此切换模型不会改变
+DS、Run、Patch 或 Tool 权限逻辑。模型负责语义判断，确定性 Service 负责安全边界。
+"""
+
 import os
 import re
 from dataclasses import replace
@@ -10,11 +20,10 @@ from app.skills import skill_catalog
 
 
 class DeterministicAgentRuntime:
-    """A deterministic stand-in for the model layer.
+    """真实模型层的确定性替身，主要验证控制流而不是回答质量。
 
-    It makes the workflow runnable and testable before a real model provider is
-    introduced. The public methods intentionally return dictionaries matching
-    the future structured-output contracts.
+    它让项目在没有网络和 API Key 时仍可运行、演示和测试。所有公开方法都返回
+    与真实模型相同的结构化契约，因此上层 Service 不需要针对测试模式写分支。
     """
 
     @staticmethod
@@ -48,6 +57,11 @@ class DeterministicAgentRuntime:
 
     @staticmethod
     def enrich_intent(request: dict[str, Any], tool_names: list[str]) -> dict[str, Any]:
+        """用规则把用户原话整理为 TaskIntent。
+
+        这里始终保留 ``raw_request``，派生目标不能覆盖用户原话。只有传入的
+        ``tool_names`` 才能成为候选，保证 Intent 阶段也遵守角色权限。
+        """
         message = request["message"].strip()
         compact = re.sub(r"\s+", "", message.lower())
         candidates: list[str] = []
@@ -99,6 +113,11 @@ class DeterministicAgentRuntime:
         observations: list[dict[str, Any]],
         primary_agent: str = "design",
     ) -> dict[str, Any]:
+        """模拟主 Agent 从候选 Tool Schema 中选择一个动作。
+
+        规则顺序代表安全优先级：先处理缺失信息和已有 Observation，再识别明确
+        工程动作、专家委派、未接入能力，最后才回退普通聊天。
+        """
         if intent.get("missing_information"):
             return {
                 "name": "ask_user",
@@ -175,6 +194,7 @@ class DeterministicAgentRuntime:
         primary_agent: str,
         max_tools: int,
     ) -> dict[str, Any]:
+        """模拟轻量 Selector；只返回名称，不生成 Tool 参数。"""
         available = {item["name"] for item in tool_metadata}
         selected = [
             name
@@ -390,14 +410,20 @@ endmodule
 
 
 class LLMChipDesignRuntime:
-    """Real-model implementation used when model settings are enabled and ready."""
+    """模型配置已启用且 Key 可用时使用的真实模型实现。"""
 
     @staticmethod
     def _provider() -> OpenAIModelProvider:
+        """为主 Agent和专业角色创建使用主模型配置的 Provider。"""
         return OpenAIModelProvider(model_settings_service.effective())
 
     @staticmethod
     def _selector_provider() -> OpenAIModelProvider:
+        """创建轻量 Selector Provider。
+
+        Provider、Base URL 和 Key 仍复用主配置，只替换模型名与输出 Token 上限。
+        因此本地用户只需维护一套服务商凭据。
+        """
         settings = model_settings_service.effective()
         return OpenAIModelProvider(
             replace(
@@ -409,6 +435,7 @@ class LLMChipDesignRuntime:
 
     @staticmethod
     def _context(request: dict[str, Any]) -> dict[str, Any]:
+        """构造并裁剪模型上下文，防止上传文档无限扩张请求体。"""
         documents = []
         remaining = 120_000
         for document in request["documents"]:
@@ -469,6 +496,7 @@ class LLMChipDesignRuntime:
         observations: list[dict[str, Any]],
         primary_agent: str = "design",
     ) -> dict[str, Any]:
+        """让当前主 Agent 使用原生 Function Calling 选择一个候选 Tool。"""
         payload = self._context(request)
         payload.update(
             {
@@ -481,6 +509,7 @@ class LLMChipDesignRuntime:
                 "primary_agent": primary_agent,
             }
         )
+        # tools 已经是 Selector 产生的候选集，这里才展开完整 JSON Schema。
         schemas = []
         for tool in tools:
             schemas.append(
@@ -508,6 +537,11 @@ class LLMChipDesignRuntime:
         primary_agent: str,
         max_tools: int,
     ) -> dict[str, Any]:
+        """让轻量模型从已授权 Metadata 中选取有限 Tool 名称。
+
+        该模型不能看到 executor，也不能授予权限。返回值还会在
+        ``ToolSelectorService`` 中再次与授权字典求交集。
+        """
         payload = {
             "primary_agent": primary_agent,
             "task_intent": intent,
@@ -684,17 +718,20 @@ def json_payload(payload: dict[str, Any]) -> str:
 
 
 class ConfigurableAgentRuntime:
+    """运行时门面：每次调用都根据最新配置选择真实模型或确定性实现。"""
     def __init__(self) -> None:
         self.deterministic = DeterministicAgentRuntime()
         self.llm = LLMChipDesignRuntime()
 
     def _active(self):
+        """测试环境强制确定性 Runtime；正常环境在配置 ready 时使用真实模型。"""
         forced_enabled = os.getenv("CHIP_AGENT_MODEL_ENABLED")
         if forced_enabled is not None and forced_enabled.strip().lower() in {"0", "false", "no", "off"}:
             return self.deterministic
         return self.llm if model_settings_service.effective().ready else self.deterministic
 
     def __getattr__(self, name: str):
+        # 属性代理让调用端始终使用 runtime.generate_ds(...) 这一种写法。
         return getattr(self._active(), name)
 
 

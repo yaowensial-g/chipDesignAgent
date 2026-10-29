@@ -1,13 +1,22 @@
+"""顶层编排 Tool 的声明。
+
+本文件只描述 Tool 的能力、参数和权限，不实现 DS/RTL 等业务逻辑。真正执行发生在
+``OrchestratorService._execute`` 及其调用的专业 Service 中。将“声明”与“执行”分开，
+可以让模型看到稳定 Schema，同时让后端继续掌握真实副作用。
+"""
+
 from app.domain.enums import AgentRole, Mutability
 from app.tools.registry import tool_registry
 
 
 def register_orchestration_tools() -> None:
+    """幂等注册主 Agent 可使用的对话、Delegate 和候选生成 Tool。"""
     definitions = [
         dict(
             name="reply_to_user",
             allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
             category="common",
+            # 主 Agent 必须始终有办法安全结束当前 Run。
             always_available=True,
             description="直接回答、解释、讨论或总结用户问题；它也是普通聊天任务的唯一执行步骤。",
             when_to_use="请求不需要工程副作用，或已有观察结果足以形成最终答复时。",
@@ -25,6 +34,7 @@ def register_orchestration_tools() -> None:
             name="ask_user",
             allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
             category="common",
+            # 缺少权威信息时应暂停询问，而不是为了完成任务编造事实。
             always_available=True,
             description="当缺失信息会显著改变工程结果时，暂停 Run 并向用户提出一个明确问题。",
             when_to_use="目标、交付物、目标文件、权威规格结论或执行授权缺失且无法安全推断时。",
@@ -55,6 +65,7 @@ def register_orchestration_tools() -> None:
         ),
         dict(
             name="consult_design_agent",
+            # Design 专家只对 Verification 主 Agent 开放，Design 不需要委派自己。
             allowed_roles=[AgentRole.VERIFICATION],
             category="delegation",
             description="让设计角色分析微架构、子模块、电路实现和 RTL 方案。",
@@ -67,6 +78,7 @@ def register_orchestration_tools() -> None:
         ),
         dict(
             name="consult_verification_agent",
+            # Verification 专家只对 Design 主 Agent 开放。
             allowed_roles=[AgentRole.DESIGN],
             category="delegation",
             description="让验证角色检查可观察性、边界条件、异常行为和可验证性。",
@@ -124,6 +136,7 @@ def register_orchestration_tools() -> None:
         ),
     ]
 
+    # Python 模块可能在测试或热加载场景被重复导入，因此按名称跳过已注册项。
     existing = {tool.name for tool in tool_registry.list()}
     for definition in definitions:
         if definition["name"] in existing:

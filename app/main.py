@@ -1,3 +1,9 @@
+"""FastAPI 应用装配入口。
+
+这里负责中间件、统一异常响应和路由挂载，不放具体业务逻辑。开发时如果某个路由
+变得很长，应优先把状态转换拆到 Service，而不是继续扩展 main.py。
+"""
+
 import logging
 from uuid import uuid4
 
@@ -29,6 +35,7 @@ app.add_middleware(
 
 @app.middleware("http")
 async def attach_request_id(request: Request, call_next):
+    """为每个请求附加可搜索的 ID，前端错误与后端日志可用同一编号关联。"""
     request_id = request.headers.get("X-Request-ID") or uuid4().hex[:12]
     request.state.request_id = request_id
     response = await call_next(request)
@@ -38,6 +45,11 @@ async def attach_request_id(request: Request, call_next):
 
 @app.exception_handler(Exception)
 async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+    """把未知异常转换成稳定 JSON，避免浏览器只看到无信息的 HTML 500 页面。
+
+    已知模型/密钥问题给出可操作建议；真正未知异常只向用户返回安全概述，详细
+    traceback 写入后端日志，避免把本机路径或敏感上下文泄露到前端。
+    """
     request_id = getattr(request.state, "request_id", uuid4().hex[:12])
     if isinstance(exc, SecretProtectionError):
         code = "MODEL_KEY_UNREADABLE"

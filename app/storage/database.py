@@ -1,3 +1,10 @@
+"""SQLite 基础访问层。
+
+项目目前是 Windows 本地单用户应用，因此使用零部署 SQLite。这个类只提供
+最小的 execute/fetch/JSON 辅助，不在这里放业务规则；业务状态转换仍由 Service
+负责。每次操作使用短连接，并通过进程内锁降低多线程 ToolRun 的写冲突。
+"""
+
 import json
 import sqlite3
 import threading
@@ -10,13 +17,16 @@ DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "chipflow.db"
 
 
 class Database:
+    """负责建表、兼容迁移和线程安全的基础 SQL 访问。"""
     def __init__(self, path: Path = DEFAULT_DATABASE_PATH) -> None:
+        # 测试可以注入临时数据库路径；正常运行默认写入 data/chipflow.db。
         self.path = path
         self._lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def connect(self) -> sqlite3.Connection:
+        """创建短生命周期连接，并统一启用外键与 WAL。"""
         connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -24,22 +34,31 @@ class Database:
         return connection
 
     def execute(self, sql: str, parameters: tuple[Any, ...] = ()) -> None:
+        """执行一条写 SQL 并立即提交事务。参数必须使用占位符，禁止字符串拼接。"""
         with self._lock, self.connect() as connection:
             connection.execute(sql, parameters)
             connection.commit()
 
     def fetch_one(self, sql: str, parameters: tuple[Any, ...] = ()) -> dict[str, Any] | None:
+        """查询单行并转换成普通字典，避免 Service 依赖 sqlite3.Row。"""
         with self._lock, self.connect() as connection:
             row = connection.execute(sql, parameters).fetchone()
         return dict(row) if row else None
 
     def fetch_all(self, sql: str, parameters: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        """查询多行并转换为字典列表。"""
         with self._lock, self.connect() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [dict(row) for row in rows]
 
     def _initialize(self) -> None:
+        """幂等创建当前 Schema，并为旧数据库补充新增列。
+
+        MVP 尚未引入 Alembic，所以只允许在这里做简单、向后兼容的 ADD COLUMN。
+        复杂生产迁移应改用正式迁移工具，不能继续堆叠手写条件分支。
+        """
         schema = """
+        -- Workspace 是所有文件操作的安全根目录，禁止 Tool 任意访问用户磁盘。
         CREATE TABLE IF NOT EXISTS workspaces (
             workspace_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -109,6 +128,7 @@ class Database:
             state_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- Run 是用户任务控制面；专业执行细节通过下方 ID 关联，不全部复制进来。
         CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
@@ -128,6 +148,7 @@ class Database:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- Event 使用 run_id + sequence 保证同一 Run 内可按稳定顺序回放。
         CREATE TABLE IF NOT EXISTS run_events (
             event_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -138,6 +159,7 @@ class Database:
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
+        -- Conversation 保存工作角色和主 Agent，不保存整段聊天正文。
         CREATE TABLE IF NOT EXISTS conversations (
             session_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
@@ -146,6 +168,7 @@ class Database:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        -- 每次跨专业 Delegate 都有独立记录，失败或超时也不会丢失审计线索。
         CREATE TABLE IF NOT EXISTS delegation_tasks (
             task_id TEXT PRIMARY KEY,
             parent_run_id TEXT NOT NULL,
@@ -173,6 +196,8 @@ class Database:
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
+            # 兼容已有本地数据库：CREATE TABLE IF NOT EXISTS 不会为旧表增加新列，
+            # 因而必须检查 PRAGMA 后再执行最小迁移。
             issue_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(engineering_issues)")
             }
@@ -187,10 +212,12 @@ class Database:
 
     @staticmethod
     def dumps(value: Any) -> str:
+        """以 UTF-8 友好的紧凑格式序列化 JSON，保留中文可读性。"""
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
     @staticmethod
     def loads(value: str | None, default: Any) -> Any:
+        """反序列化可空 JSON 字段；空值返回调用方提供的默认值。"""
         if not value:
             return default
         return json.loads(value)

@@ -1,3 +1,9 @@
+"""模型配置的读取、合并和本地持久化。
+
+配置优先级从高到低：环境变量 → 网页保存 JSON → 仓库默认 TOML。
+API Key 单独经过 Windows DPAPI 保护，公开接口永远不返回明文。
+"""
+
 import json
 import os
 import threading
@@ -16,6 +22,7 @@ SAVED_CONFIG_PATH = PROJECT_ROOT / "data" / "model_settings.json"
 
 @dataclass(frozen=True)
 class EffectiveModelSettings:
+    """完成三层合并后，Runtime 实际使用的不可变配置。"""
     enabled: bool
     provider: str
     api_style: str
@@ -31,11 +38,12 @@ class EffectiveModelSettings:
 
     @property
     def ready(self) -> bool:
+        # enabled 表示用户主动启用，api_key 表示具备调用条件；两者缺一不可。
         return self.enabled and bool(self.api_key.strip())
 
 
 class ModelSettingsService:
-    """Loads defaults and persists local overrides without exposing secrets."""
+    """加载默认值并保存本地覆盖，同时避免暴露密钥。"""
 
     def __init__(
         self,
@@ -47,6 +55,7 @@ class ModelSettingsService:
         self._lock = threading.RLock()
 
     def effective(self) -> EffectiveModelSettings:
+        """按优先级合并配置，并解密当前 Provider 对应的 Key。"""
         with self._lock:
             defaults = self._load_defaults()
             saved = self._load_saved()
@@ -54,6 +63,7 @@ class ModelSettingsService:
         provider = str(value_from_sources(saved, defaults, "provider", "CHIP_AGENT_MODEL_PROVIDER"))
         key_environment_name = "DEEPSEEK_API_KEY" if provider == "deepseek" else "OPENAI_API_KEY"
         base_url_environment_name = "DEEPSEEK_BASE_URL" if provider == "deepseek" else "OPENAI_BASE_URL"
+        # 环境变量最适合 CI/部署，因此优先于网页保存的本机密文。
         environment_key = os.getenv(key_environment_name, "").strip()
         saved_key = ""
         provider_key_field = f"{provider}_api_key_protected"
@@ -100,6 +110,7 @@ class ModelSettingsService:
         )
 
     def save(self, updates: dict[str, object]) -> EffectiveModelSettings:
+        """保存网页覆盖配置，并使用临时文件替换避免写一半导致 JSON 损坏。"""
         with self._lock:
             current = self._load_saved()
             updates = dict(updates)
@@ -114,6 +125,8 @@ class ModelSettingsService:
                     current.pop("api_key", None)
                     current.pop("api_key_protected", None)
             elif isinstance(api_key, str) and api_key.strip():
+                # 不把明文 API Key 写入 JSON；每个 Provider 使用独立密文字段，
+                # 避免切换 OpenAI/DeepSeek 时误用另一家的凭据。
                 current[provider_key_field] = protect_secret(api_key.strip())
                 if provider == "openai":
                     current.pop("api_key", None)
@@ -129,6 +142,7 @@ class ModelSettingsService:
         return self.effective()
 
     def public_view(self) -> dict[str, object]:
+        """返回前端可见配置：删除明文 Key，只保留存在标记和掩码。"""
         settings = self.effective()
         view = asdict(settings)
         view.pop("api_key")
@@ -167,6 +181,7 @@ def value_from_sources(
     environment_name: str | None = None,
     fallback: object | None = None,
 ):
+    """按环境变量、保存值、默认值、兼容 fallback 的顺序取配置。"""
     if environment_name and os.getenv(environment_name) is not None:
         return os.environ[environment_name]
     if name in saved:

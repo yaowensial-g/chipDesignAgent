@@ -1,8 +1,15 @@
+"""Agent 角色目录。
+
+角色按真实生产职责划分，而不是“每个函数一个 Agent”。这里保存相对稳定的职责、
+Prompt 版本和委派关系；具体 Tool 权限仍以 Tool Registry 为准，避免两处权限漂移。
+"""
+
 from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
 class AgentDefinition:
+    """角色的静态说明，用于文档、Prompt 组装和能力发现。"""
     agent_id: str
     display_name: str
     prompt_version: str
@@ -15,6 +22,8 @@ class AgentDefinition:
 
 AGENTS: dict[str, AgentDefinition] = {
     "orchestrator": AgentDefinition(
+        # v0.5 中仅保留历史语义。真正顶层是确定性 Control Plane，
+        # 该角色不能成为会话 primary_agent。
         agent_id="orchestrator",
         display_name="Orchestrator Agent",
         prompt_version="v3",
@@ -32,6 +41,7 @@ AGENTS: dict[str, AgentDefinition] = {
         agent_id="architecture_advisor",
         display_name="Architecture Agent",
         prompt_version="v2",
+        # 虚拟架构专家没有组织授权，只能解释和质疑受控规格。
         read_only=True,
         purpose="解释并质疑 FS、AS 和 ICD，不作正式架构决策。",
         system_prompt="你是只读 Architecture 专家，负责架构与微架构分析，不批准或修改受控规格。",

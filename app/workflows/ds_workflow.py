@@ -1,3 +1,9 @@
+"""DS 专业子流程的 LangGraph 定义。
+
+顶层主 Agent 通过 ``create_ds_candidate`` Tool 启动这个子图。图适合表达 DS 内部
+相对稳定的并行分析、冲突循环、人工中断和并行评审；它不是所有任务的固定总流程。
+"""
+
 import operator
 from typing import Annotated, Any, TypedDict
 
@@ -10,6 +16,11 @@ from app.agents.runtime import runtime
 
 
 class DSWorkflowState(TypedDict, total=False):
+    """图节点共享状态。
+
+    ``events`` 使用 ``Annotated[..., operator.add]``，表示并行节点返回的事件应追加，
+    而不是后完成的节点覆盖先完成节点。其余字段由对应节点独占写入。
+    """
     task_id: str
     request: dict[str, Any]
     status: str
@@ -39,6 +50,7 @@ def _disabled(state: DSWorkflowState, agent_id: str) -> bool:
 
 
 async def prepare_context(state: DSWorkflowState) -> dict[str, Any]:
+    """冻结输入并记录被用户禁用角色带来的质量降级。"""
     disabled = set(state["request"].get("disabled_agents", []))
     warnings = [
         f"用户禁用了 {agent_id}；相关检查未执行，交付质量可能下降。"
@@ -54,6 +66,7 @@ async def prepare_context(state: DSWorkflowState) -> dict[str, Any]:
 
 
 async def architecture_analysis(state: DSWorkflowState) -> dict[str, Any]:
+    """只读理解架构基线；虚拟架构角色不能批准或修改 FS/AS。"""
     if _disabled(state, "architecture_advisor"):
         result = {"summary": "架构顾问 Agent 已被用户禁用。", "sources": []}
     else:
@@ -95,6 +108,7 @@ async def verification_analysis(state: DSWorkflowState) -> dict[str, Any]:
 
 
 async def detect_conflicts(state: DSWorkflowState) -> dict[str, Any]:
+    """在三类分析汇合后检测需要讨论或升级真实架构师的问题。"""
     issues = runtime.detect_issues(state["request"])
     message = "未发现需要升级的规格冲突。"
     status = "executing"
@@ -113,6 +127,7 @@ def route_after_conflict_detection(state: DSWorkflowState) -> str:
 
 
 async def discussion(state: DSWorkflowState) -> dict[str, Any]:
+    """推进一轮内部讨论；没有新正式证据时不会擅自关闭 Issue。"""
     round_number = state.get("discussion_round", 0) + 1
     issues = [dict(issue, discussion_round=round_number) for issue in state.get("issues", [])]
     return {
@@ -130,6 +145,7 @@ async def discussion(state: DSWorkflowState) -> dict[str, Any]:
 
 
 def route_after_discussion(state: DSWorkflowState) -> str:
+    """达到用户配置轮次后停止内部循环并升级，而不是无限消耗模型。"""
     maximum = state["request"].get("max_discussion_rounds", 2)
     if state.get("discussion_round", 0) < maximum:
         return "discussion"
@@ -137,6 +153,7 @@ def route_after_discussion(state: DSWorkflowState) -> str:
 
 
 async def await_user(state: DSWorkflowState) -> dict[str, Any]:
+    """使用 LangGraph interrupt 暂停，等待真实架构结论、假设或取消决定。"""
     response = interrupt(
         {
             "type": "architecture_resolution_required",
@@ -170,6 +187,7 @@ async def cancelled(state: DSWorkflowState) -> dict[str, Any]:
 
 
 async def generate_ds(state: DSWorkflowState) -> dict[str, Any]:
+    """生成 Markdown Candidate；关键电路图仍由真实工程师补充。"""
     markdown = runtime.generate_ds(
         state["request"],
         state.get("design_analysis", {}),
@@ -188,6 +206,7 @@ def _review_result(
     category: str,
     custom_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
+    """统一调用独立 Reviewer；禁用角色返回空 Finding，不伪装成已评审。"""
     if _disabled(state, agent_id):
         return []
     return runtime.review(
@@ -255,6 +274,7 @@ async def custom_review(state: DSWorkflowState) -> dict[str, Any]:
 
 
 async def aggregate_findings(state: DSWorkflowState) -> dict[str, Any]:
+    """聚合各独立视角，不自动根据多数意见修改 DS。"""
     findings = [
         *state.get("spec_findings", []),
         *state.get("design_findings", []),
@@ -275,6 +295,11 @@ async def aggregate_findings(state: DSWorkflowState) -> dict[str, Any]:
 
 
 def build_ds_workflow():
+    """声明节点和有向边，并编译为可执行 LangGraph。
+
+    读图技巧：先看 START 到 prepare_context，再看三路分析如何汇合；冲突路径可能
+    循环或 interrupt，无冲突路径生成 DS；生成后五路评审并行，最终汇合交付。
+    """
     builder = StateGraph(DSWorkflowState)
     builder.add_node("prepare_context", prepare_context)
     builder.add_node("architecture_analysis", architecture_analysis)
@@ -292,6 +317,7 @@ def build_ds_workflow():
     builder.add_node("custom_review", custom_review)
     builder.add_node("aggregate_findings", aggregate_findings)
 
+    # 第一阶段：一次准备后并行执行架构、设计、验证分析。
     builder.add_edge(START, "prepare_context")
     builder.add_edge("prepare_context", "architecture_analysis")
     builder.add_edge("prepare_context", "design_analysis")
@@ -299,6 +325,7 @@ def build_ds_workflow():
     builder.add_edge("architecture_analysis", "detect_conflicts")
     builder.add_edge("design_analysis", "detect_conflicts")
     builder.add_edge("verification_analysis", "detect_conflicts")
+    # 第二阶段：有冲突进入有限讨论，无冲突直接生成 DS。
     builder.add_conditional_edges(
         "detect_conflicts",
         route_after_conflict_detection,
@@ -315,6 +342,7 @@ def build_ds_workflow():
         {"cancelled": "cancelled", "generate_ds": "generate_ds"},
     )
     builder.add_edge("cancelled", END)
+    # 第三阶段：DS 生成后独立并行评审，避免生成者自我批准。
     builder.add_edge("generate_ds", "spec_review")
     builder.add_edge("generate_ds", "design_review")
     builder.add_edge("generate_ds", "verification_review")
@@ -327,6 +355,8 @@ def build_ds_workflow():
     builder.add_edge("custom_review", "aggregate_findings")
     builder.add_edge("aggregate_findings", END)
 
+    # MemorySaver 只负责当前进程内的 interrupt/resume；应用层 TaskService 另存
+    # SQLite 快照。它不是生产级持久化 LangGraph Checkpointer。
     return builder.compile(checkpointer=MemorySaver())
 
 

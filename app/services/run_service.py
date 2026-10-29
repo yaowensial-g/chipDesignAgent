@@ -1,3 +1,14 @@
+"""统一 Run 控制面。
+
+Run 表示“用户要求系统完成的一件事”，但不复制所有专业状态：
+- DS 的专业状态仍由 Task/LangGraph 保存；
+- RTL 修改内容仍由 Patch 保存；
+- 外部工具进程仍由 ToolRun 保存。
+
+Run 只负责把这些对象串在同一条用户任务证据链上，并提供统一的
+running / waiting / completed / failed / cancelled 状态给前端。
+"""
+
 import re
 from typing import Any
 from uuid import uuid4
@@ -30,10 +41,10 @@ TOOL_BY_RUN_TYPE = {
 
 
 class RunService:
-    """Persists and coordinates user-requested work across workflows and tools.
+    """持久化并协调跨 Workflow、Patch 和 ToolRun 的用户任务。
 
-    A Run is the common control-plane record. Existing DS Task and ToolRun records
-    remain the specialized execution records linked from it.
+    Run 是公共控制面记录，DS Task、Patch 和 ToolRun 是专业执行记录。
+    两层分开可以避免把不同领域的全部字段塞进一个万能 JSON。
     """
 
     def __init__(
@@ -59,6 +70,7 @@ class RunService:
         intent: dict[str, Any],
         primary_agent: AgentRole,
     ) -> str:
+        """创建顶层 Run，并记录原始 Intent 与主 Agent 身份。"""
         run_id = self._create(
             session_id,
             request,
@@ -87,6 +99,11 @@ class RunService:
         tool_selections: list[dict[str, Any]] | None = None,
         delegations: list[dict[str, Any]] | None = None,
     ) -> None:
+        """把每轮 Planner 轨迹合并到 Run.result。
+
+        使用整体 JSON 快照便于当前本地 MVP 查询。未来若事件量很大，可以把
+        Tool Call/Observation 拆成独立表，但公开 ``RunView`` 契约无需改变。
+        """
         run = self.get(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -101,6 +118,7 @@ class RunService:
         self._update(run_id, result=result)
 
     def complete_reply(self, run_id: str, message: str) -> RunView:
+        """结束普通聊天 Run，并保存最终助手消息。"""
         self._set_run_type(run_id, RunType.CHAT)
         run = self.get(run_id)
         if run is None:
@@ -119,6 +137,7 @@ class RunService:
         message: str,
         details: dict[str, Any] | None = None,
     ) -> RunView:
+        """把 Run 置为可恢复等待态，而不是把缺少信息当作系统失败。"""
         pending = {"type": pending_type, "message": message, **(details or {})}
         self._update(run_id, status=RunStatus.WAITING_FOR_USER, pending=pending)
         self.append_event(run_id, "input_required", message, "orchestrator")
@@ -127,12 +146,14 @@ class RunService:
     async def execute_ds_tool(
         self, run_id: str, request: ChatRequest
     ) -> tuple[RunView, TaskView | None, str]:
+        """将顶层 Run 切为 DS 类型，并复用既有 DS Workflow。"""
         self._set_run_type(run_id, RunType.DS_DESIGN)
         return await self._start_ds(run_id, request)
 
     def execute_rtl_tool(
         self, run_id: str, request: ChatRequest
     ) -> tuple[RunView, None, str]:
+        """将顶层 Run 切为 RTL 类型，并生成等待审批的 Candidate Patch。"""
         self._set_run_type(run_id, RunType.RTL_IMPLEMENTATION)
         return self._start_rtl(run_id, request)
 
@@ -142,10 +163,12 @@ class RunService:
         request: ChatRequest,
         run_type: RunType,
     ) -> tuple[RunView, None, str]:
+        """启动 Lint/用例发现等工程 Tool，并关联独立 ToolRun。"""
         self._set_run_type(run_id, run_type)
         return self._start_tool(run_id, request, run_type)
 
     def report_capability_gap(self, run_id: str, capability: str) -> RunView:
+        """记录尚未接入的真实能力，避免用虚构执行结果欺骗用户。"""
         mapping = {
             "simulation": RunType.SIMULATION,
             "cdc": RunType.CDC,
@@ -167,6 +190,8 @@ class RunService:
     async def _start_ds(
         self, run_id: str, request: ChatRequest
     ) -> tuple[RunView, TaskView | None, str]:
+        """校验 DS 前置资料、创建专业 Task，并把状态映射回统一 Run。"""
+        # AS 是 DS 的设计基线。缺少时保留 Run 并等待用户，而不是让模型猜架构。
         if not request.documents or not any(document.kind.value == "AS" for document in request.documents):
             pending = {
                 "type": "missing_design_baseline",
@@ -215,6 +240,7 @@ class RunService:
     def _start_rtl(
         self, run_id: str, request: ChatRequest
     ) -> tuple[RunView, None, str]:
+        """校验已确认 DS，生成 RTL Candidate，并停在人工 Diff 审批点。"""
         if not request.ds_markdown:
             pending = {
                 "type": "missing_confirmed_ds",
@@ -256,6 +282,8 @@ class RunService:
     def _start_tool(
         self, run_id: str, request: ChatRequest, run_type: RunType
     ) -> tuple[RunView, None, str]:
+        """准备工程 Tool 参数、Workspace 和用户授权。"""
+        # 优先使用请求明确指定的 Workspace；未指定时才尝试项目已有 Workspace。
         workspace_id = request.workspace_id
         if not workspace_id:
             workspaces = self.workspaces.list(request.project_id)
@@ -279,6 +307,8 @@ class RunService:
             )
             return self.get(run_id), None, "已创建工程 Run，但当前项目还没有 Workspace。"  # type: ignore[return-value]
 
+        # 网页按钮的 user_approved 最明确；自然语言中出现“执行/运行”等词也视为
+        # 本轮明确授权。仅讨论 Lint 概念不会满足这个条件。
         approved = request.user_approved or self._is_explicit_execution(request.message)
         if run_type == RunType.LINT and not approved:
             pending = {
@@ -305,11 +335,17 @@ class RunService:
         arguments: dict[str, Any],
         run_type: RunType,
     ) -> tuple[RunView, None, str]:
+        """创建专业 ToolRun，并把其 ID 关联回顶层 Run。"""
+        control = self.db.fetch_one(
+            "SELECT primary_agent FROM runs WHERE run_id = ?", (run_id,)
+        )
+        # ToolRun 也应记录真实调用角色。旧 Run 没有 primary_agent 时才回退 Design。
+        tool_role = AgentRole((control or {}).get("primary_agent") or AgentRole.DESIGN.value)
         tool_run = self.tools.start(
             ToolRunRequest(
                 workspace_id=workspace_id,
                 tool_name=tool_name,
-                role=AgentRole.DESIGN,
+                role=tool_role,
                 arguments=arguments,
                 user_approved=True,
             )
@@ -322,13 +358,16 @@ class RunService:
             pending=None,
             result={"tool_name": tool_name, "arguments": arguments},
         )
-        control = self.db.fetch_one("SELECT primary_agent FROM runs WHERE run_id = ?", (run_id,))
-        actor = (control or {}).get("primary_agent") or AgentRole.DESIGN.value
+        actor = tool_role.value
         self.append_event(run_id, "tool_started", f"已启动 {tool_name}。", actor)
         label = "已有用例发现" if run_type == RunType.TEST_EXECUTION else run_type.value
         return self.get(run_id), None, f"{label} Run 已启动，可在任务面板查看进度。"  # type: ignore[return-value]
 
     async def resume(self, run_id: str, request: RunResumeRequest) -> RunView:
+        """根据 Run 类型恢复 DS、Patch 审批或工程 Tool 授权。
+
+        Resume 只允许作用于 waiting 状态，避免对已完成任务重复应用副作用。
+        """
         run = self.get(run_id)
         if run is None:
             raise KeyError(run_id)
@@ -427,6 +466,7 @@ class RunService:
         return self.get(run_id)  # type: ignore[return-value]
 
     def get(self, run_id: str) -> RunView | None:
+        """读取 Run；若关联 ToolRun 已结束，先同步其终态再返回。"""
         row = self.db.fetch_one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         if not row:
             return None
@@ -464,6 +504,7 @@ class RunService:
         message: str,
         agent_id: str | None = None,
     ) -> None:
+        """为 Run 追加单调递增事件，供 UI 展示和问题排查。"""
         row = self.db.fetch_one(
             "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM run_events WHERE run_id = ?",
             (run_id,),
@@ -482,6 +523,7 @@ class RunService:
         reason: str,
         primary_agent: AgentRole | None = None,
     ) -> str:
+        """插入最小 Run 记录；后续状态变化统一通过 ``_update``。"""
         run_id = str(uuid4())
         now = utc_now()
         self.db.execute(
@@ -519,6 +561,11 @@ class RunService:
         pending: dict[str, Any] | None | object = ...,
         result: dict[str, Any] | None = None,
     ) -> None:
+        """局部更新 Run，同时保留调用方没有传入的字段。
+
+        ``pending=...``（省略号）表示“不修改等待项”，``pending=None`` 才表示
+        “明确清空等待项”。这个区别对 Resume/Complete 非常重要。
+        """
         row = self.db.fetch_one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         if not row:
             raise KeyError(run_id)
@@ -551,6 +598,7 @@ class RunService:
         )
 
     def _refresh_tool_status(self, row: dict[str, Any]) -> None:
+        """把专业 ToolRun 的终态映射到用户可见的统一 Run。"""
         tool_run = self.tools.get(row["tool_run_id"])
         if tool_run is None:
             self._update(row["run_id"], status=RunStatus.FAILED)
@@ -575,6 +623,7 @@ class RunService:
 
     @staticmethod
     def _task_status(task: TaskView) -> RunStatus:
+        """把 DS Task 的细粒度状态折叠为统一 RunStatus。"""
         if task.status.value == "waiting_for_user":
             return RunStatus.WAITING_FOR_USER
         if task.status.value in {"delivered", "accepted"}:

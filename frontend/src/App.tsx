@@ -61,6 +61,8 @@ const initialMessage: ChatMessage = {
 };
 
 function App() {
+  // projectId/moduleName/documents 属于共享工程上下文；userRole 属于当前工作身份。
+  // 角色切换时共享工程资料可以保留，但旧角色的私有聊天历史不能继续发送给新主 Agent。
   const [projectId, setProjectId] = useState("demo-project");
   const [moduleName, setModuleName] = useState("dma_ctrl");
   const [userRole, setUserRole] = useState<"design_engineer" | "verification_engineer">("design_engineer");
@@ -86,10 +88,12 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   function changeUserRole(nextRole: typeof userRole) {
+    // 选择相同角色时不重置页面，避免用户误触导致当前对话消失。
     if (nextRole === userRole) return;
     setUserRole(nextRole);
-    // Keep the conversation identity and shared project documents, but never
-    // resend another role's private chat history to the new primary agent.
+    // 保留 sessionId 和 documents：它们代表同一项目会话及共享资料。
+    // 清空 messages/task/run：防止后续 submitMessage 把旧角色消息重新拼入 history，
+    // 同时避免右侧仍展示上一个主 Agent 的当前任务而使用户产生误解。
     setMessages([
       {
         id: crypto.randomUUID(),
@@ -107,10 +111,13 @@ function App() {
   }
 
   useEffect(() => {
+    // 页面启动只读取脱敏配置。后端不会把完整 API Key 返回浏览器。
     getModelSettings().then(setModelSettings).catch(() => undefined);
   }, []);
 
   useEffect(() => {
+    // 外部 Tool 可能在线程池继续执行，因此运行态 Run 需要轮询。
+    // effect 依赖 run_id/status：任务结束后会自动清理定时器，避免永久请求后端。
     if (!run || !["planned", "running"].includes(run.status)) return;
     const timer = window.setInterval(() => {
       getRun(run.run_id).then(setRun).catch(() => undefined);
@@ -162,11 +169,13 @@ function App() {
   }, [task, run]);
 
   async function handleFiles(files: FileList | File[]) {
+    // 浏览器不自己解析 PDF/DOCX；统一发给后端抽取，保证文件类型和大小校验一致。
     const candidates = Array.from(files);
     if (!candidates.length) return;
     setUploading(true);
     setError(null);
     try {
+      // 多文件并行上传可以减少等待时间。这里只把文档加入上下文，不会自动启动 DS。
       const extracted = await Promise.all(
         candidates.map(async (file) => {
           const result = await extractFile(file);
@@ -210,6 +219,8 @@ function App() {
   }
 
   async function submitMessage(event: FormEvent) {
+    // 所有普通聊天和工程请求都从这一入口发送，前端不自行判断 DS/RTL/Lint 路由。
+    // 后端主 Agent 根据角色、Intent 和 Tool 权限决定下一步。
     event.preventDefault();
     if (!readyToSend) return;
     const content = draft.trim();
@@ -231,10 +242,13 @@ function App() {
         projectId,
         moduleName,
         message: content,
+        // 只发送最近 20 条可见消息，避免长会话无限膨胀。角色切换会先清空 messages，
+        // 所以这里不会把旧角色的私有历史再次带入新主 Agent。
         history: messages.slice(-20).map(({ role, content: messageContent }) => ({
           role,
           content: messageContent,
         })),
+        // 文档属于本地页面上下文；当前版本每轮随请求发送，后续可改为 Artifact ID 引用。
         documents: documents.map(({ kind, name, version, content: documentContent }) => ({
           kind,
           name,
@@ -246,6 +260,7 @@ function App() {
         userRole,
       });
       setSessionId(response.session_id);
+      // task 是 DS 专业记录，run 是统一控制面记录，两者可能同时存在但含义不同。
       if (response.task) setTask(response.task);
       if (response.run) setRun(response.run);
       addAssistant(response.assistant_message, response.route);

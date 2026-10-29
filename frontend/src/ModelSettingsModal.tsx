@@ -10,6 +10,8 @@ interface Props {
 }
 
 export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
+  // 主模型负责专业判断和最终 Tool Call；Selector 模型只根据短 Metadata 筛选候选 Tool。
+  // 两者共享 Provider/Base URL/API Key，但可以使用不同模型名和输出 Token 上限。
   const [enabled, setEnabled] = useState(settings.enabled);
   const [provider, setProvider] = useState<"openai" | "deepseek">(
     settings.provider === "deepseek" ? "deepseek" : "openai",
@@ -30,6 +32,8 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
   const currentProviderHasKey = provider === settings.provider && settings.has_api_key;
 
   function payload(): ModelSettingsInput {
+    // 空 apiKey 表示“不修改已保存密钥”；只有 clear_api_key=true 才会主动删除密钥。
+    // 这样用户修改模型名时无需再次输入已经安全保存的 Key。
     return {
       enabled,
       provider,
@@ -47,6 +51,8 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
   }
 
   function changeProvider(nextProvider: "openai" | "deepseek") {
+    // 切换供应商时填入常用默认值，减少手工输入；这些值仍可由用户编辑。
+    // 清空当前输入框不会直接删除后端保存的另一供应商密钥。
     setProvider(nextProvider);
     if (nextProvider === "deepseek") {
       setApiStyle("responses");

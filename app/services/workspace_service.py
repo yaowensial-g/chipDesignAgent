@@ -1,3 +1,9 @@
+"""隔离 Workspace 与版本化 Artifact 服务。
+
+所有 Agent/Tool 文件访问都应先转换成 Workspace 内的相对路径。这个模块负责阻止
+绝对路径和 ``..`` 路径穿越，并使用临时文件替换完成较安全的文本写入。
+"""
+
 import hashlib
 import re
 from datetime import datetime, timezone
@@ -21,6 +27,7 @@ def utc_now() -> str:
 
 
 class WorkspaceService:
+    """创建工作区并提供安全路径解析、原子文本写入。"""
     def __init__(
         self,
         db: Database = database,
@@ -31,7 +38,10 @@ class WorkspaceService:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def create(self, request: WorkspaceCreateRequest) -> WorkspaceView:
+        """创建独立目录和约定子目录，并把绝对根路径登记到数据库。"""
         workspace_id = str(uuid4())
+        # project_id 可能含中文、空格或路径字符，先转换成安全目录片段；
+        # UUID 后缀保证同项目可以创建多个互不覆盖的 Workspace。
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", request.project_id).strip("-._") or "project"
         path = (self.root / f"{slug[:48]}-{workspace_id[:8]}").resolve()
         self._assert_within_root(path)
@@ -69,6 +79,11 @@ class WorkspaceService:
         return [WorkspaceView(**row) for row in rows]
 
     def resolve_path(self, workspace_id: str, relative_path: str) -> Path:
+        """把相对路径解析到 Workspace 内，并拒绝绝对路径与目录穿越。
+
+        ``Path.resolve`` 会消除 ``..``，随后再检查目标是否仍是 root 的后代。
+        这是所有文件 Tool 都必须经过的核心安全边界。
+        """
         workspace = self.get(workspace_id)
         if workspace is None:
             raise KeyError(f"Workspace not found: {workspace_id}")
@@ -82,6 +97,7 @@ class WorkspaceService:
         return target
 
     def write_text(self, workspace_id: str, relative_path: str, content: str) -> Path:
+        """先写同目录临时文件，再 replace 目标，降低中途崩溃产生半文件的风险。"""
         target = self.resolve_path(workspace_id, relative_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
@@ -95,6 +111,7 @@ class WorkspaceService:
 
 
 class ArtifactService:
+    """写入带版本、Hash、来源和状态的工程制品记录。"""
     def __init__(
         self,
         workspace_service: WorkspaceService,
@@ -104,6 +121,7 @@ class ArtifactService:
         self.db = db
 
     def create(self, workspace_id: str, request: ArtifactCreateRequest) -> ArtifactView:
+        """保存制品内容，并为同一路径分配递增版本号。"""
         self.workspaces.write_text(workspace_id, request.relative_path, request.content)
         previous = self.db.fetch_one(
             "SELECT MAX(version) AS version FROM artifacts WHERE workspace_id = ? AND relative_path = ?",
@@ -111,6 +129,7 @@ class ArtifactService:
         )
         version = int(previous["version"] or 0) + 1
         artifact_id = str(uuid4())
+        # Hash 用于判断内容是否变化和提供审计标识，不替代版本号或数字签名。
         content_hash = hashlib.sha256(request.content.encode("utf-8")).hexdigest()
         created_at = utc_now()
         self.db.execute(

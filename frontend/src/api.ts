@@ -70,6 +70,8 @@ export interface ChatInput {
 }
 
 export async function sendChat(input: ChatInput): Promise<ChatResponse> {
+  // 有 sessionId 时使用稳定会话入口；第一次消息则由 /chat 创建 session。
+  // 前端只负责字段序列化，不在这里判断聊天、DS、RTL 或 Lint 路由。
   const path = input.sessionId
     ? `/conversations/${encodeURIComponent(input.sessionId)}/messages`
     : "/chat";

@@ -1,3 +1,10 @@
+"""当前已接入的本地工程 Tool。
+
+Tool executor 接收 Workspace ID 和结构化参数，返回
+``(command, exit_code, stdout, stderr)``。执行器绝不能直接接受模型生成的任意
+Shell 字符串；所有路径和参数都必须先经过白名单校验，并使用 ``shell=False``。
+"""
+
 import json
 import re
 import shutil
@@ -10,6 +17,7 @@ from app.tools.registry import tool_registry
 
 
 def _discover_testcases(workspace_id: str, arguments: dict) -> tuple[list[str], int, str, str]:
+    """只读扫描已有验证文件，不生成或修改验证计划。"""
     root_name = str(arguments.get("directory", "dv"))
     root = workspace_service.resolve_path(workspace_id, root_name)
     if not root.exists():
@@ -33,6 +41,13 @@ def _discover_testcases(workspace_id: str, arguments: dict) -> tuple[list[str], 
 
 
 def _verilator_lint(workspace_id: str, arguments: dict) -> tuple[list[str], int, str, str]:
+    """构造并执行受控 Verilator Lint 命令。
+
+    文件必须位于 Workspace 内，后缀和 top_module 都经过检查。返回原始输出，
+    后续由 ToolRunService 统一落盘并解析为 EngineeringIssue。
+    """
+    # which 返回绝对可执行文件路径。找不到工具时返回标准化环境错误，
+    # 不能用一段假日志伪装成 Lint 已经执行。
     executable = shutil.which("verilator")
     if not executable:
         return ["verilator", "--lint-only"], 127, "", "TOOL_ENVIRONMENT: Verilator 未安装或不在 PATH 中"
@@ -47,6 +62,7 @@ def _verilator_lint(workspace_id: str, arguments: dict) -> tuple[list[str], int,
         if not path.exists():
             return [executable, "--lint-only"], 2, "", f"TOOL_ARGUMENT: 文件不存在 {item}"
         resolved_files.append(str(path))
+    # 使用参数列表和 shell=False，避免文件名或模型参数被解释成额外 Shell 命令。
     command = [executable, "--lint-only", "-Wall", *resolved_files]
     top_module = arguments.get("top_module")
     if top_module:
@@ -72,6 +88,7 @@ def _verilator_lint(workspace_id: str, arguments: dict) -> tuple[list[str], int,
 
 
 def register_builtin_tools() -> None:
+    """幂等注册真实工程 Tool；声明权限和审批要求，执行器只负责动作本身。"""
     existing = {tool.name for tool in tool_registry.list()}
     if "discover_testcases" not in existing:
         tool_registry.register(
