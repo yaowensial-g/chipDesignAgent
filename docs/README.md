@@ -1,11 +1,12 @@
 # ChipFlow Agent 技术文档
 
-本文档集描述当前代码库的实际实现，技术基线为 **v0.4 动态 Tool Calling（2026-10-28）**，产品需求以根目录的 [PRD_v0.2.md](../PRD_v0.2.md) 为准。
+本文档集描述当前代码库的实际实现，技术基线为 **v0.5 角色主 Agent（2026-10-28）**，产品需求以根目录的 [PRD_v0.2.md](../PRD_v0.2.md) 为准。
 
 ## 文档导航
 
 | 文档 | 关注内容 | 推荐读者 |
 |---|---|---|
+| [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md) | 角色主 Agent、Delegate、两阶段 Tool Selector | 所有人，建议首先阅读 |
 | [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) | Intent Enricher、Planner–Executor Loop、Chat Tool 和动态 Tool Calling | 所有人，建议首先阅读 |
 | [architecture-overview.md](architecture-overview.md) | 系统上下文、动态编排、控制面、数据与安全边界 | 架构师、技术负责人 |
 | [codebase-guide.md](codebase-guide.md) | 目录结构、文件职责、扩展入口 | 开发和维护人员 |
@@ -17,13 +18,16 @@
 
 ## 当前版本一句话说明
 
-ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：所有用户输入进入统一 Orchestrator，模型先完善任务意图，再通过原生 Function Calling 动态选择 Tool；普通聊天也是只有 `reply_to_user` 的 Run，工程副作用仍由确定性权限、审批和 Workspace 规则约束。
+ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：用户工作角色决定 Design 或 Verification 主 Agent；主 Agent 通过受控 Delegate 获得跨专业结论，并只从权限过滤和轻量 Selector 筛选后的 Tool 集合中规划。普通聊天也是只有 `reply_to_user` 的 Run，工程副作用仍由确定性权限、审批和 Workspace 规则约束。
 
 ## 已实现能力
 
 - React 正式网页、普通聊天、文件上传和 DS Multi-Agent 流程；
 - 统一 Run 控制面、RunEvent、查询/恢复/取消接口和前端状态展示；
 - 统一 Intent Enricher 与 Planner–Executor Tool Loop；
+- 会话工作角色持久化与 Design/Verification 主 Agent 切换；
+- 有次数、超时、上下文裁剪和持久化结果的 Delegate；
+- 权限优先、Metadata-only 的两阶段 Tool Selector；
 - DeepSeek Chat Completions 和 OpenAI Responses 原生 Function Calling；
 - Chat、角色咨询、DS、RTL、Lint 和用例能力统一注册为 Tool；
 - DS Task、RTL Patch、ToolRun 作为专业执行记录关联到统一 Run；
@@ -52,10 +56,11 @@ ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：所�
 
 ## 推荐阅读顺序
 
-1. [v0.4 动态编排](dynamic-orchestration-v0.4.md)；
-2. [总体架构](architecture-overview.md)；
-3. [运行逻辑](runtime-flow.md)；
-4. [组件与接口](components-and-interfaces.md)；
-5. [编排与 Skill](orchestration-and-skills.md)；
-6. [代码结构](codebase-guide.md)；
-7. [自验证报告](../SELF_VALIDATION_v0.4.md)。
+1. [v0.5 角色主 Agent](role-driven-multi-agent-v0.5.md)；
+2. [v0.4 动态编排演进背景](dynamic-orchestration-v0.4.md)；
+3. [总体架构](architecture-overview.md)；
+4. [运行逻辑](runtime-flow.md)；
+5. [组件与接口](components-and-interfaces.md)；
+6. [编排与 Skill](orchestration-and-skills.md)；
+7. [代码结构](codebase-guide.md)；
+8. [自验证报告](../SELF_VALIDATION_v0.5.md)。

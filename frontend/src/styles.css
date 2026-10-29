@@ -73,6 +73,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .inspector-panel { border-left: 1px solid var(--line); display: flex; flex-direction: column; }
 .panel-section { padding: 20px; border-bottom: 1px solid var(--line); }
 .project-section { display: grid; gap: 12px; }
+.project-section select { width: 100%; padding: 9px 10px; }
+.project-section small { color: var(--teal); font-size: 9px; }
 .eyebrow { margin: 0 0 6px; color: var(--teal); font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
 label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
 input, textarea, select {

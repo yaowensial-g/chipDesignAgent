@@ -1,4 +1,4 @@
-# 组件与接口说明（v0.4 动态编排）
+# 组件与接口说明（v0.5 角色主 Agent）
 
 > Tool Catalog 现在同时包含编排 Tool 和工程 Tool，并提供适用/禁用条件、JSON Schema、前置条件、副作用与执行类型。完整清单见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
 
@@ -9,7 +9,10 @@
 | React Workspace | 用户输入、上传文件 | 对话、DS、Diff、Run、Issue | 浏览器内存 |
 | API Router | HTTP | JSON/结构化错误 | 无 |
 | ConversationService | 消息、历史、文档和工程上下文 | 普通回答或统一 Run | 间接 |
-| OrchestratorService | 消息、历史、文档、Tool Catalog | TaskIntent、Tool Call、Observation、Run | SQLite（经 RunService） |
+| SessionService | session、项目、用户工作角色 | Design/Verification 主 Agent | SQLite |
+| OrchestratorService | 消息、主 Agent、候选 Tool | TaskIntent、Tool Call、Observation、Run | SQLite（经 RunService） |
+| ToolSelectorService | 已授权 Tool Metadata、Intent | 有限 Tool Shortlist 和选择轨迹 | Run result |
+| DelegationService | 专家任务、裁剪上下文 | 结构化专家结果 | SQLite |
 | RunService | Intent、Tool 执行结果、用户指令 | Run、事件、专业执行记录关联 | SQLite |
 | TaskService | DS 请求/用户结论 | TaskView | SQLite 快照 + 热内存 |
 | DS Workflow | DSWorkflowState | delivered/interrupt | MemorySaver |
@@ -28,29 +31,31 @@
 
 | ID | 职责 | 当前使用位置 |
 |---|---|---|
-| `orchestrator` | 整理 TaskIntent、动态选择 Tool，不决定研发阶段 | OrchestratorService + Planner Loop |
+| `orchestrator` | 历史兼容定义；控制面本身不是业务主 Agent | 不作为默认主 Agent |
 | `chat` | 普通技术问答 | `reply_to_user` Tool |
 | `architecture_advisor` | 解释和质疑规格，不修改 FS/AS/ICD | DS Workflow |
-| `design` | DS/RTL 候选及设计侧工具判断 | DS Workflow、RTLService |
-| `verification` | 可验证性分析、已有用例与验证侧工具 | DS Workflow、Tool 权限 |
+| `design` | 设计用户的主 Agent；DS/RTL、设计 Tool、结果整合 | Planner、DS Workflow、RTLService |
+| `verification` | 验证用户的主 Agent；验证分析、已有用例、结果整合 | Planner、Tool 权限 |
 | `spec_reviewer` | 规格一致性 | DS Review |
 | `microarchitecture_reviewer` | 微架构完整性 | DS Review |
 | `verification_reviewer` | 可验证性 | DS Review |
 | `interface_reviewer` | 接口一致性 | DS Review |
 | `specialist_reviewer` | CDC/低功耗/安全/DFT/PPA/时序专项 | 元数据已定义，按需编排尚未接入 |
 
-所有真实角色当前共享一个有效模型配置；角色隔离依靠契约和提示词，不是独立模型进程。
+主 Agent 当前共享一个有效模型 Provider；Selector 可单独配置模型名称。角色隔离依靠会话身份、Tool 白名单、Delegate 契约和执行前权限复核，不是独立模型进程。
 
 ## 3. Tool Catalog
 
 | Tool | 允许角色 | Mutability | 需批准 | 行为 |
 |---|---|---|---|---|
-| `reply_to_user` | Orchestrator/Chat | read | 否 | 普通问答、解释和总结 |
-| `ask_user` | Orchestrator | read | 否 | 缺少关键输入时暂停 Run |
-| `consult_*_agent` | Orchestrator、对应生产角色 | analysis | 否 | 获得架构、设计或验证 Observation |
-| `create_ds_candidate` | Orchestrator、Design | candidate_write | 否 | 启动 DS 候选与评审子流程 |
-| `create_rtl_candidate` | Orchestrator、Design | candidate_write | 否 | 生成 RTL Candidate 与 Patch |
-| `report_capability_gap` | Orchestrator | read | 否 | 明确报告 Adapter 未接入并暂停 |
+| `reply_to_user` | Design、Verification | analysis | 否 | 普通问答、解释和总结；始终进入候选集 |
+| `ask_user` | Design、Verification | analysis | 否 | 缺少关键输入时暂停 Run；始终进入候选集 |
+| `consult_architecture_agent` | Design、Verification | analysis | 否 | 创建只读 Architecture DelegationTask |
+| `consult_design_agent` | Verification | analysis | 否 | 创建 Design DelegationTask |
+| `consult_verification_agent` | Design | analysis | 否 | 创建 Verification DelegationTask |
+| `create_ds_candidate` | Design | candidate_write | 否 | 启动 DS 候选与评审子流程 |
+| `create_rtl_candidate` | Design | candidate_write | 否 | 生成 RTL Candidate 与 Patch |
+| `report_capability_gap` | Design、Verification | analysis | 否 | 明确报告 Adapter 未接入并暂停 |
 | `discover_testcases` | Design、Verification | read | 否 | 扫描 Workspace 的已有验证文件 |
 | `verilator_lint` | Design、Verification | execution | 是 | 受控执行 Verilator `--lint-only -Wall` |
 
@@ -64,7 +69,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 状态和 v0.4.0 |
+| GET | `/health` | 状态和 v0.5.0 |
 | GET | `/diagnostics` | 本机无费用自检 |
 | GET/PUT | `/settings/model` | 读取/保存公开模型设置 |
 | POST | `/settings/model/test` | 真实连接探针 |
@@ -76,8 +81,11 @@
 |---|---|---|
 | POST | `/chat` | 无 session 时的兼容聊天入口；可创建统一 Run |
 | POST | `/conversations/{session_id}/messages` | 网页主入口，session 由路径绑定 |
+| GET | `/conversations/{session_id}` | 查询工作角色和主 Agent |
+| PUT | `/conversations/{session_id}/role` | 切换会话工作角色 |
 | GET | `/runs/{run_id}` | 查询统一 Run，并刷新关联 ToolRun 终态 |
 | GET | `/runs/{run_id}/events` | 查询按序持久化的 RunEvent |
+| GET | `/runs/{run_id}/delegations` | 查询结构化专家委派结果 |
 | POST | `/runs/{run_id}/resume` | 提交架构结论、Tool 授权或 Patch 决策 |
 | POST | `/runs/{run_id}/cancel` | 取消非终态 Run |
 | POST | `/tasks/ds` | 兼容/测试：直接创建 DS Task，跳过编排 |
@@ -105,7 +113,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/tools` | Tool 元数据 |
+| GET | `/tools?role=design` | 全量或按主 Agent 权限过滤的 Tool 元数据 |
 | POST | `/tool-runs` | 授权检查后异步创建 Run |
 | GET | `/tool-runs/{run_id}` | Run 状态、命令和输出 |
 | GET | `/tool-runs/{run_id}/issues` | 全部标准化问题 |

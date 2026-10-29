@@ -57,16 +57,24 @@ class RunService:
         session_id: str,
         request: ChatRequest,
         intent: dict[str, Any],
+        primary_agent: AgentRole,
     ) -> str:
         run_id = self._create(
             session_id,
             request,
             RunType.ORCHESTRATION,
             "统一 Orchestrator 动态选择 Tool",
+            primary_agent,
         )
         self._update(run_id, status=RunStatus.RUNNING, result={"intent": intent, "tool_calls": [], "observations": []})
         self.append_event(run_id, "run_created", "已创建统一编排 Run。", "orchestrator")
         self.append_event(run_id, "intent_enriched", "已完成用户意图结构化，原始请求保持不变。", "orchestrator")
+        self.append_event(
+            run_id,
+            "primary_agent_selected",
+            f"当前会话由 {primary_agent.value} Agent 作为主 Agent。",
+            primary_agent.value,
+        )
         return run_id
 
     def record_orchestration(
@@ -76,6 +84,8 @@ class RunService:
         intent: dict[str, Any],
         tool_calls: list[dict[str, Any]],
         observations: list[dict[str, Any]],
+        tool_selections: list[dict[str, Any]] | None = None,
+        delegations: list[dict[str, Any]] | None = None,
     ) -> None:
         run = self.get(run_id)
         if run is None:
@@ -84,6 +94,10 @@ class RunService:
         result["intent"] = intent
         result["tool_calls"] = tool_calls
         result["observations"] = observations
+        if tool_selections is not None:
+            result["tool_selections"] = tool_selections
+        if delegations is not None:
+            result["delegations"] = delegations
         self._update(run_id, result=result)
 
     def complete_reply(self, run_id: str, message: str) -> RunView:
@@ -308,7 +322,9 @@ class RunService:
             pending=None,
             result={"tool_name": tool_name, "arguments": arguments},
         )
-        self.append_event(run_id, "tool_started", f"已启动 {tool_name}。", "design")
+        control = self.db.fetch_one("SELECT primary_agent FROM runs WHERE run_id = ?", (run_id,))
+        actor = (control or {}).get("primary_agent") or AgentRole.DESIGN.value
+        self.append_event(run_id, "tool_started", f"已启动 {tool_name}。", actor)
         label = "已有用例发现" if run_type == RunType.TEST_EXECUTION else run_type.value
         return self.get(run_id), None, f"{label} Run 已启动，可在任务面板查看进度。"  # type: ignore[return-value]
 
@@ -430,6 +446,7 @@ class RunService:
             status=row["status"],
             user_instruction=row["user_instruction"],
             route_reason=row["route_reason"],
+            primary_agent=row.get("primary_agent"),
             legacy_task_id=row["legacy_task_id"],
             tool_run_id=row["tool_run_id"],
             patch_id=row["patch_id"],
@@ -463,11 +480,16 @@ class RunService:
         request: ChatRequest,
         run_type: RunType,
         reason: str,
+        primary_agent: AgentRole | None = None,
     ) -> str:
         run_id = str(uuid4())
         now = utc_now()
         self.db.execute(
-            "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?, ?)",
+            """INSERT INTO runs (
+            run_id, session_id, project_id, module_name, workspace_id, run_type,
+            status, user_instruction, route_reason, primary_agent, legacy_task_id,
+            tool_run_id, patch_id, pending_user_request_json, result_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '{}', ?, ?)""",
             (
                 run_id,
                 session_id,
@@ -478,6 +500,7 @@ class RunService:
                 RunStatus.PLANNED.value,
                 request.message,
                 reason,
+                primary_agent.value if primary_agent else None,
                 now,
                 now,
             ),
@@ -547,7 +570,7 @@ class RunService:
                 row["run_id"],
                 "tool_finished",
                 f"{tool_run.tool_name} 结束，状态为 {tool_run.status.value}。",
-                "design",
+                row.get("primary_agent") or AgentRole.DESIGN.value,
             )
 
     @staticmethod

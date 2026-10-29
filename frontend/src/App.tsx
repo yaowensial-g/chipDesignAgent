@@ -43,6 +43,9 @@ const defaultModelSettings: ModelSettings = {
   base_url: "https://api.deepseek.com",
   timeout_seconds: 120,
   max_output_tokens: 6000,
+  selector_model: "deepseek-chat",
+  selector_max_tools: 6,
+  selector_max_output_tokens: 1000,
   api_key_source: "none",
   has_api_key: false,
   api_key_masked: null,
@@ -60,6 +63,7 @@ const initialMessage: ChatMessage = {
 function App() {
   const [projectId, setProjectId] = useState("demo-project");
   const [moduleName, setModuleName] = useState("dma_ctrl");
+  const [userRole, setUserRole] = useState<"design_engineer" | "verification_engineer">("design_engineer");
   const [documents, setDocuments] = useState<ExtractedDocument[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([initialMessage]);
   const [draft, setDraft] = useState("");
@@ -80,6 +84,27 @@ function App() {
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [engineeringOpen, setEngineeringOpen] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  function changeUserRole(nextRole: typeof userRole) {
+    if (nextRole === userRole) return;
+    setUserRole(nextRole);
+    // Keep the conversation identity and shared project documents, but never
+    // resend another role's private chat history to the new primary agent.
+    setMessages([
+      {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content:
+          nextRole === "design_engineer"
+            ? "已切换为设计工程师：后续请求由 Design Agent 主导，旧角色的私有对话上下文不会带入。"
+            : "已切换为验证工程师：后续请求由 Verification Agent 主导，旧角色的私有对话上下文不会带入。",
+        time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+      },
+    ]);
+    setTask(null);
+    setRun(null);
+    setError(null);
+  }
 
   useEffect(() => {
     getModelSettings().then(setModelSettings).catch(() => undefined);
@@ -218,6 +243,7 @@ function App() {
         })),
         workspaceId: run?.workspace_id,
         dsMarkdown: task?.ds_markdown,
+        userRole,
       });
       setSessionId(response.session_id);
       if (response.task) setTask(response.task);
@@ -340,6 +366,14 @@ function App() {
           <label>
             目标模块
             <input value={moduleName} onChange={(event) => setModuleName(event.target.value)} />
+          </label>
+          <label>
+            当前工作角色
+            <select value={userRole} onChange={(event) => changeUserRole(event.target.value as typeof userRole)}>
+              <option value="design_engineer">Design Engineer</option>
+              <option value="verification_engineer">Verification Engineer</option>
+            </select>
+            <small>{userRole === "design_engineer" ? "Design Agent 作为主 Agent" : "Verification Agent 作为主 Agent"}</small>
           </label>
         </section>
 

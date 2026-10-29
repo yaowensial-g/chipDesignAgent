@@ -78,6 +78,19 @@ class AgentRole(str, Enum):
     ORCHESTRATOR = "orchestrator"
 
 
+class UserRole(str, Enum):
+    DESIGN_ENGINEER = "design_engineer"
+    VERIFICATION_ENGINEER = "verification_engineer"
+
+
+class DelegationStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+
 class Mutability(str, Enum):
     READ = "read"
     ANALYSIS = "analysis"

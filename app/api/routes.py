@@ -30,7 +30,11 @@ from app.domain.models import (
     UserResolution,
     WorkspaceCreateRequest,
     WorkspaceView,
+    ConversationRoleUpdate,
+    ConversationView,
+    DelegationResult,
 )
+from app.domain.enums import AgentRole
 from app.models.provider import ModelInvocationError, OpenAIModelProvider
 from app.services.conversation_service import conversation_service
 from app.services.diagnostics_service import diagnostics_service
@@ -40,6 +44,8 @@ from app.services.rtl_service import rtl_service
 from app.services.run_service import run_service
 from app.services.tool_run_service import tool_run_service
 from app.services.workspace_service import artifact_service, workspace_service
+from app.services.session_service import session_service
+from app.services.delegation_service import delegation_service
 from app.tools.registry import tool_registry
 
 
@@ -48,7 +54,7 @@ router = APIRouter()
 
 @router.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 
 @router.get("/diagnostics", response_model=DiagnosticReport)
@@ -96,13 +102,43 @@ async def extract_uploaded_document(file: UploadFile = File(...)) -> ExtractedDo
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
-    return await conversation_service.handle(request)
+    try:
+        return await conversation_service.handle(request)
+    except ValueError as exc:
+        if str(exc) == "Conversation belongs to a different project":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
 
 
 @router.post("/conversations/{session_id}/messages", response_model=ChatResponse)
 async def send_conversation_message(session_id: str, request: ChatRequest) -> ChatResponse:
     """Primary UI entrypoint; specialized task endpoints remain compatibility APIs."""
-    return await conversation_service.handle(request.model_copy(update={"session_id": session_id}))
+    try:
+        return await conversation_service.handle(
+            request.model_copy(update={"session_id": session_id})
+        )
+    except ValueError as exc:
+        if str(exc) == "Conversation belongs to a different project":
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise
+
+
+@router.get("/conversations/{session_id}", response_model=ConversationView)
+async def get_conversation(session_id: str) -> ConversationView:
+    conversation = session_service.get(session_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return conversation
+
+
+@router.put("/conversations/{session_id}/role", response_model=ConversationView)
+async def update_conversation_role(
+    session_id: str, request: ConversationRoleUpdate
+) -> ConversationView:
+    try:
+        return session_service.set_role(session_id, request.user_role)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
 
 
 @router.get("/runs/{run_id}", response_model=RunView)
@@ -119,6 +155,13 @@ async def get_run_events(run_id: str) -> list[RunEventView]:
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run.events
+
+
+@router.get("/runs/{run_id}/delegations", response_model=list[DelegationResult])
+async def get_run_delegations(run_id: str) -> list[DelegationResult]:
+    if run_service.get(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return delegation_service.list_for_run(run_id)
 
 
 @router.post("/runs/{run_id}/resume", response_model=RunView)
@@ -204,8 +247,8 @@ async def list_artifacts(workspace_id: str) -> list[ArtifactView]:
 
 
 @router.get("/tools", response_model=list[ToolDefinitionView])
-async def list_tools() -> list[ToolDefinitionView]:
-    return tool_registry.list()
+async def list_tools(role: AgentRole | None = Query(default=None)) -> list[ToolDefinitionView]:
+    return tool_registry.for_role(role) if role else tool_registry.list()
 
 
 @router.post("/tool-runs", response_model=ToolRunView, status_code=status.HTTP_202_ACCEPTED)

@@ -1,6 +1,6 @@
-# 代码结构说明（v0.4 动态编排）
+# 代码结构说明（v0.5 角色主 Agent）
 
-> v0.4 新增 `app/services/orchestrator_service.py` 和 `app/tools/orchestration.py`。`ConversationService` 已成为兼容门面，主链不再调用固定 Conversation Router；详见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
+> v0.5 在 v0.4 动态 Tool Calling 上增加 `session_service.py`、`tool_selector_service.py` 和 `delegation_service.py`。主链由用户工作角色选择 Design/Verification 主 Agent；详见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
 
 ## 1. 目录
 
@@ -36,6 +36,7 @@ chipDesignAgent/
 ├─ SELF_VALIDATION_v0.2.md
 ├─ SELF_VALIDATION_v0.3.md
 ├─ SELF_VALIDATION_v0.4.md
+├─ SELF_VALIDATION_v0.5.md
 └─ pyproject.toml
 ```
 
@@ -45,7 +46,7 @@ chipDesignAgent/
 
 ### `app/main.py`
 
-- FastAPI 应用入口，项目版本 v0.4.0；
+- FastAPI 应用入口，项目版本 v0.5.0；
 - CORS；
 - 请求编号；
 - 模型、配置和未知异常的结构化错误；
@@ -57,7 +58,7 @@ chipDesignAgent/
 
 ### `app/domain/models.py` 与 `enums.py`
 
-除文档、Task、Issue、Finding、模型设置等既有契约外，v0.4 还包含：
+除文档、Task、Issue、Finding、模型设置等既有契约外，v0.5 还包含：
 
 - `WorkspaceView`、`ArtifactView`；
 - `RTLCandidateRequest/Response`；
@@ -66,6 +67,8 @@ chipDesignAgent/
 - `EngineeringIssueView`、Issue/Patch 决策；
 - `RunView`、`RunEventView`、`RunResumeRequest`；
 - `RunType` 与 `RunStatus`；
+- `UserRole`、`ConversationView`、`ToolShortlist`；
+- `DelegationRequest`、`DelegationResult`、`DelegationStatus`；
 - AgentRole、Mutability、Artifact/ToolRun/EngineeringIssue 状态。
 
 Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步。
@@ -75,10 +78,23 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 ### `app/services/orchestrator_service.py`
 
 - 接收所有聊天入口请求并形成 `TaskIntent`；
+- 通过 SessionService 解析本轮 Design/Verification 主 Agent；
 - 创建 Unified Run；
-- 把 Tool Catalog 交给真实模型 Function Calling 或 Deterministic Planner；
+- 先调用 ToolSelectorService 形成权限安全的候选集，再把候选完整 Schema 交给主 Agent；
 - 执行最多六步的 Planner → Tool → Observation 循环；
 - 将普通聊天、角色咨询、DS、RTL 和工程 Tool 纳入同一控制面。
+
+### `app/services/session_service.py`
+
+持久化会话工作角色，将 `design_engineer` / `verification_engineer` 映射到对应主 Agent；角色切换时由主链隔离旧角色私有历史。
+
+### `app/services/tool_selector_service.py`
+
+先用 Tool Registry 按角色和启用状态硬过滤，再把轻量 Metadata 发送给 Selector Model；校验返回名称、加入基础 Tool，并记录模型、延迟、候选数量和回退状态。
+
+### `app/services/delegation_service.py`
+
+创建持久化 `DelegationTask`，强制专家白名单、单 Run 次数、超时、只读和禁止嵌套委派；专家结果作为 Observation 返回原主 Agent。
 
 ### `app/services/run_service.py`
 
@@ -96,7 +112,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ### `app/agents/definitions.py`
 
-角色目录包括 Orchestrator、Chat、Architecture、Design、Verification、四类默认 Reviewer 和 Specialist Reviewer。旧 Conversation Router 已退出主链；Agent 是职责边界，不是独立进程。
+角色目录包括 Design/Verification 主 Agent、只读 Architecture Expert、Chat 实现、四类默认 Reviewer 和 Specialist Reviewer。Orchestrator 定义仅保留架构演进兼容语义；确定性控制平面不作为业务主 Agent。
 
 ### `app/agents/runtime.py`
 
@@ -104,6 +120,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 - `LLMChipDesignRuntime`：真实提示词和结果归一化；
 - `ConfigurableAgentRuntime`：按当前设置动态选择；
 - 支持 TaskIntent、ToolSelection、聊天、DS 分析/生成/评审和 RTL 候选生成。
+- 支持 Metadata-only `select_tool_names()`，主 Agent 与 Selector 可配置不同模型名称。
 
 真实模型 Runtime 会通过 `app/skills/registry.py` 加载根目录 `skills/**/*.md`。Skill 提供专业分析步骤和禁止事项，但没有 Workspace、数据库或进程执行权限；确定性测试 Runtime 不依赖模型 Skill 才能运行。
 
@@ -135,6 +152,8 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 - `task_snapshots`。
 - `runs`；
 - `run_events`。
+- `conversations`；
+- `delegation_tasks`。
 
 使用 WAL、外键、线程锁和短连接。当前没有 Alembic；新增列使用小型兼容迁移。
 
@@ -152,7 +171,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ### `app/tools/registry.py`
 
-每个 Tool 注册名称、说明、允许角色、修改等级、是否需要批准、幂等性、超时和执行函数。
+每个 Tool 注册名称、说明、允许角色、修改等级、是否需要批准、幂等性、超时、分类、启用状态、基础 Tool 标记和执行函数；Registry 可输出按角色过滤的轻量 Metadata。
 
 ### `app/tools/builtin.py`
 
@@ -176,7 +195,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ### `frontend/src/App.tsx`
 
-主页面：项目/模块、文档上传、聊天、统一 Run 状态及事件、真实架构反馈、RTL Patch 审批、DS/Finding 视图，以及模型设置、自检、工程工作台兼容入口。运行中的 Tool Run 会按统一 Run ID 轮询。
+主页面：项目/模块、当前工作角色、文档上传、聊天、统一 Run 状态及事件、真实架构反馈、RTL Patch 审批、DS/Finding 视图，以及模型设置、自检、工程工作台兼容入口。切换角色会保留共享文档但清空旧角色私有聊天和旧 Run 展示。
 
 ### `frontend/src/EngineeringModal.tsx`
 

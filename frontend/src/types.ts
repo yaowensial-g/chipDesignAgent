@@ -77,6 +77,7 @@ export interface RunView {
   status: string;
   user_instruction: string;
   route_reason: string;
+  primary_agent: "design" | "verification" | null;
   legacy_task_id: string | null;
   tool_run_id: string | null;
   patch_id: string | null;
@@ -103,6 +104,9 @@ export interface ModelSettings {
   base_url: string;
   timeout_seconds: number;
   max_output_tokens: number;
+  selector_model: string;
+  selector_max_tools: number;
+  selector_max_output_tokens: number;
   api_key_source: string;
   has_api_key: boolean;
   api_key_masked: string | null;
@@ -119,6 +123,9 @@ export interface ModelSettingsInput {
   clear_api_key?: boolean;
   timeout_seconds: number;
   max_output_tokens: number;
+  selector_model: string;
+  selector_max_tools: number;
+  selector_max_output_tokens: number;
 }
 
 export interface DiagnosticCheck {
@@ -152,6 +159,9 @@ export interface ToolDefinition {
   requires_user_approval: boolean;
   idempotent: boolean;
   timeout_seconds: number;
+  category: string;
+  enabled: boolean;
+  always_available: boolean;
 }
 
 export interface ToolRun {

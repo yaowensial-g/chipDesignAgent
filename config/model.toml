@@ -7,4 +7,7 @@ model = "deepseek-flash"
 base_url = "https://api.deepseek.com"
 timeout_seconds = 120
 max_output_tokens = 6000
+selector_model = "deepseek-chat"
+selector_max_tools = 6
+selector_max_output_tokens = 1000
 

@@ -1,5 +1,6 @@
 import os
 import re
+from dataclasses import replace
 from typing import Any
 
 from app.config.model_settings import model_settings_service
@@ -96,6 +97,7 @@ class DeterministicAgentRuntime:
         intent: dict[str, Any],
         tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
+        primary_agent: str = "design",
     ) -> dict[str, Any]:
         if intent.get("missing_information"):
             return {
@@ -132,6 +134,18 @@ class DeterministicAgentRuntime:
                 if name == "verilator_lint":
                     arguments = dict(request.get("tool_arguments") or {})
                 return {"name": name, "arguments": arguments, "reason": "模拟 Planner 选择匹配 Tool"}
+        delegation_choices = (
+            ("consult_architecture_agent", r"架构|微架构|ppa|流水线|规格歧义"),
+            ("consult_design_agent", r"ds|详细设计|rtl|systemverilog|verilog|设计根因"),
+            ("consult_verification_agent", r"验证|testplan|testbench|覆盖率|coverage|断言|仿真分析"),
+        )
+        for name, target in delegation_choices:
+            if name in available and re.search(target, message):
+                return {
+                    "name": name,
+                    "arguments": {"focus": request["message"]},
+                    "reason": "主 Agent 将跨专业子任务委派给专家",
+                }
         unsupported = (
             ("simulation", r"仿真|simulation|sim"),
             ("cdc", r"cdc|跨时钟"),
@@ -150,6 +164,45 @@ class DeterministicAgentRuntime:
             "name": "reply_to_user",
             "arguments": {"message": self.chat(request)},
             "reason": "普通讨论由 Chat Tool 完成",
+        }
+
+    @staticmethod
+    def select_tool_names(
+        request: dict[str, Any],
+        intent: dict[str, Any],
+        tool_metadata: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        primary_agent: str,
+        max_tools: int,
+    ) -> dict[str, Any]:
+        available = {item["name"] for item in tool_metadata}
+        selected = [
+            name
+            for name in intent.get("candidate_tools", [])
+            if name in available
+        ]
+        message = re.sub(r"\s+", "", request.get("message", "").lower())
+        keyword_tools = (
+            ("create_ds_candidate", r"ds|详细设计"),
+            ("create_rtl_candidate", r"rtl|systemverilog|verilog"),
+            ("verilator_lint", r"lint|verilator|静态检查"),
+            ("discover_testcases", r"testcase|用例|回归"),
+            ("consult_architecture_agent", r"架构|微架构|ppa|流水线"),
+            ("consult_design_agent", r"rtl|systemverilog|verilog|ds|详细设计|设计专家|设计分析|电路实现"),
+            ("consult_verification_agent", r"验证|覆盖率|断言|testbench|仿真分析"),
+            ("report_capability_gap", r"仿真|simulation|cdc|综合|synthesis|sta|时序"),
+        )
+        for name, pattern in keyword_tools:
+            if name in available and re.search(pattern, message) and name not in selected:
+                selected.append(name)
+        if observations and "reply_to_user" in available:
+            selected.insert(0, "reply_to_user")
+        for name in ("reply_to_user", "ask_user"):
+            if name in available and name not in selected:
+                selected.append(name)
+        return {
+            "selected_tools": selected[:max_tools],
+            "reason": f"Deterministic selector 为 {primary_agent} 选择任务相关工具",
         }
 
     def architecture_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -344,6 +397,17 @@ class LLMChipDesignRuntime:
         return OpenAIModelProvider(model_settings_service.effective())
 
     @staticmethod
+    def _selector_provider() -> OpenAIModelProvider:
+        settings = model_settings_service.effective()
+        return OpenAIModelProvider(
+            replace(
+                settings,
+                model=settings.selector_model,
+                max_output_tokens=settings.selector_max_output_tokens,
+            )
+        )
+
+    @staticmethod
     def _context(request: dict[str, Any]) -> dict[str, Any]:
         documents = []
         remaining = 120_000
@@ -403,6 +467,7 @@ class LLMChipDesignRuntime:
         intent: dict[str, Any],
         tools: list[dict[str, Any]],
         observations: list[dict[str, Any]],
+        primary_agent: str = "design",
     ) -> dict[str, Any]:
         payload = self._context(request)
         payload.update(
@@ -413,6 +478,7 @@ class LLMChipDesignRuntime:
                 "has_confirmed_ds": bool(request.get("ds_markdown")),
                 "previous_observations": observations,
                 "already_called_tools": [item.get("tool_name") for item in observations],
+                "primary_agent": primary_agent,
             }
         )
         schemas = []
@@ -428,10 +494,43 @@ class LLMChipDesignRuntime:
                 }
             )
         return self._provider().choose_tool(
-            """你是 ChipFlow 的统一任务编排 Agent。所有请求都必须通过 Tool 完成，普通聊天也调用 reply_to_user。根据用户明确目标动态选择一个最合适的下一步 Tool，不得强制套用固定 Workflow，不得自行推进用户未要求的研发阶段。可以先调用角色咨询 Tool 获取观察，再重新规划。若缺失的是权威规格事实、目标文件或必要授权，调用 ask_user；不要猜测。不得重复调用 already_called_tools 中的分析 Tool。候选写入和本地进程必须遵守 Tool 描述及审批策略。""",
+            f"""你是 ChipFlow 的 {primary_agent} 主 Agent。所有请求都必须通过 Tool 完成，普通聊天也调用 reply_to_user。主 Agent 始终保留会话控制权；专家委派只返回 Observation。根据用户明确目标动态选择一个最合适的下一步 Tool，不得强制套用固定 Workflow，不得自行推进用户未要求的研发阶段。若缺失权威规格事实、目标文件或必要授权，调用 ask_user；不要猜测。不得重复调用 already_called_tools 中的分析 Tool。候选写入和本地进程必须遵守 Tool 描述及审批策略。""",
             payload,
             schemas,
         )
+
+    def select_tool_names(
+        self,
+        request: dict[str, Any],
+        intent: dict[str, Any],
+        tool_metadata: list[dict[str, Any]],
+        observations: list[dict[str, Any]],
+        primary_agent: str,
+        max_tools: int,
+    ) -> dict[str, Any]:
+        payload = {
+            "primary_agent": primary_agent,
+            "task_intent": intent,
+            "task_summary": request.get("message", ""),
+            "has_observations": bool(observations),
+            "authorized_tool_metadata": tool_metadata,
+            "max_tools": max_tools,
+        }
+        result = self._selector_provider().generate_json(
+            """你是轻量 Tool Selector。你只做语义筛选，不执行工具、不授予权限。只能从 authorized_tool_metadata 中返回工具名称；优先最小充分集合，不返回参数或完整 Schema。普通回答、最终汇总保留 reply_to_user；缺少关键信息保留 ask_user。只返回 JSON。""",
+            payload,
+            operation="轻量 Tool Selector",
+            expected_shape='{"selected_tools":["tool_name"],"reason":"选择原因"}',
+        )
+        if not isinstance(result, dict):
+            raise ValueError("Tool Selector 输出必须是 JSON 对象")
+        selected = result.get("selected_tools", [])
+        if not isinstance(selected, list):
+            selected = []
+        return {
+            "selected_tools": [str(item) for item in selected[:max_tools]],
+            "reason": str(result.get("reason", "")),
+        }
 
     def architecture_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
         result = self._provider().generate_json(

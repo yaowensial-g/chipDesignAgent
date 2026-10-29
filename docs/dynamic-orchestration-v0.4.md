@@ -1,5 +1,7 @@
 # 动态编排架构说明（v0.4）
 
+> 本文保留 v0.4 的架构演进背景。当前实现已经升级为 v0.5：Tool 先按角色过滤并由轻量 Selector 形成候选集，Design/Verification 可作为主 Agent，角色咨询已替换为持久化 Delegate。请以 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md) 为准。
+
 ## 1. 变更目标
 
 v0.4 将主交互从“Router 分类到 Chat 或固定 Workflow”改为“统一 Orchestrator 动态选择 Tool”。普通聊天也是一个只有 `reply_to_user` 的 Run；DS、RTL 和工程执行则由同一 Planner 根据上下文选择不同 Tool。
@@ -156,8 +158,8 @@ Tool 定义包含 `when_to_use`、`when_not_to_use`、输入/输出 Schema、前
 ## 10. 当前边界
 
 - 当前一次只选择并执行一个 Tool，再依据 Observation 重新规划，尚未生成可视化 Run DAG；
-- Tool 数量较少，因此当前把完整 Catalog 提供给 Planner；工具规模扩大后应先按角色、环境和能力检索过滤；
+- v0.4 当时把完整 Catalog 提供给 Planner；v0.5 已实现按角色权限过滤和 Metadata-only Tool Selector；
 - DS 内部仍有兼容 LangGraph；
-- 角色 Agent 当前共享同一模型配置；
+- v0.4 当时角色 Agent 共享同一模型配置；v0.5 已允许 Selector 单独配置模型名称；
 - `ask_user` 后的通用重新规划恢复尚未完成，目前专业 DS/RTL/Tool 审批恢复沿用 RunService；
 - 尚未实现 Sim、CDC、综合和 STA 的真实 Adapter。

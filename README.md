@@ -2,7 +2,7 @@
 
 完整技术文档入口：[docs/README.md](docs/README.md)，包含总体架构、代码结构、运行逻辑及组件与接口说明。
 
-当前代码已升级到 v0.4，产品基线见 [PRD_v0.2.md](PRD_v0.2.md)。主交互已经从固定路由升级为统一 Orchestrator + 动态 Tool Calling：
+当前代码已升级到 v0.5，产品基线见 [PRD_v0.2.md](PRD_v0.2.md)。主交互采用“工作角色决定主 Agent + Delegate 专家协作 + 两阶段动态 Tool 选择”：
 
 - FastAPI 服务；
 - LangGraph DS 工作流；
@@ -19,7 +19,9 @@
 - React 正式前端工作台；
 - 任务意图完善、原生 Function Calling 和 Planner–Executor Loop；
 - 普通聊天作为 `reply_to_user` Tool，不再是独立路由分支；
-- Architecture、Design、Verification 角色作为可编排咨询 Tool；
+- Design/Verification 可作为主 Agent，Architecture 作为只读专家；
+- 跨专业协作持久化为有次数和超时边界的 DelegationTask；
+- Tool 先按主 Agent 权限过滤，再由轻量 Selector 选择有限候选；
 - PDF、DOCX、Markdown 和文本文件上传；
 - DS、评审意见和执行过程展示。
 - Architecture、Design、Verification 和独立 Reviewer 角色定义；
@@ -54,7 +56,7 @@
 
 1. 在左侧填写项目和目标模块；
 2. 可以直接提问或讨论芯片架构、RTL、验证等话题，无需先上传文档；
-3. 路由 Agent 会把普通问答交给聊天 Agent，并向其提供最近对话、项目、模块和已上传文档上下文；
+3. 选择“设计工程师”或“验证工程师”；对应主 Agent 会把普通问答编排为 `reply_to_user` Tool，并在需要时 Delegate 给其他专家；
 4. 需要生成 DS 时，再上传 FS、AS、ICD（支持 PDF、DOCX、MD、TXT）并输入“请生成该模块 DS”；
 5. 检查 Agent 推断的文档类型和版本，在右侧查看 DS、评审意见和执行过程；
 6. 如果任务因规格歧义暂停，在对话区提交真实架构结论或问题单编号后继续。

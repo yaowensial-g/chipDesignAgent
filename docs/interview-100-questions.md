@@ -1,6 +1,6 @@
 # ChipFlow 项目面试拷打 100 问
 
-本文档基于当前 **v0.4.0** 代码，而不是只基于 PRD。每题第一段给出可以直接用于面试的核心回答，第二段继续展开实现、取舍、风险或后续方案。回答时要主动区分“已经实现”“只具备接口骨架”和“下一阶段规划”，避免把原型包装成生产级平台。
+本文档基于当前 **v0.5.0** 代码，而不是只基于 PRD。每题第一段给出可以直接用于面试的核心回答，第二段继续展开实现、取舍、风险或后续方案。回答时要主动区分“已经实现”“只具备接口骨架”和“下一阶段规划”，避免把原型包装成生产级平台。
 
 ## 一、产品定位与需求（1～10）
 
@@ -34,11 +34,11 @@
 
 这种约束也为未来的记忆失效传播提供基础：任何从规格形成的 Reflection 都应保存来源和版本，规格变更后才能定位受影响的 DS、RTL 和验证结论。当前版本只保存部分来源信息，还没有完整依赖图，因此宁可不开放原始文档修改，也不制造无法追踪的隐式变更。
 
-### 6. v0.1 到 v0.4 的架构演进是什么？
+### 6. v0.1 到 v0.5 的架构演进是什么？
 
-v0.1 聚焦聊天、文档上传、FS/AS 到 DS、多角色评审和人工冲突恢复；v0.2 增加 SQLite、Workspace、Artifact、Patch、ToolRun 和 Issue；v0.3 引入统一 Run；v0.4 删除 Chat/Workflow 二分 Router，加入 Intent Enricher、Planner–Executor Loop、原生 Function Calling，并把聊天也注册成 Tool。
+v0.1 聚焦聊天、文档上传、FS/AS 到 DS、多角色评审和人工冲突恢复；v0.2 增加 SQLite、Workspace、Artifact、Patch、ToolRun 和 Issue；v0.3 引入统一 Run；v0.4 删除 Chat/Workflow 二分 Router并引入动态 Tool Calling；v0.5 让用户工作角色决定 Design/Verification 主 Agent，把跨专业协作改为可持久化 Delegate，并加入权限优先的轻量 Tool Selector。
 
-这条演进线体现了两个变化：一是从“模型工作流”走向可恢复、可审计的工程状态机；二是从预设场景路由走向模型按 Tool Schema 动态规划。v0.4 的顶层编排已经落地，但执行面仍诚实受限：真实 EDA Adapter 只有 Verilator Lint，Sim、CDC、综合、STA 和自动修复复验仍待接入。
+这条演进线体现了三个变化：从模型演示走向可恢复状态机；从预设路由走向动态 Tool；从中央 Orchestrator Agent 走向生产角色主 Agent。执行面仍诚实受限：真实 EDA Adapter 只有 Verilator Lint，Sim、CDC、综合、STA 和自动修复复验仍待接入。
 
 ### 7. 当前产品最有价值的设计是什么？
 
@@ -68,7 +68,7 @@ SystemVerilog 也便于在生成规范中明确 `always_ff`、`always_comb`、�
 
 ### 11. 这个系统真的算 Multi-Agent 吗？
 
-它是逻辑角色型 Multi-Agent：不同角色有独立职责、提示词、权限和工作流节点，但目前共享模型配置，也不是独立进程。这里的 Multi-Agent 强调职责隔离和协作协议，而非部署数量。
+它是逻辑角色型 Multi-Agent：Design 或 Verification 根据用户工作角色成为主 Agent；需要跨专业判断时创建有 instruction、证据、次数和超时边界的 `DelegationTask`。角色目前仍运行在同一进程并共享主模型 Provider，因此 Multi-Agent 强调职责、权限和协作协议，而不是部署数量。
 
 从代码看，角色目录位于 `app/agents/definitions.py`，真实行为由 Runtime 方法和 LangGraph 节点承载。面试时不要把多个 Prompt 等同于完全自治的 Agent 社会；当前更准确的说法是“一个模型运行时承载多个有边界的 Agent 角色”。未来可以为不同角色选择不同模型，但领域协议不需要随之改变。
 
@@ -84,11 +84,11 @@ Agent 负责语义理解、方案权衡、根因判断和自然语言解释；To
 
 例如“这个 WIDTH 错误是否会造成功能截断”属于 Agent 判断，“读取报错行、运行 Verilator、保存日志”属于 Tool。这个边界保证同一 Tool 可以被不同角色复用，也保证真正的文件和进程权限由后端代码控制，而不是由模型自报权限。
 
-### 14. Orchestrator Agent 做什么？
+### 14. Orchestrator Agent 做什么？v0.5 为什么不再把它当主 Agent？
 
-Orchestrator 接收所有对话请求，先把零散表达整理为 `TaskIntent`，再创建统一 Run，由 Planner 读取 Tool Catalog 并通过原生 Function Calling 决定下一步调用。每次 Tool 结果会作为 Observation 回到规划循环，直到完成、等待用户、失败或达到步骤上限。
+v0.5 中 `OrchestratorService` 更准确地说是确定性控制平面：它解析会话角色、创建 Run、调用 Selector、校验权限、执行 Tool 并记录 Observation。真正对专业结果负责、选择下一动作并最终回复用户的是 Design 或 Verification 主 Agent。
 
-当前 `OrchestratorService`、`TaskIntent`、`ToolSelection` 和最多 6 步的 Planner–Executor Loop 已实现；DeepSeek Chat Completions 与 OpenAI Responses 都支持原生 Tool Call。需要强调，模型只负责选择候选动作，Tool Registry、Policy Gate、路径校验和审批仍由确定性后端执行，模型不能自授予权限。
+保留这个 Service 是为了复用状态机和安全策略，不代表保留一个“超级 Agent”。最多 6 步的 Planner–Executor Loop 仍存在；Tool 先按主 Agent 权限过滤，再由轻量 Selector 读 Metadata 形成候选集。模型不能自授予权限，执行前还会二次校验。
 
 ### 15. 为什么删除 Conversation Router，并把 Chat 也做成 Tool？
 
@@ -124,13 +124,13 @@ Reviewer 只返回 Finding，不直接批准或修改。其输出仍然是模型
 
 它用于按任务加载 CDC、低功耗、安全、DFT、PPA 或时序专项清单。当前只完成角色元数据，还没有自动识别模块特性并加入工作流，因此不能声称这些专项评审已经落地。
 
-合理的触发方式应结合文档标签、时钟/电源域信息、工具结果和用户指令，而不是只靠关键词。Orchestrator 还要说明为何选择某专项评审，避免无关角色带来额外成本和噪声。
+合理的触发方式应结合文档标签、时钟/电源域信息、工具结果和用户指令，而不是只靠关键词。当前主 Agent 还要说明为何选择某专项评审，避免无关角色带来额外成本和噪声。
 
 ### 21. 多 Agent 如何共享上下文？
 
-DS 工作流通过统一 State 共享请求、文档、分析结果、Issue、用户结论和 DS。每个角色只读取所需字段并写入自己的结果。当前没有独立 Agent 私有长期记忆或消息总线。
+顶层跨角色协作不直接共享完整聊天历史。主 Agent 创建 `DelegationTask`，只传项目、模块、明确 instruction、必要文档和制品引用，并附加只读与禁止嵌套委派约束；专家返回结论、证据和建议，作为 Observation 回到原主 Agent。DS 内部兼容子图仍通过统一 State 共享请求、分析结果、Issue、用户结论和 DS。
 
-统一 State 的优点是数据流清晰、可测试，缺点是字段增多后容易形成大对象。演进时可以用 Artifact ID 和 SourceRef 替代重复大文本，并通过共享存储传递制品，而不是让所有 Agent 复制完整上下文。
+这样既保留共享工程资产，又避免把主 Agent 私有上下文无边界扩散给专家。当前 Delegate 仍在同进程异步执行，不是消息队列；演进时应更多使用 Artifact ID 和 SourceRef 替代重复大文本。
 
 ### 22. 如何防止 Agent 形成虚假共识？
 
@@ -220,9 +220,9 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 ### 36. 为什么没有把所有流程都塞进一个 LangGraph？
 
-当前 DS 是成熟的内部图流程，而 RTL 和 ToolRun 通过独立 Service 和状态机落地。强行放入一个巨型图会增加耦合；v0.4 Orchestrator 在顶层按 Tool 动态组合这些执行器，不要求所有任务共享同一 State。
+当前 DS 是成熟的内部图流程，而 RTL 和 ToolRun 通过独立 Service 和状态机落地。强行放入一个巨型图会增加耦合；v0.5 由角色主 Agent 在顶层按 Tool 动态组合这些执行器，不要求所有任务共享同一 State。
 
-图适合表达 DS 内部稳定的推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。v0.4 顶层 Orchestrator 已经可以动态启动 DS 子图、RTL Service 或 ToolRun；它组合专业执行器，而不是把所有细节节点平铺进一张巨型图。
+图适合表达 DS 内部稳定的推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。v0.5 控制平面可根据主 Agent 的受控 Tool Call 启动 DS 子图、RTL Service 或 ToolRun；它组合专业执行器，而不是把所有细节节点平铺进一张巨型图。
 
 ### 37. 事件列表有什么作用？
 
@@ -258,7 +258,7 @@ Provider 对 DeepSeek 的 system role 和最大 Token 参数做了适配，同�
 
 ### 42. 模型配置在哪里？
 
-默认配置在 `config/model.toml`，网页覆盖在 `data/model_settings.json`，环境变量优先级最高。前端可以配置 provider、API 风格、模型、Base URL、超时、输出 Token 和 API Key。
+默认配置在 `config/model.toml`，网页覆盖在 `data/model_settings.json`，环境变量优先级最高。前端可以配置 provider、API 风格、主模型、Selector 模型、候选 Tool 上限、Base URL、超时、输出 Token 和 API Key。
 
 这种三级合并既提供可提交的安全默认值，也允许单机用户持久化选择，并让部署环境通过环境变量覆盖。DeepSeek 和 OpenAI 分别保存 Key，避免切换供应商时错误复用凭据。
 
@@ -288,7 +288,7 @@ Runtime 每次调用时读取有效设置，因此网页保存后无需重启后
 
 ### 47. 原生 Function Calling 和 Structured Outputs 在项目中如何分工？
 
-v0.4 已将原生 Function Calling 用于 Planner 的动作选择，因为 Tool 名称和参数天然适合函数契约；Architecture、Design、Review 等复杂结论目前仍采用提示词 JSON 加 Pydantic/Python 校验，因为不同供应商对严格 Structured Outputs 的支持并不一致。
+v0.5 使用两层选择：轻量 Selector 用结构化 JSON 返回候选 Tool 名称，主 Agent 再用原生 Function Calling 选择动作和参数。Architecture、Design、Review 等复杂结论目前仍采用提示词 JSON 加 Pydantic/Python 校验，因为不同供应商对严格 Structured Outputs 的支持并不一致。
 
 两者解决的问题不同：Function Calling 解决“调用哪个动作、传什么参数”，Structured Outputs 解决“一个语义结论如何严格成形”。即使未来角色输出升级为严格 Schema，来源校验、人工审批和 Tool 权限仍然必要，不能把格式可靠性等同于工程正确性。
 
@@ -306,9 +306,9 @@ v0.4 已将原生 Function Calling 用于 Planner 的动作选择，因为 Tool 
 
 ### 50. 如何控制模型成本？
 
-当前通过 Intent 整理、最多 6 步的规划上限、讨论轮次上限、确定性测试和上下文裁剪控制。尚未实现 Token 预算、计划缓存、Tool 检索、角色模型分级和成本面板，这些是生产化必须补充的能力。
+当前通过 Intent 整理、最多 6 步的规划上限、讨论轮次上限、Delegate 次数/超时和上下文裁剪控制。v0.5 先让可配置轻量 Selector 读取短 Metadata，最多返回有限 Tool 候选，不再把全量 Schema 发给主 Agent。
 
-进一步可以给任务设置总预算，Intent Enricher 和简单聊天使用小模型，关键架构/评审使用强模型；相同文档摘要和稳定计划按版本缓存；超过预算时暂停并让用户选择继续。成本指标应与接受率和缺陷发现价值一起看，不能只追求最低 Token。
+尚未实现 Provider token usage 回传、任务总预算、计划缓存、独立限流和成本面板。进一步可以让 Intent Enricher、Selector 和简单聊天使用小模型，关键架构/评审使用强模型；成本指标应与接受率和缺陷发现价值一起看，不能只追求最低 Token。
 
 ## 五、持久化、记忆与一致性（51～60）
 
@@ -320,9 +320,9 @@ v0.4 已将原生 Function Calling 用于 Planner 的动作选择，因为 Tool 
 
 ### 52. SQLite 中有哪些表？
 
-`workspaces`、`artifacts`、`patches`、`tool_runs`、`engineering_issues` 和 `task_snapshots`。数据库启用外键和 WAL。
+`workspaces`、`artifacts`、`patches`、`tool_runs`、`engineering_issues`、`task_snapshots`、`runs`、`run_events`、`conversations` 和 `delegation_tasks`。数据库启用外键和 WAL。
 
-这些表分别对应工程空间、版本化资产、候选修改、执行记录、标准化错误和 Agent 任务快照。Issue 对同一 Run 的 fingerprint 建唯一索引，Artifact 按 Workspace 和路径查询版本。当前没有用户、项目权限、模型调用审计和完整事件表。
+这些表覆盖工程空间、版本化资产、候选修改、外部执行、标准化错误、Agent 任务快照、统一控制面、会话角色和专家委派。Issue 对同一 Run 的 fingerprint 建唯一索引，DelegationTask 按父 Run 建索引。当前仍没有真实用户、项目 ACL 和完整模型调用审计。
 
 ### 53. TaskService 的内存状态和 SQLite 快照是什么关系？
 
@@ -440,7 +440,7 @@ Workspace 创建 `rtl`、`dv`、`constraints`、`candidates`、`artifacts` 和 `
 
 名称、说明、允许角色、Mutability、是否要求用户批准、幂等性、超时和执行器。它让编排层在运行前检查权限，而不是只依赖提示词。
 
-Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入。v0.4 的 Tool Metadata 已包含机器可读 `input_schema`、`output_schema`、`when_to_use` 和前置条件，可直接转换为 DeepSeek/OpenAI 的 Function Calling 定义；执行器仍会二次校验，不能只信模型参数。
+Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入。v0.5 的 Tool Metadata 还包含分类、启用状态和基础 Tool 标记；Selector 只看轻量字段，只有候选 Tool 的完整 Schema 才转换为 DeepSeek/OpenAI Function Calling 定义。执行器仍会二次校验，不能只信模型参数。
 
 ### 72. 当前真实接入了哪些 Tool？
 

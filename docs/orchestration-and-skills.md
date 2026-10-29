@@ -1,12 +1,15 @@
 # 编排、Workflow、Skill 与 Tool 设计
 
-> v0.4 已将主链升级为统一动态 Tool Calling。固定 Workflow 正在迁移为 Skill/Playbook + Tool，安全 Policy 继续由确定性代码强制；实现位置见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
+> v0.5 由用户工作角色选择 Design/Verification 主 Agent，专家协作使用 Delegate，Tool 采用权限过滤后的两阶段选择。固定 Workflow 继续渐进迁移；实现位置见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
 
 ## 1. 核心分工
 
 | 概念 | 解决的问题 | 当前实现 |
 |---|---|---|
-| Orchestrator + Intent | 用户想做什么、还缺什么信息 | `OrchestratorService`、`TaskIntent` |
+| Session + Primary Agent | 谁负责本轮判断和最终答复 | `SessionService`、Design/Verification |
+| Control Plane + Intent | 用户想做什么、还缺什么信息 | `OrchestratorService`、`TaskIntent` |
+| Tool Selector | 哪些已授权 Tool 值得给主 Agent | `ToolSelectorService` |
+| Delegate | 如何获得跨专业判断而不切换主 Agent | `DelegationService`、`DelegationTask` |
 | Run | 一次用户任务现在处于什么状态 | `RunService`、`runs`、`run_events` |
 | Workflow | 多步骤任务怎样推进和中断 | DS 使用 LangGraph；工程任务由 RunService 协调 ToolRun |
 | Role Agent | 由哪个生产角色判断 | Architecture、Design、Verification、Reviewer |
@@ -21,10 +24,13 @@
 
 ```text
 POST /conversations/{session_id}/messages
-→ OrchestratorService 形成 TaskIntent 并创建 Run
-→ Planner 通过原生 Function Calling 选择 Tool
+→ SessionService 解析 Design / Verification 主 Agent
+→ 控制平面形成 TaskIntent 并创建 Run
+→ Registry 先按主 Agent 权限过滤
+→ Selector Model 读取 Metadata 并形成候选集
+→ 主 Agent通过原生 Function Calling 选择 Tool
 → Registry / Policy 校验权限、参数和审批
-→ Tool Handler 执行并返回 Observation
+→ Delegate 或 Tool Handler 执行并返回 Observation
 → 重新规划、等待用户或完成
 ```
 
@@ -32,7 +38,7 @@ POST /conversations/{session_id}/messages
 
 ## 3. 为什么模型不能直接执行
 
-模型只返回 ToolSelection，不直接执行动作。真正执行前，由确定性代码检查：
+Selector 只返回候选名称，主 Agent 只返回 ToolSelection，都不直接执行动作。真正执行前，由确定性代码检查：
 
 - 用户是否明确要求动作；
 - 是否有 AS、已确认 DS、Workspace 等必需输入；
@@ -99,3 +105,4 @@ planned
 4. 增加 Run 的 SSE 事件推送和最近会话恢复；
 5. 为 Skill 增加版本、测试样例和效果评估；
 6. 将 Issue → Candidate Patch → 用户审批 → 最小复验串成可恢复 Workflow。
+7. 为 Selector 和 Delegate 增加 token、成本、独立限流与熔断指标。

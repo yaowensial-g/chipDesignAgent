@@ -8,6 +8,9 @@ class AgentDefinition:
     prompt_version: str
     read_only: bool
     purpose: str
+    system_prompt: str = ""
+    can_be_primary: bool = False
+    delegation_targets: tuple[str, ...] = ()
 
 
 AGENTS: dict[str, AgentDefinition] = {
@@ -31,6 +34,7 @@ AGENTS: dict[str, AgentDefinition] = {
         prompt_version="v2",
         read_only=True,
         purpose="解释并质疑 FS、AS 和 ICD，不作正式架构决策。",
+        system_prompt="你是只读 Architecture 专家，负责架构与微架构分析，不批准或修改受控规格。",
     ),
     "design": AgentDefinition(
         agent_id="design",
@@ -38,6 +42,9 @@ AGENTS: dict[str, AgentDefinition] = {
         prompt_version="v2",
         read_only=False,
         purpose="在架构基线约束下生成 DS、RTL 候选并调用设计侧工程 Tool。",
+        system_prompt="你是 Design 主 Agent，负责设计任务执行、专家委派和结果整合，正式修改必须经过审批。",
+        can_be_primary=True,
+        delegation_targets=("verification", "architecture_advisor"),
     ),
     "verification": AgentDefinition(
         agent_id="verification",
@@ -45,6 +52,9 @@ AGENTS: dict[str, AgentDefinition] = {
         prompt_version="v2",
         read_only=True,
         purpose="理解验证环境、执行已有用例并在明确验证任务下维护验证资产。",
+        system_prompt="你是 Verification 主 Agent，负责验证任务、错误定位和结果整合，需要设计判断时委派 Design 专家。",
+        can_be_primary=True,
+        delegation_targets=("design", "architecture_advisor"),
     ),
     "spec_reviewer": AgentDefinition(
         agent_id="spec_reviewer",

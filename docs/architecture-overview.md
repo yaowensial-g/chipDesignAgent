@@ -1,13 +1,16 @@
-# ChipFlow 总体架构说明（v0.4）
+# ChipFlow 总体架构说明（v0.5）
 
 ## 1. 架构目标
 
 ChipFlow 是面向 RTL 设计与验证工程师的 Windows 本地 Multi-Agent 工作台。系统的核心不是让模型替代工程师，而是把不确定的模型判断放入可审计、可暂停、可审批的工程控制面。
 
-v0.4 遵循以下原则：
+v0.5 遵循以下原则：
 
 - 用户决定任务目标以及是否进入下一研发阶段；
-- 所有消息进入统一 Orchestrator，不再预先二分为 Chat 和固定 Workflow；
+- 用户工作角色决定 Design 或 Verification 主 Agent，控制平面不冒充专业主 Agent；
+- 所有消息进入统一 Planner–Executor 控制面，不再预先二分为 Chat 和固定 Workflow；
+- 跨专业协作通过有边界、可持久化的 Delegate 完成；
+- Tool 先按主 Agent 权限硬过滤，再由轻量模型选择有限候选；
 - 模型可以完善任务表达，但不能补造 FS、AS、ICD 中不存在的工程事实；
 - 普通聊天也是一个只有 `reply_to_user` Tool 的 Run；
 - Agent 负责专业判断，Tool 负责结构化动作，Policy 负责不可绕过的安全规则；
@@ -38,24 +41,27 @@ flowchart LR
 | FastAPI | HTTP 契约、请求编号、异常转换、Service 装配 | 不在路由函数中实现业务编排 |
 | ConversationService | 保持对话 API 兼容并转交请求 | 不再判断 Chat/DS/RTL 固定分支 |
 
-### 2.2 统一编排主链
+### 2.2 角色主 Agent 与统一控制主链
 
 ```mermaid
 flowchart TB
-    Message[用户消息和文档上下文]
+    Message[用户消息、工作角色和文档上下文]
+    Session[SessionService 解析主 Agent]
     Intent[TaskIntent 意图整理]
     Run[创建 Unified Run]
-    Planner[Planner 选择下一 Tool]
+    Filter[按主 Agent 权限过滤 Tool]
+    Selector[轻量 Selector 选候选 Tool]
+    Planner[Design / Verification 主 Agent 规划]
     Guard[Policy 与前置条件校验]
     Execute[Tool Handler / Executor]
     Observe[Observation 写回 Run]
 
-    Message --> Intent --> Run --> Planner
+    Message --> Session --> Intent --> Run --> Filter --> Selector --> Planner
     Planner --> Guard --> Execute --> Observe
-    Observe --> Planner
+    Observe --> Filter
 ```
 
-这张图只表达控制流。`TaskIntent` 保存原始请求、目标、交付物、已知事实、假设和缺失信息；Planner 每次只选择一个下一步 Tool。Tool 执行结果作为 Observation 返回，系统重新规划，直到完成、等待用户、失败或达到六步上限。
+这张图只表达控制流。`SessionService` 将 `design_engineer` 映射为 Design 主 Agent，将 `verification_engineer` 映射为 Verification 主 Agent。`TaskIntent` 保存原始请求、目标、交付物、已知事实、假设和缺失信息；当前主 Agent 每次只选择一个下一步 Tool。Tool 执行结果作为 Observation 返回，系统重新规划，直到完成、等待用户、失败或达到六步上限。
 
 普通聊天没有旁路。Planner 选择 `reply_to_user` 后形成只有一个 Tool Call 的短 Run，因此聊天和工程任务共享相同的事件、错误和审计语义。
 
@@ -63,26 +69,31 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    Planner[LLM Planner]
-    Catalog[Tool Catalog 与 JSON Schema]
-    Policy[Role / Mutability / Approval Policy]
+    Catalog[Tool Registry 全量目录]
+    Permission[主 Agent 权限与 enabled 硬过滤]
+    Metadata[轻量 Metadata]
+    Selector[Selector Model]
+    Schemas[候选 Tool 完整 JSON Schema]
+    Planner[当前主 Agent]
+    Policy[执行前二次 Policy 校验]
     RoleTools[Architecture / Design / Verification Tools]
     CandidateTools[DS / RTL / Patch Tools]
     EDATools[Lint / Test Discovery / Future EDA]
 
-    Planner --> Catalog --> Policy
+    Catalog --> Permission --> Metadata --> Selector --> Schemas --> Planner --> Policy
     Policy --> RoleTools
     Policy --> CandidateTools
     Policy --> EDATools
 ```
 
-模型只提出“调用哪个 Tool、传哪些参数”，不能直接取得数据库、文件系统或 Shell 权限。Tool Registry 将模型可见的描述与后端执行器绑定；Policy Gate 再检查角色、修改等级、Workspace 路径、参数和用户授权。即使模型选择了越权 Tool，确定性代码也会拒绝执行。
+权限过滤发生在模型选择之前：无权或禁用 Tool 不会进入 Selector 的 Metadata，也不会进入主 Agent 的完整 Schema。Selector 只决定候选集，主 Agent 再决定“调用哪个 Tool、传哪些参数”。两个模型都不能直接取得数据库、文件系统或 Shell 权限；执行前还会再次检查角色、修改等级、Workspace 路径、参数和用户授权。
 
 ### 2.4 状态、证据和外部依赖
 
 | 类别 | 当前组件 | 主要数据 | 失败时如何处理 |
 |---|---|---|---|
-| 控制面状态 | Unified Run、RunEvent、SQLite | Intent、Tool Call、Observation、等待项和结果 | 保留失败状态与请求编号 |
+| 控制面状态 | Conversation、Unified Run、RunEvent、SQLite | 工作角色、主 Agent、Intent、Tool Shortlist、Tool Call、Observation 和结果 | 保留失败状态与请求编号 |
+| 协作状态 | DelegationTask | 专家 instruction、约束、证据、状态和结构化结果 | 超时/失败返回主 Agent，并标记需人工介入 |
 | 专业状态 | DS Task、Patch、ToolRun、EngineeringIssue | DS、Diff、审批、命令、日志和单 Issue 决策 | 专业对象独立恢复或重试 |
 | 本地文件 | Workspace、Artifact、Raw Logs | RTL、候选文件、版本 Hash、stdout/stderr | 路径限制、原子写入、保留原始证据 |
 | 模型服务 | DeepSeek / OpenAI | 意图整理、Planner 和角色判断 | 结构化错误；测试回退 Deterministic Runtime |
@@ -97,17 +108,19 @@ flowchart TB
 ```text
 用户消息
 → ConversationService
-→ OrchestratorService
+→ SessionService 解析 Design / Verification 主 Agent
 → TaskIntent
 → 创建 Unified Run
-→ Planner 选择一个 Tool
+→ 按角色权限过滤 Tool
+→ Selector Model 读取轻量 Metadata 并生成候选集
+→ 主 Agent 读取候选 Tool 完整 Schema 并选择一个 Tool
 → Policy 与前置条件校验
-→ Tool Handler / Executor
+→ Delegate / Tool Handler / Executor
 → Observation
 → 重新规划、等待用户或完成
 ```
 
-`ConversationService` 只是兼容门面。它不再调用 `route_conversation()`，也不再输出 Chat/DS/RTL/EDA 的固定分支。所有响应统一标记为 `orchestrated`，真正的执行语义由 Run 中的 `tool_calls`、`observations` 和专业对象关联表示。
+`ConversationService` 只是兼容门面。`OrchestratorService` 是确定性控制平面，不是默认业务主 Agent。所有响应统一标记为 `orchestrated`，真正的责任主体由 Run 的 `primary_agent` 表示，执行语义由 `tool_selections`、`tool_calls`、`delegations`、`observations` 和专业对象关联表示。
 
 每个 Planner Loop 最多六步。这个上限防止模型重复调用角色或为了闭环制造虚假进展。达到上限后 Run 进入 `waiting_for_user`，不会继续消耗模型额度。
 
@@ -137,9 +150,9 @@ flowchart TB
 
 例如“帮我检查一下 scheduler”不能直接等价为执行 Lint。系统会询问用户希望阅读代码评审、执行 Lint，还是结合规格检查一致性。
 
-## 5. Planner 与原生 Function Calling
+## 5. 两阶段 Tool 选择与原生 Function Calling
 
-真实模型通过 Provider 接收完整 Tool Schema，并一次选择一个下一步 Tool。两种协议被统一：
+第一阶段中，Selector 只接收当前角色已授权 Tool 的名称、说明、适用条件和分类，返回最多 `selector_max_tools` 个名称。第二阶段中，主 Agent 才通过 Provider 接收这些候选 Tool 的完整 Schema，并一次选择一个下一步 Tool。两种 Provider 协议被统一：
 
 | Provider 路径 | 原生接口 | 归一化结果 |
 |---|---|---|
@@ -160,7 +173,7 @@ flowchart TB
 
 如果模型只返回文字，没有发起 Function Call，Provider 会将它归一化成 `reply_to_user`。因此普通回答也不会绕开 Run、事件和审计链。
 
-自动化测试强制使用 Deterministic Runtime。它实现相同的 `enrich_intent()` 和 `select_tool()` 契约，不读取开发者保存的 Key，也不消耗真实模型额度。
+自动化测试强制使用 Deterministic Runtime。它实现相同的 `enrich_intent()`、`select_tool_names()` 和 `select_tool()` 契约，不读取开发者保存的 Key，也不消耗真实模型额度。
 
 ## 6. Tool Catalog
 
@@ -195,7 +208,7 @@ Tool Definition 不只是名称和描述，还包含：
 | `verilator_lint` | 执行受控 HDL Lint | Workspace、文件白名单、显式授权 |
 | `discover_testcases` | 发现验证目录中的已有用例 | 只读，不生成验证计划 |
 
-当前工具数量较少，因此完整 Catalog 可以发送给 Planner。工具扩大后应先按角色、环境、Workspace 和能力标签过滤，再向模型提供候选子集，避免上下文膨胀和相似 Tool 误选。
+当前实现已经不再向主 Agent 发送完整 Catalog：后端先按角色和启用状态过滤，再由 Selector 形成候选集。`reply_to_user` 与 `ask_user` 始终可用；Selector 失败时回退到 Intent 候选和基础 Tool。后续可继续加入环境、Workspace、能力标签和历史成功率等过滤维度。
 
 ## 7. Agent 角色模型
 
@@ -203,13 +216,13 @@ Tool Definition 不只是名称和描述，还包含：
 
 | 角色 | 主要职责 | 禁止事项 |
 |---|---|---|
-| Orchestrator | 完善意图、选择 Tool、维护 Run | 不替用户决定研发阶段 |
+| Design（可作为主 Agent） | DS、RTL、微架构、设计侧 Tool、结果整合 | 不直接写正式文件 |
+| Verification（可作为主 Agent） | 验证分析、已有用例、验证侧 Tool、结果整合 | 不默认替验证团队制定计划 |
 | Architecture | 解释、质疑 FS/AS/ICD | 不批准或直接修改架构基线 |
-| Design | DS、RTL、微架构与设计建议 | 不直接写正式文件 |
-| Verification | 可验证性、已有用例和验证侧判断 | 不默认替验证团队制定计划 |
 | Reviewer | 独立检查规格、微架构、接口和可验证性 | 不自我批准或直接修改 |
+| 确定性控制平面 | 保存 Run、过滤权限、执行 Tool、记录 Observation | 不产生专业结论，不成为默认主 Agent |
 
-角色当前共享同一模型配置，通过提示词、Skill、输入契约和 Tool 权限隔离。它们不是独立进程，也不是多个自治服务。未来可以按角色选择不同模型，而不改变领域协议。
+Design 和 Verification 当前共享主模型配置，通过提示词、Skill、输入契约和 Tool 权限隔离；轻量 Selector 可以单独配置模型名称。专家委派在同进程中异步执行并持久化为 `DelegationTask`，不是独立微服务。完整设计见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
 
 ## 8. Skill、Tool、Workflow 与 Policy
 

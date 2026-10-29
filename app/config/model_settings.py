@@ -25,6 +25,9 @@ class EffectiveModelSettings:
     timeout_seconds: int
     max_output_tokens: int
     api_key_source: str
+    selector_model: str = "deepseek-chat"
+    selector_max_tools: int = 6
+    selector_max_output_tokens: int = 1000
 
     @property
     def ready(self) -> bool:
@@ -64,8 +67,12 @@ class ModelSettingsService:
         api_key = environment_key or saved_key
         key_source = "environment" if environment_key else ("saved" if saved_key else "none")
 
-        def value(name: str, environment_name: str | None = None):
-            return value_from_sources(saved, defaults, name, environment_name)
+        def value(
+            name: str,
+            environment_name: str | None = None,
+            fallback: object | None = None,
+        ):
+            return value_from_sources(saved, defaults, name, environment_name, fallback)
 
         return EffectiveModelSettings(
             enabled=_as_bool(value("enabled", "CHIP_AGENT_MODEL_ENABLED")),
@@ -76,6 +83,19 @@ class ModelSettingsService:
             api_key=api_key,
             timeout_seconds=int(value("timeout_seconds", "CHIP_AGENT_MODEL_TIMEOUT")),
             max_output_tokens=int(value("max_output_tokens", "CHIP_AGENT_MAX_OUTPUT_TOKENS")),
+            selector_model=str(
+                value("selector_model", "CHIP_AGENT_SELECTOR_MODEL", "deepseek-chat")
+            ),
+            selector_max_tools=int(
+                value("selector_max_tools", "CHIP_AGENT_SELECTOR_MAX_TOOLS", 6)
+            ),
+            selector_max_output_tokens=int(
+                value(
+                    "selector_max_output_tokens",
+                    "CHIP_AGENT_SELECTOR_MAX_OUTPUT_TOKENS",
+                    1000,
+                )
+            ),
             api_key_source=key_source,
         )
 
@@ -145,10 +165,17 @@ def value_from_sources(
     defaults: dict[str, object],
     name: str,
     environment_name: str | None = None,
+    fallback: object | None = None,
 ):
     if environment_name and os.getenv(environment_name) is not None:
         return os.environ[environment_name]
-    return saved.get(name, defaults[name])
+    if name in saved:
+        return saved[name]
+    if name in defaults:
+        return defaults[name]
+    if fallback is not None:
+        return fallback
+    raise KeyError(name)
 
 
 def _mask_key(api_key: str) -> str | None:

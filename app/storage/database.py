@@ -119,6 +119,7 @@ class Database:
             status TEXT NOT NULL,
             user_instruction TEXT NOT NULL,
             route_reason TEXT NOT NULL,
+            primary_agent TEXT,
             legacy_task_id TEXT,
             tool_run_id TEXT,
             patch_id TEXT,
@@ -137,11 +138,38 @@ class Database:
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
+        CREATE TABLE IF NOT EXISTS conversations (
+            session_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            user_role TEXT NOT NULL,
+            primary_agent TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delegation_tasks (
+            task_id TEXT PRIMARY KEY,
+            parent_run_id TEXT NOT NULL,
+            from_agent TEXT NOT NULL,
+            to_agent TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            instruction TEXT NOT NULL,
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            constraints_json TEXT NOT NULL DEFAULT '{}',
+            expected_output TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            error TEXT,
+            requires_human_intervention INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(parent_run_id) REFERENCES runs(run_id)
+        );
         CREATE INDEX IF NOT EXISTS idx_artifacts_workspace ON artifacts(workspace_id);
         CREATE INDEX IF NOT EXISTS idx_issues_run_order ON engineering_issues(run_id, queue_index);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_issue_fingerprint ON engineering_issues(run_id, fingerprint);
         CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_order ON run_events(run_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_delegations_run ON delegation_tasks(parent_run_id, created_at);
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -152,6 +180,9 @@ class Database:
                 connection.execute(
                     "ALTER TABLE engineering_issues ADD COLUMN analysis_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
+            if "primary_agent" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN primary_agent TEXT")
             connection.commit()
 
     @staticmethod

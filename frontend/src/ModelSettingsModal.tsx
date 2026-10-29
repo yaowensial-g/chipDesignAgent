@@ -20,6 +20,9 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
   const [apiKey, setApiKey] = useState("");
   const [timeout, setTimeoutValue] = useState(settings.timeout_seconds);
   const [maxOutputTokens, setMaxOutputTokens] = useState(settings.max_output_tokens);
+  const [selectorModel, setSelectorModel] = useState(settings.selector_model);
+  const [selectorMaxTools, setSelectorMaxTools] = useState(settings.selector_max_tools);
+  const [selectorMaxOutputTokens, setSelectorMaxOutputTokens] = useState(settings.selector_max_output_tokens);
   const [clearApiKey, setClearApiKey] = useState(false);
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -37,6 +40,9 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
       clear_api_key: clearApiKey,
       timeout_seconds: timeout,
       max_output_tokens: maxOutputTokens,
+      selector_model: selectorModel.trim(),
+      selector_max_tools: selectorMaxTools,
+      selector_max_output_tokens: selectorMaxOutputTokens,
     };
   }
 
@@ -45,10 +51,12 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
     if (nextProvider === "deepseek") {
       setApiStyle("responses");
       setModel("deepseek-flash");
+      setSelectorModel("deepseek-chat");
       setBaseUrl("https://api.deepseek.com");
     } else {
       setApiStyle("responses");
       setModel("gpt-5.5");
+      setSelectorModel("gpt-4.1-mini");
       setBaseUrl("https://api.openai.com/v1");
     }
     setApiKey("");
@@ -134,6 +142,11 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
             <input required value={model} onChange={(event) => setModel(event.target.value)} placeholder={provider === "deepseek" ? "deepseek-flash" : "gpt-5.5"} />
           </label>
           <label>
+            <span>轻量 Tool Selector 模型</span>
+            <input required value={selectorModel} onChange={(event) => setSelectorModel(event.target.value)} placeholder={provider === "deepseek" ? "deepseek-chat" : "gpt-4.1-mini"} />
+            <small>只接收已授权 Tool 的简短元数据，主 Agent 只看到筛选后的完整 Schema。</small>
+          </label>
+          <label>
             <span>Base URL</span>
             <input required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" />
           </label>
@@ -171,6 +184,16 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
             <label>
               <span>最大输出 Token</span>
               <input type="number" min={256} max={100000} value={maxOutputTokens} onChange={(event) => setMaxOutputTokens(Number(event.target.value))} />
+            </label>
+          </div>
+          <div className="form-grid">
+            <label>
+              <span>Selector 最大 Tool 数</span>
+              <input type="number" min={2} max={20} value={selectorMaxTools} onChange={(event) => setSelectorMaxTools(Number(event.target.value))} />
+            </label>
+            <label>
+              <span>Selector 输出 Token</span>
+              <input type="number" min={128} max={8000} value={selectorMaxOutputTokens} onChange={(event) => setSelectorMaxOutputTokens(Number(event.target.value))} />
             </label>
           </div>
 

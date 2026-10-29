@@ -6,6 +6,7 @@ from app.domain.enums import (
     AgentRole,
     ArtifactStatus,
     DocumentKind,
+    DelegationStatus,
     EngineeringIssueStatus,
     IssueDecisionAction,
     KnowledgeType,
@@ -16,6 +17,7 @@ from app.domain.enums import (
     Severity,
     TaskStatus,
     ToolRunStatus,
+    UserRole,
 )
 
 
@@ -139,6 +141,7 @@ class ChatRequest(BaseModel):
     ds_markdown: str | None = None
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     user_approved: bool = False
+    user_role: UserRole | None = None
 
 
 class TaskIntent(BaseModel):
@@ -163,6 +166,57 @@ class ToolSelection(BaseModel):
     reason: str = ""
 
 
+class ToolShortlist(BaseModel):
+    selected_tools: list[str] = Field(default_factory=list)
+    reason: str = ""
+    used_fallback: bool = False
+
+
+class ConversationRoleUpdate(BaseModel):
+    user_role: UserRole
+
+
+class ConversationView(BaseModel):
+    session_id: str
+    project_id: str
+    user_role: UserRole
+    primary_agent: AgentRole
+    created_at: str
+    updated_at: str
+
+
+class DelegationArtifactRef(BaseModel):
+    path: str
+    version: str = ""
+
+
+class DelegationRequest(BaseModel):
+    parent_run_id: str
+    from_agent: AgentRole
+    to_agent: AgentRole
+    task_type: str = Field(min_length=1, max_length=120)
+    instruction: str = Field(min_length=1, max_length=4000)
+    artifacts: list[DelegationArtifactRef] = Field(default_factory=list)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    expected_output: str = "结构化专业分析"
+
+
+class DelegationResult(BaseModel):
+    task_id: str
+    parent_run_id: str
+    from_agent: AgentRole
+    to_agent: AgentRole
+    status: DelegationStatus
+    conclusion: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    artifacts: list[DelegationArtifactRef] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    error: str | None = None
+    requires_human_intervention: bool = False
+    created_at: str
+    updated_at: str
+
+
 class RunEventView(BaseModel):
     event_id: str
     run_id: str
@@ -183,6 +237,7 @@ class RunView(BaseModel):
     status: RunStatus
     user_instruction: str
     route_reason: str = ""
+    primary_agent: AgentRole | None = None
     legacy_task_id: str | None = None
     tool_run_id: str | None = None
     patch_id: str | None = None
@@ -228,6 +283,9 @@ class ModelSettingsUpdate(BaseModel):
     clear_api_key: bool = False
     timeout_seconds: int = Field(default=120, ge=10, le=600)
     max_output_tokens: int = Field(default=6000, ge=256, le=100_000)
+    selector_model: str = Field(default="deepseek-chat", min_length=1)
+    selector_max_tools: int = Field(default=6, ge=2, le=20)
+    selector_max_output_tokens: int = Field(default=1000, ge=128, le=8000)
 
 
 class ModelSettingsView(BaseModel):
@@ -238,6 +296,9 @@ class ModelSettingsView(BaseModel):
     base_url: str
     timeout_seconds: int
     max_output_tokens: int
+    selector_model: str
+    selector_max_tools: int
+    selector_max_output_tokens: int
     api_key_source: str
     has_api_key: bool
     api_key_masked: str | None
@@ -313,6 +374,9 @@ class ToolDefinitionView(BaseModel):
     preconditions: list[str] = Field(default_factory=list)
     side_effect: str = "none"
     execution_kind: Literal["orchestration", "engineering"] = "engineering"
+    category: str = "common"
+    enabled: bool = True
+    always_available: bool = False
 
     def as_function_tool(self) -> dict[str, Any]:
         return {

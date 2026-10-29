@@ -66,6 +66,7 @@ export interface ChatInput {
   dsMarkdown?: string | null;
   toolArguments?: Record<string, unknown>;
   userApproved?: boolean;
+  userRole: "design_engineer" | "verification_engineer";
 }
 
 export async function sendChat(input: ChatInput): Promise<ChatResponse> {
@@ -89,6 +90,7 @@ export async function sendChat(input: ChatInput): Promise<ChatResponse> {
       ds_markdown: input.dsMarkdown || null,
       tool_arguments: input.toolArguments || {},
       user_approved: input.userApproved || false,
+      user_role: input.userRole,
     }),
   });
   return parseResponse(response);

@@ -1,6 +1,6 @@
-# 运行逻辑说明（v0.4 动态编排）
+# 运行逻辑说明（v0.5 角色主 Agent）
 
-> 当前对话主链为 Intent Enricher → Planner → Tool → Observation → Replan。本文件描述 v0.4 当前实现，不再混入旧 Router 主链。
+> 当前对话主链为 Role Resolution → Intent Enricher → Permission Filter → Tool Selector → Primary Agent → Tool/Delegate → Observation。本文件描述 v0.5 当前实现。
 
 ## 1. 启动
 
@@ -17,34 +17,48 @@
 
 1. 初始化示例项目和模块；
 2. 读取公开模型设置；
-3. 显示真实模型或模拟运行时；
-4. 用户可以直接聊天，不要求先上传 FS/AS；
-5. 右上角提供工程工作台、系统自检和模型设置。
+3. 默认选择设计工程师工作角色，并允许切换验证工程师；
+4. 显示真实模型或模拟运行时；
+5. 用户可以直接聊天，不要求先上传 FS/AS；
+6. 右上角提供工程工作台、系统自检和模型设置。
 
 浏览器刷新仍会清空当前聊天和上传列表；后端持久化的 Task/Workspace 不会自动重新绑定到新页面会话。
 
-## 3. 对话、Orchestrator 和统一 Run
+## 3. 对话、角色主 Agent 和统一 Run
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant W as Web
     participant C as ConversationService
-    participant O as OrchestratorService
-    participant P as Planner
+    participant S as SessionService
+    participant O as Control Plane
+    participant TS as Tool Selector
+    participant P as Primary Agent
     participant T as Tool Registry
+    participant D as DelegationService
     participant E as Tool Handler
     participant DB as SQLite
     U->>W: 消息 + 可选文档
     W->>C: POST /conversations/{id}/messages
+    C->>S: session + user_role
+    S-->>O: Design / Verification 主 Agent
     C->>O: message + history + documents
     O->>O: enrich TaskIntent
     O->>DB: create Unified Run
     loop 最多 6 个 Planner Step
-        O->>P: Intent + Tool Schema + Observations
+        O->>T: 按主 Agent 权限过滤
+        T-->>TS: 轻量 Tool Metadata
+        TS-->>O: Tool Shortlist
+        O->>P: Intent + 候选 Tool Schema + Observations
         P-->>O: ToolSelection
         O->>T: 解析 Tool + Policy 校验
-        T->>E: 调用受控 Handler
+        alt 跨专业判断
+            T->>D: 创建受控专家任务
+            D-->>O: 结构化专家 Observation
+        else 普通 Tool
+            T->>E: 调用受控 Handler
+        end
         E-->>O: Observation / 专业对象 ID
         O->>DB: RunEvent + result/status
     end
@@ -52,12 +66,13 @@ sequenceDiagram
     C-->>W: assistant + RunView + 可选 TaskView
 ```
 
-上传文件只增加上下文，不自动触发流程。用户决定任务目标和研发阶段；Intent Enricher 只整理有证据的信息，Planner 根据目标选择 Tool。明确 DS 任务必须至少包含 AS，否则 `ask_user` 让 Run 进入 `waiting_for_user`。
+上传文件只增加上下文，不自动触发流程。用户决定任务目标和研发阶段；Intent Enricher 只整理有证据的信息，当前主 Agent 从权限安全的候选集中选择 Tool。明确 DS 任务必须至少包含 AS，否则 `ask_user` 让 Run 进入 `waiting_for_user`。
 
 统一 Run 和专业执行记录分层：
 
 ```text
 Run（用户任务控制面）
+├─ DelegationTask（只读专家协作）
 ├─ DS Task（LangGraph 专业状态）
 ├─ RTL Patch（候选修改与审批）
 └─ ToolRun（一次外部进程执行）
