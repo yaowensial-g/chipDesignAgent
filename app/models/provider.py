@@ -200,6 +200,7 @@ class OpenAIModelProvider:
             "只回答 CHIP_AGENT_CONNECTION_OK",
         )
         if "CHIP_AGENT_CONNECTION_OK" not in result:
+            print(result)
             raise ModelInvocationError("模型已响应，但未返回预期的连接检查结果")
         return result.strip()
 

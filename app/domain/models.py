@@ -141,6 +141,8 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1)
     history: list[ChatHistoryMessage] = Field(default_factory=list, max_length=40)
     documents: list[DocumentInput] = Field(default_factory=list)
+    # 新版前端可以只传后端已经保存的文档 ID；documents 保留用于旧客户端和首次上传。
+    document_ids: list[str] = Field(default_factory=list)
     disabled_agents: set[str] = Field(default_factory=set)
     custom_reviewers: list[str] = Field(default_factory=list)
     max_discussion_rounds: int = Field(default=2, ge=1, le=3)
@@ -190,10 +192,166 @@ class ConversationView(BaseModel):
     """会话级角色元数据；``primary_agent`` 由后端根据用户角色计算。"""
     session_id: str
     project_id: str
+    module_name: str = ""
+    title: str = "新会话"
     user_role: UserRole
     primary_agent: AgentRole
+    last_message_preview: str = ""
+    message_count: int = 0
+    active_run_id: str | None = None
     created_at: str
     updated_at: str
+
+
+class ConversationMessageView(BaseModel):
+    """后端持久化的单条会话消息。"""
+
+    message_id: str
+    session_id: str
+    sequence: int
+    role: Literal["user", "assistant", "system"]
+    agent_role: str | None = None
+    content: str
+    message_type: str = "chat"
+    run_id: str | None = None
+    delegation_task_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class ConversationMessagesPage(BaseModel):
+    """消息倒序分页结果；items 对前端仍按时间正序返回。"""
+
+    items: list[ConversationMessageView]
+    next_before: int | None = None
+
+
+class ConversationSummaryView(BaseModel):
+    session_id: str
+    summary: str
+    covered_until_sequence: int
+    updated_at: str
+
+
+class DocumentIngestRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    module_name: str = Field(min_length=1)
+    kind: DocumentKind
+    name: str = Field(min_length=1)
+    version: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class StoredDocumentView(BaseModel):
+    document_id: str
+    version_id: str
+    project_id: str
+    module_name: str
+    kind: DocumentKind
+    name: str
+    version: str
+    content_hash: str
+    status: str
+    chunk_count: int
+    created_at: str
+
+
+class DocumentChunkView(BaseModel):
+    chunk_id: str
+    document_id: str
+    version_id: str
+    document_name: str
+    document_version: str
+    document_kind: DocumentKind
+    module_name: str
+    section: str
+    ordinal: int
+    content: str
+    token_count: int
+    score: float = 0.0
+    keyword_score: float = 0.0
+    semantic_score: float = 0.0
+
+
+class RetrievalRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    module_name: str | None = None
+    query: str = Field(min_length=1)
+    document_kinds: list[DocumentKind] = Field(default_factory=list)
+    top_k: int = Field(default=8, ge=1, le=50)
+    include_superseded: bool = False
+
+
+class RetrievalResult(BaseModel):
+    query: str
+    chunks: list[DocumentChunkView]
+
+
+class MemoryCreateRequest(BaseModel):
+    project_id: str = Field(min_length=1)
+    module_name: str | None = None
+    scope: str = "module"
+    kind: Literal["fact", "decision", "assumption", "inference", "question", "preference", "experience"]
+    content: str = Field(min_length=1)
+    confidence: int = Field(default=5, ge=1, le=10)
+    authority: str = "agent"
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    status: Literal["proposed", "active"] = "proposed"
+
+    @model_validator(mode="after")
+    def require_source_for_authoritative_memory(self) -> "MemoryCreateRequest":
+        traceable_sources = [
+            source
+            for source in self.source_refs
+            if str(source.get("source_id") or source.get("id") or "").strip()
+        ]
+        if self.status == "active" and self.kind in {"fact", "decision"} and not traceable_sources:
+            raise ValueError("active fact/decision requires at least one source")
+        return self
+
+
+class MemoryPromoteRequest(BaseModel):
+    authority: str = Field(min_length=1)
+    source_refs: list[dict[str, Any]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_traceable_source(self) -> "MemoryPromoteRequest":
+        if not any(
+            str(source.get("source_id") or source.get("id") or "").strip()
+            for source in self.source_refs
+        ):
+            raise ValueError("promotion requires at least one traceable source_id")
+        return self
+
+
+class MemoryView(BaseModel):
+    memory_id: str
+    project_id: str
+    module_name: str | None = None
+    scope: str
+    kind: str
+    content: str
+    confidence: int
+    authority: str
+    status: str
+    source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class ContextManifestView(BaseModel):
+    context_id: str
+    session_id: str
+    run_id: str | None = None
+    agent_role: str
+    token_budget: int
+    estimated_tokens: int
+    message_ids: list[str] = Field(default_factory=list)
+    memory_ids: list[str] = Field(default_factory=list)
+    chunk_ids: list[str] = Field(default_factory=list)
+    observation_ids: list[str] = Field(default_factory=list)
+    sections: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
 
 
 class DelegationArtifactRef(BaseModel):

@@ -146,6 +146,9 @@ def register_builtin_tools() -> None:
             preconditions=["存在可访问的 Workspace", "Verilator 已安装", "用户授权启动本地进程"],
             side_effect="local_process",
             category="common",
+            # 当前产品运行环境不保证安装 EDA 工具。保留真实 Adapter 代码供未来启用，
+            # 但默认不暴露给 Agent；现阶段统一调用 run_mock_eda。
+            enabled=False,
             executor=_verilator_lint,
         )
 

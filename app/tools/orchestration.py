@@ -119,11 +119,44 @@ def register_orchestration_tools() -> None:
             side_effect="candidate_patch",
         ),
         dict(
+            name="run_mock_eda",
+            allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
+            category="eda",
+            description=(
+                "调用不依赖真实工具环境的 EDA 占位函数，覆盖 RTL 编译、仿真、Lint、"
+                "CDC、综合和 STA；返回值明确标记为 MOCK，不能用于 Sign-off。"
+            ),
+            when_to_use="当前开发环境中，用户要求执行编译、仿真、Lint、CDC、综合或时序分析时。",
+            when_not_to_use="用户只是询问概念，或未来已经启用相应真实 EDA Adapter 时。",
+            mutability=Mutability.ANALYSIS,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "stage": {
+                        "type": "string",
+                        "enum": ["compilation", "simulation", "lint", "cdc", "synthesis", "sta"],
+                    },
+                    "target": {"type": "string", "description": "目标模块或顶层名称"},
+                    "options": {"type": "object", "description": "原样记录的占位参数"},
+                },
+                "required": ["stage"],
+            },
+            output_schema={
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string"},
+                    "mock": {"type": "boolean"},
+                },
+            },
+            preconditions=[],
+            side_effect="mock_only_no_process",
+        ),
+        dict(
             name="report_capability_gap",
             allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
             category="common",
             description="诚实说明当前缺少某个工程 Tool Adapter，并给出接入所需信息。",
-            when_to_use="用户明确要求执行仿真、CDC、综合、STA 等尚未注册的真实工具时。",
+            when_to_use="用户明确要求执行尚未被 run_mock_eda 覆盖、且未注册真实 Adapter 的工具时。",
             when_not_to_use="已有可执行 Tool，或用户只是询问相关概念时。",
             mutability=Mutability.ANALYSIS,
             input_schema={

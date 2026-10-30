@@ -129,6 +129,51 @@ class RunService:
         self.append_event(run_id, "tool_completed", "reply_to_user 已完成。", "orchestrator")
         return self.get(run_id)  # type: ignore[return-value]
 
+    def complete_mock_eda(
+        self,
+        run_id: str,
+        *,
+        stage: str,
+        message: str,
+        arguments: dict[str, Any],
+    ) -> RunView:
+        """完成一个无外部副作用的 EDA 占位调用。
+
+        结果中同时保存 ``mock=True`` 和 ``real_execution=False``，避免前端、面试演示
+        或后续 Agent 把“Function Call 链路成功”误解为“真实 EDA 检查通过”。
+        """
+        mapping = {
+            "compilation": RunType.COMPILATION,
+            "simulation": RunType.SIMULATION,
+            "lint": RunType.LINT,
+            "cdc": RunType.CDC,
+            "synthesis": RunType.SYNTHESIS,
+            "sta": RunType.STA,
+        }
+        run_type = mapping.get(stage)
+        if run_type is None:
+            raise ValueError(f"Unsupported Mock EDA stage: {stage}")
+        self._set_run_type(run_id, run_type)
+        run = self.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        result = dict(run.result)
+        result["mock_eda"] = {
+            "mock": True,
+            "real_execution": False,
+            "stage": stage,
+            "arguments": arguments,
+            "message": message,
+        }
+        self._update(run_id, status=RunStatus.COMPLETED, pending=None, result=result)
+        self.append_event(
+            run_id,
+            "mock_tool_completed",
+            f"run_mock_eda 已完成 {stage} 占位调用；未启动外部进程。",
+            "orchestrator",
+        )
+        return self.get(run_id)  # type: ignore[return-value]
+
     def pause_for_user(
         self,
         run_id: str,

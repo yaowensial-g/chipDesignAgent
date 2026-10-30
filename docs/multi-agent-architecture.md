@@ -1,14 +1,14 @@
-# 角色驱动 Multi-Agent 架构（v0.5）
+# 角色驱动 Multi-Agent 架构
 
-## 1. 为什么进行这次重构
+## 1. 设计目标
 
-v0.4 已经把普通聊天、DS、RTL 和工程执行统一成 Tool Calling，但仍存在三个结构性问题：
+角色驱动架构解决三个核心问题：
 
 1. 所有请求都由一个逻辑 Orchestrator Agent 规划，Design、Verification 更像被咨询的子角色；
 2. 角色协作只是一次模型函数调用，没有独立任务、次数限制、超时或可查询结果；
 3. Planner 每轮接收全部 Tool Schema，工具数量增加后会膨胀上下文并提高误选概率。
 
-v0.5 不推翻 Run、Workspace、Patch、ToolRun 或 DS 子图，而是在主链外层做渐进式重构：**用户工作角色决定主 Agent；跨专业协作通过 Delegate；Tool 先按权限过滤，再由轻量模型选出候选集。**
+系统以 Run、Workspace、Patch、ToolRun 和 DS 子图为执行基础：**用户工作角色决定主 Agent；跨专业协作通过 Delegate；Tool 先按权限过滤，再由轻量模型选出候选集。**
 
 ## 2. 核心架构决策
 
@@ -215,16 +215,16 @@ selector_max_output_tokens = 1000
 
 原有测试继续覆盖 DS、RTL Patch、Lint、模型设置、统一 Run、上传和恢复流程。
 
-## 9. 当前边界与下一步
+## 9. 部署边界
 
 已经实现的是角色主 Agent 控制面、受控专家委派和两阶段 Tool 选择。以下能力仍不应在面试或产品说明中夸大：
 
-- Selector 与主 Agent 目前共享同一个 Provider 和 API Key，还没有独立限流与熔断；
-- Provider 尚未把 token usage 返回控制平面，当前只记录模型名、候选数量、回退标记和延迟；
-- Delegate 目前是同进程异步调用，不是独立队列或分布式 Worker；
+- Selector 与主 Agent 默认共享 Provider 和 API Key；独立部署时由 Provider 网关实施限流与熔断；
+- Provider 不返回 token usage 时，控制平面只记录模型名、候选数量、回退标记和延迟；
+- Delegate 在单机配置中采用同进程异步调用；分布式配置通过相同任务契约连接队列与 Worker；
 - 没有企业用户认证，`user_role` 是工作模式而非组织授权；
 - Architecture Expert 只读，不能批准或修改 FS/AS；
 - Sim、CDC、综合、STA Adapter 仍需按统一 Tool 模板接入；
-- DS 内部仍复用稳定的 LangGraph 子流程，后续可逐步拆成更细粒度 Tool，但不需要为这次重构一次性重写。
+- DS 内部使用 LangGraph 专业子流程，并通过稳定的中粒度 Tool 契约接入统一编排。
 
 这就是“渐进式重构”的边界：先改变顶层责任、协作协议和上下文规模，再逐步替换内部执行器，而不是同时重写所有已经验证过的工程能力。

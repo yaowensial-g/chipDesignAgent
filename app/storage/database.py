@@ -159,14 +159,131 @@ class Database:
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
-        -- Conversation 保存工作角色和主 Agent，不保存整段聊天正文。
+        -- Conversation 只保存会话索引信息；正文放在 conversation_messages，避免
+        -- 列表页为了展示标题而扫描大段历史消息。
         CREATE TABLE IF NOT EXISTS conversations (
             session_id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL,
+            module_name TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '新会话',
             user_role TEXT NOT NULL,
             primary_agent TEXT NOT NULL,
+            last_message_preview TEXT NOT NULL DEFAULT '',
+            message_count INTEGER NOT NULL DEFAULT 0,
+            active_run_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        );
+        -- 聊天消息是后端事实源。sequence 是会话内稳定游标，前端刷新后可分页恢复。
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            message_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            agent_role TEXT,
+            content TEXT NOT NULL,
+            message_type TEXT NOT NULL DEFAULT 'chat',
+            run_id TEXT,
+            delegation_task_id TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES conversations(session_id)
+        );
+        -- 摘要只覆盖较早消息。covered_until_sequence 让 ContextBuilder 明确知道摘要
+        -- 覆盖边界，避免摘要和近期原文重复进入 Prompt。
+        CREATE TABLE IF NOT EXISTS conversation_summaries (
+            session_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL,
+            covered_until_sequence INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES conversations(session_id)
+        );
+        -- 原始文档、版本和检索分块分表保存。新版本不会覆盖旧版本，旧版本仅被标记
+        -- superseded，便于追踪“某条结论当时依据的是哪版 AS”。
+        CREATE TABLE IF NOT EXISTS documents (
+            document_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            module_name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS document_versions (
+            version_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            version TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            content TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(document_id)
+        );
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            chunk_id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            section TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            token_count INTEGER NOT NULL,
+            terms_json TEXT NOT NULL,
+            embedding_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(document_id),
+            FOREIGN KEY(version_id) REFERENCES document_versions(version_id)
+        );
+        -- 长期记忆和来源分离：一条记忆可由多个规格段落、问题单或用户决策共同支撑。
+        CREATE TABLE IF NOT EXISTS memories (
+            memory_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            module_name TEXT,
+            scope TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            content TEXT NOT NULL,
+            confidence INTEGER NOT NULL,
+            authority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memory_sources (
+            source_ref_id TEXT PRIMARY KEY,
+            memory_id TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_version TEXT,
+            location TEXT,
+            content_hash TEXT,
+            source_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(memory_id) REFERENCES memories(memory_id)
+        );
+        CREATE TABLE IF NOT EXISTS memory_relations (
+            relation_id TEXT PRIMARY KEY,
+            from_memory_id TEXT NOT NULL,
+            to_memory_id TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(from_memory_id) REFERENCES memories(memory_id),
+            FOREIGN KEY(to_memory_id) REFERENCES memories(memory_id)
+        );
+        -- Context Manifest 记录每次模型调用实际选中了哪些消息、记忆和文档分块。
+        -- 它是调试“模型为什么没看到某条规格”的关键审计对象。
+        CREATE TABLE IF NOT EXISTS context_manifests (
+            context_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            agent_role TEXT NOT NULL,
+            token_budget INTEGER NOT NULL,
+            estimated_tokens INTEGER NOT NULL,
+            message_ids_json TEXT NOT NULL,
+            memory_ids_json TEXT NOT NULL,
+            chunk_ids_json TEXT NOT NULL,
+            observation_ids_json TEXT NOT NULL,
+            sections_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES conversations(session_id)
         );
         -- 每次跨专业 Delegate 都有独立记录，失败或超时也不会丢失审计线索。
         CREATE TABLE IF NOT EXISTS delegation_tasks (
@@ -193,6 +310,22 @@ class Database:
         CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, created_at);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_run_events_order ON run_events(run_id, sequence);
         CREATE INDEX IF NOT EXISTS idx_delegations_run ON delegation_tasks(parent_run_id, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_message_order
+            ON conversation_messages(session_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_conversation_project
+            ON conversations(project_id, updated_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_document_identity
+            ON documents(project_id, module_name, kind, name);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_document_version_hash
+            ON document_versions(document_id, version, content_hash);
+        CREATE INDEX IF NOT EXISTS idx_document_chunks_active
+            ON document_chunks(document_id, status, ordinal);
+        CREATE INDEX IF NOT EXISTS idx_memories_scope
+            ON memories(project_id, module_name, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_memory_sources_source
+            ON memory_sources(source_type, source_id);
+        CREATE INDEX IF NOT EXISTS idx_context_run
+            ON context_manifests(run_id, created_at);
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema)
@@ -208,6 +341,21 @@ class Database:
             run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
             if "primary_agent" not in run_columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN primary_agent TEXT")
+            conversation_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(conversations)")
+            }
+            conversation_migrations = {
+                "module_name": "TEXT NOT NULL DEFAULT ''",
+                "title": "TEXT NOT NULL DEFAULT '新会话'",
+                "last_message_preview": "TEXT NOT NULL DEFAULT ''",
+                "message_count": "INTEGER NOT NULL DEFAULT 0",
+                "active_run_id": "TEXT",
+            }
+            for column, declaration in conversation_migrations.items():
+                if column not in conversation_columns:
+                    connection.execute(
+                        f"ALTER TABLE conversations ADD COLUMN {column} {declaration}"
+                    )
             connection.commit()
 
     @staticmethod

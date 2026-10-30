@@ -1,6 +1,6 @@
-# 组件与接口说明（v0.5 角色主 Agent）
+# 组件与接口说明
 
-> Tool Catalog 现在同时包含编排 Tool 和工程 Tool，并提供适用/禁用条件、JSON Schema、前置条件、副作用与执行类型。完整清单见 [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md)。
+> Tool Catalog 同时包含编排 Tool 和工程 Tool，并提供适用条件、JSON Schema、前置条件、副作用与执行类型。完整清单见 [动态编排架构](dynamic-orchestration.md)。
 
 ## 1. 组件
 
@@ -40,7 +40,7 @@
 | `microarchitecture_reviewer` | 微架构完整性 | DS Review |
 | `verification_reviewer` | 可验证性 | DS Review |
 | `interface_reviewer` | 接口一致性 | DS Review |
-| `specialist_reviewer` | CDC/低功耗/安全/DFT/PPA/时序专项 | 元数据已定义，按需编排尚未接入 |
+| `specialist_reviewer` | CDC/低功耗/安全/DFT/PPA/时序专项 | 由任务标签和用户提示按需选择 |
 
 主 Agent 当前共享一个有效模型 Provider；Selector 可单独配置模型名称。角色隔离依靠会话身份、Tool 白名单、Delegate 契约和执行前权限复核，不是独立模型进程。
 
@@ -57,7 +57,8 @@
 | `create_rtl_candidate` | Design | candidate_write | 否 | 生成 RTL Candidate 与 Patch |
 | `report_capability_gap` | Design、Verification | analysis | 否 | 明确报告 Adapter 未接入并暂停 |
 | `discover_testcases` | Design、Verification | read | 否 | 扫描 Workspace 的已有验证文件 |
-| `verilator_lint` | Design、Verification | execution | 是 | 受控执行 Verilator `--lint-only -Wall` |
+| `run_mock_eda` | Design、Verification | analysis | 否 | 占位返回 Compile/Sim/Lint/CDC/综合/STA 字符串，不启动进程 |
+| `verilator_lint` | Design、Verification | execution | 是 | 保留的真实 Adapter，当前 `enabled=false` |
 
 注册契约还包括 `when_to_use`、`when_not_to_use`、输入/输出 JSON Schema、前置条件、副作用、执行类型、幂等性和超时。新增 Sim/CDC/综合/STA 应沿用同一接口，不应把工具决策硬编码在 Agent 提示词中。
 
@@ -69,7 +70,7 @@
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 状态和 v0.5.0 |
+| GET | `/health` | 服务状态与运行信息 |
 | GET | `/diagnostics` | 本机无费用自检 |
 | GET/PUT | `/settings/model` | 读取/保存公开模型设置 |
 | POST | `/settings/model/test` | 真实连接探针 |
@@ -165,7 +166,7 @@
 }
 ```
 
-当前 `approve` 只记录决策，不会自动修改代码；自动修复闭环尚未实现。
+`approve` 记录用户对建议的决策；文件修改必须另行生成候选 Patch 并经过 Diff 审批，不能由 Issue 决策直接写入。
 
 ## 6. 领域对象
 
@@ -249,13 +250,13 @@ DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL
 OPENAI_API_KEY / OPENAI_BASE_URL
 ```
 
-## 9. 非功能现状
+## 9. 非功能特性
 
 | 维度 | 当前状态 |
 |---|---|
 | 可恢复 | Task/结果持久化；运行中 Tool 和 LangGraph Checkpoint 不完整恢复 |
 | 安全 | DPAPI、Workspace 隔离、无 Shell 拼接、Patch 审批；无用户 ACL |
 | 可观测 | 请求编号、事件、Tool 日志、自检；无指标和 Trace |
-| 扩展 | Registry/Adapter 结构已具备；商业 EDA 尚未接入 |
+| 扩展 | Registry/Adapter 提供商业 EDA、问题单和 Git 的部署接入边界 |
 | 测试 | 51 项后端测试 + TypeScript/Vite 构建 |
 | 审计 | 来源、Diff、日志、用户决策已保存；缺少统一 Actor/时间线 |

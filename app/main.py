@@ -21,7 +21,7 @@ logger = logging.getLogger("chipflow.errors")
 
 app = FastAPI(
     title="Chip Design Multi-Agent API",
-    version="0.5.0",
+    version="0.6.0",
     description="Windows-first role-based chip design multi-agent workbench.",
 )
 app.add_middleware(

@@ -12,7 +12,14 @@
 from __future__ import annotations
 
 from app.domain.enums import AgentRole, UserRole
-from app.domain.models import ConversationView
+from uuid import uuid4
+
+from app.domain.models import (
+    ConversationMessageView,
+    ConversationMessagesPage,
+    ConversationSummaryView,
+    ConversationView,
+)
 from app.services.workspace_service import utc_now
 from app.storage.database import Database, database
 
@@ -34,6 +41,7 @@ class SessionService:
         session_id: str,
         project_id: str,
         requested_role: UserRole | None = None,
+        module_name: str = "",
     ) -> ConversationView:
         """读取或创建会话，并在用户明确要求时切换工作角色。
 
@@ -52,7 +60,15 @@ class SessionService:
             if existing.project_id != project_id:
                 raise ValueError("Conversation belongs to a different project")
             if requested_role is not None and requested_role != existing.user_role:
-                return self.set_role(session_id, requested_role)
+                existing = self.set_role(session_id, requested_role)
+            if module_name and not existing.module_name:
+                self.db.execute(
+                    "UPDATE conversations SET module_name = ?, updated_at = ? WHERE session_id = ?",
+                    (module_name, utc_now(), session_id),
+                )
+                existing = self.get(session_id)  # type: ignore[assignment]
+            elif module_name and existing.module_name != module_name:
+                raise ValueError("Conversation belongs to a different module")
             return existing
 
         # 兼容历史请求：没有显式角色时，默认按设计工程师工作模式运行。
@@ -60,8 +76,11 @@ class SessionService:
         primary_agent = PRIMARY_AGENT_BY_USER_ROLE[role]
         now = utc_now()
         self.db.execute(
-            "INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?)",
-            (session_id, project_id, role.value, primary_agent.value, now, now),
+            """INSERT INTO conversations
+            (session_id, project_id, module_name, title, user_role, primary_agent,
+             last_message_preview, message_count, active_run_id, created_at, updated_at)
+            VALUES (?, ?, ?, '新会话', ?, ?, '', 0, NULL, ?, ?)""",
+            (session_id, project_id, module_name, role.value, primary_agent.value, now, now),
         )
         return self.get(session_id)  # type: ignore[return-value]
 
@@ -87,6 +106,155 @@ class SessionService:
             (user_role.value, primary_agent.value, utc_now(), session_id),
         )
         return self.get(session_id)  # type: ignore[return-value]
+
+    def list(self, project_id: str | None = None) -> list[ConversationView]:
+        """按最近活动倒序列出会话，供前端刷新页面后恢复历史。"""
+        if project_id:
+            rows = self.db.fetch_all(
+                "SELECT * FROM conversations WHERE project_id = ? ORDER BY updated_at DESC",
+                (project_id,),
+            )
+        else:
+            rows = self.db.fetch_all("SELECT * FROM conversations ORDER BY updated_at DESC")
+        return [ConversationView(**row) for row in rows]
+
+    def set_active_run(self, session_id: str, run_id: str | None) -> None:
+        """记录会话当前 Run，前端恢复会话后可以继续展示任务状态。"""
+        self.db.execute(
+            "UPDATE conversations SET active_run_id = ?, updated_at = ? WHERE session_id = ?",
+            (run_id, utc_now(), session_id),
+        )
+
+    def add_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        *,
+        agent_role: str | None = None,
+        message_type: str = "chat",
+        run_id: str | None = None,
+        delegation_task_id: str | None = None,
+        metadata: dict | None = None,
+    ) -> ConversationMessageView:
+        """追加完整消息，并同步会话列表所需的标题、预览和计数。"""
+        if self.get(session_id) is None:
+            raise KeyError(session_id)
+        message_id = str(uuid4())
+        now = utc_now()
+        # sequence 在 SQL 内计算；唯一索引会阻止极端并发下出现重复游标。
+        self.db.execute(
+            """INSERT INTO conversation_messages
+            (message_id, session_id, sequence, role, agent_role, content, message_type,
+             run_id, delegation_task_id, metadata_json, created_at)
+            VALUES (?, ?,
+                COALESCE((SELECT MAX(sequence) + 1 FROM conversation_messages WHERE session_id = ?), 1),
+                ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                message_id,
+                session_id,
+                session_id,
+                role,
+                agent_role,
+                content,
+                message_type,
+                run_id,
+                delegation_task_id,
+                self.db.dumps(metadata or {}),
+                now,
+            ),
+        )
+        preview = " ".join(content.strip().split())[:120]
+        conversation = self.get(session_id)
+        title = conversation.title if conversation else "新会话"
+        if role == "user" and title == "新会话":
+            title = preview[:40] or title
+        self.db.execute(
+            """UPDATE conversations
+            SET title = ?, last_message_preview = ?, message_count = message_count + 1,
+                updated_at = ? WHERE session_id = ?""",
+            (title, preview, now, session_id),
+        )
+        return self.get_message(message_id)  # type: ignore[return-value]
+
+    def get_message(self, message_id: str) -> ConversationMessageView | None:
+        row = self.db.fetch_one(
+            "SELECT * FROM conversation_messages WHERE message_id = ?", (message_id,)
+        )
+        return self._message_from_row(row) if row else None
+
+    def messages(
+        self, session_id: str, *, before: int | None = None, limit: int = 50
+    ) -> ConversationMessagesPage:
+        """分页读取历史；数据库倒序取最近 N 条，返回前恢复为时间正序。"""
+        if self.get(session_id) is None:
+            raise KeyError(session_id)
+        bounded_limit = max(1, min(limit, 200))
+        if before is None:
+            rows = self.db.fetch_all(
+                """SELECT * FROM conversation_messages WHERE session_id = ?
+                ORDER BY sequence DESC LIMIT ?""",
+                (session_id, bounded_limit + 1),
+            )
+        else:
+            rows = self.db.fetch_all(
+                """SELECT * FROM conversation_messages
+                WHERE session_id = ? AND sequence < ? ORDER BY sequence DESC LIMIT ?""",
+                (session_id, before, bounded_limit + 1),
+            )
+        has_more = len(rows) > bounded_limit
+        rows = rows[:bounded_limit]
+        items = [self._message_from_row(row) for row in reversed(rows)]
+        return ConversationMessagesPage(
+            items=items,
+            next_before=items[0].sequence if has_more and items else None,
+        )
+
+    def recent_messages(
+        self,
+        session_id: str,
+        *,
+        agent_role: str | None,
+        exclude_message_id: str | None = None,
+        limit: int = 30,
+    ) -> list[ConversationMessageView]:
+        """读取短期上下文，并根据 agent_role 隔离角色私有历史。"""
+        parameters: list[object] = [session_id]
+        conditions = ["session_id = ?"]
+        if exclude_message_id:
+            conditions.append("message_id <> ?")
+            parameters.append(exclude_message_id)
+        if agent_role:
+            conditions.append("(agent_role IS NULL OR agent_role = ?)")
+            parameters.append(agent_role)
+        parameters.append(max(1, min(limit, 100)))
+        rows = self.db.fetch_all(
+            f"""SELECT * FROM conversation_messages WHERE {' AND '.join(conditions)}
+            ORDER BY sequence DESC LIMIT ?""",
+            tuple(parameters),
+        )
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def get_summary(self, session_id: str) -> ConversationSummaryView | None:
+        row = self.db.fetch_one(
+            "SELECT * FROM conversation_summaries WHERE session_id = ?", (session_id,)
+        )
+        return ConversationSummaryView(**row) if row else None
+
+    def upsert_summary(self, session_id: str, summary: str, covered_until: int) -> None:
+        self.db.execute(
+            """INSERT INTO conversation_summaries
+            (session_id, summary, covered_until_sequence, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary,
+                covered_until_sequence = excluded.covered_until_sequence,
+                updated_at = excluded.updated_at""",
+            (session_id, summary, covered_until, utc_now()),
+        )
+
+    def _message_from_row(self, row: dict) -> ConversationMessageView:
+        payload = dict(row)
+        payload["metadata"] = self.db.loads(payload.pop("metadata_json", None), {})
+        return ConversationMessageView(**payload)
 
 
 session_service = SessionService()

@@ -1,6 +1,6 @@
-# 代码结构说明（v0.5 角色主 Agent）
+# 代码结构说明
 
-> v0.5 在 v0.4 动态 Tool Calling 上增加 `session_service.py`、`tool_selector_service.py` 和 `delegation_service.py`。主链由用户工作角色选择 Design/Verification 主 Agent；详见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
+> 主链由用户工作角色选择 Design 或 Verification 主 Agent；会话、权限过滤、动态 Tool 选择与专家委派分别由独立服务承担。详见 [角色驱动 Multi-Agent 架构](multi-agent-architecture.md)。
 
 ## 1. 目录
 
@@ -30,13 +30,8 @@ chipDesignAgent/
 ├─ skills/           架构、设计和评审的版本化专业指南
 ├─ tests/
 ├─ docs/
-├─ PRD_v0.1.md       历史需求
-├─ PRD_v0.2.md       当前需求基线
-├─ SELF_VALIDATION_v0.1.md
-├─ SELF_VALIDATION_v0.2.md
-├─ SELF_VALIDATION_v0.3.md
-├─ SELF_VALIDATION_v0.4.md
-├─ SELF_VALIDATION_v0.5.md
+├─ PRODUCT_REQUIREMENTS.md 产品需求与验收基线
+├─ VALIDATION_REPORT.md    系统验证报告
 └─ pyproject.toml
 ```
 
@@ -46,7 +41,7 @@ chipDesignAgent/
 
 ### `app/main.py`
 
-- FastAPI 应用入口，项目版本 v0.5.0；
+- FastAPI 应用入口和生命周期管理；
 - CORS；
 - 请求编号；
 - 模型、配置和未知异常的结构化错误；
@@ -58,7 +53,7 @@ chipDesignAgent/
 
 ### `app/domain/models.py` 与 `enums.py`
 
-除文档、Task、Issue、Finding、模型设置等既有契约外，v0.5 还包含：
+除文档、Task、Issue、Finding、模型设置等契约外，还包含：
 
 - `WorkspaceView`、`ArtifactView`；
 - `RTLCandidateRequest/Response`；
@@ -71,7 +66,7 @@ chipDesignAgent/
 - `DelegationRequest`、`DelegationResult`、`DelegationStatus`；
 - AgentRole、Mutability、Artifact/ToolRun/EngineeringIssue 状态。
 
-Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步。
+Pydantic 是后端 HTTP 契约的事实来源；前端类型与对应响应模型保持字段对齐。
 
 ## 3. 编排、Agent 与 DS 工作流
 
@@ -108,11 +103,11 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 - 查询 Run 时把 ToolRun 终态同步到统一 Run；
 - 处理 DS Resume、RTL Patch 决策、Tool 授权和通用取消。
 
-当前聊天可编排 DS、RTL、Lint 和已有用例发现；Sim/CDC/综合/STA 在缺少 Adapter 时生成诚实的能力缺失等待项。
+当前聊天可编排 DS、RTL、已有用例发现，以及统一的 `run_mock_eda`；编译、Sim、Lint、CDC、综合和 STA 都返回明确的 Mock 字符串。
 
 ### `app/agents/definitions.py`
 
-角色目录包括 Design/Verification 主 Agent、只读 Architecture Expert、Chat 实现、四类默认 Reviewer 和 Specialist Reviewer。Orchestrator 定义仅保留架构演进兼容语义；确定性控制平面不作为业务主 Agent。
+角色目录包括 Design/Verification 主 Agent、只读 Architecture Expert、Chat 实现、四类默认 Reviewer 和 Specialist Reviewer。Orchestrator 是确定性控制平面，不作为对专业结果负责的业务主 Agent。
 
 ### `app/agents/runtime.py`
 
@@ -176,7 +171,8 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 ### `app/tools/builtin.py`
 
 - `discover_testcases`：扫描已有验证资产，不生成用例；
-- `verilator_lint`：验证输入路径和后缀，使用 `shell=False` 执行 Verilator；工具不存在、参数错误和超时都返回可解析错误。
+- `run_mock_eda`：接收 EDA stage 并直接返回 Mock 字符串，不依赖 Workspace、PATH 或外部工具。
+- `verilator_lint`：外部 Verilator Adapter，默认禁用；部署方完成工具、PATH 和审批策略配置后启用。
 
 ### `app/services/tool_run_service.py`
 
@@ -195,7 +191,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 
 ### `frontend/src/App.tsx`
 
-主页面：项目/模块、当前工作角色、文档上传、聊天、统一 Run 状态及事件、真实架构反馈、RTL Patch 审批、DS/Finding 视图，以及模型设置、自检、工程工作台兼容入口。切换角色会保留共享文档但清空旧角色私有聊天和旧 Run 展示。
+主页面：项目/模块、工作角色、文档上传、聊天、统一 Run 状态及事件、真实架构反馈、RTL Patch 审批、DS/Finding 视图，以及模型设置、自检和工程调试工作台。切换角色会保留共享文档但清空旧角色私有聊天和旧 Run 展示。
 
 ### `frontend/src/EngineeringModal.tsx`
 
@@ -222,7 +218,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型目前手工同步�
 | `test_model_settings.py` | DPAPI、配置优先级、供应商 Key 和运行时切换 |
 | `test_provider_json.py` | JSON 提取、修复和模型输出错误 |
 | `test_phase2_platform.py` | Workspace 越界、Patch 审批、RTL 候选、Tool 授权、日志解析和 SQLite 恢复 |
-| `test_run_orchestration.py` | Conversation 主入口、统一 Run、DS 关联、RTL 审批、Lint 状态回写和缺失 Adapter |
+| `test_run_orchestration.py` | Conversation 主入口、统一 Run、DS 关联、RTL 审批和 Mock EDA Function Call |
 
 `tests/conftest.py` 强制 `CHIP_AGENT_MODEL_ENABLED=false`，测试不会消耗真实模型额度。测试数量以 `pytest -q` 的最新结果为准。
 

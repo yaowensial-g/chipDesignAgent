@@ -1,23 +1,18 @@
 # ChipFlow Agent 产品需求文档
 
-## 1. 文档信息
+## 1. 文档定位
 
 | 项目 | 内容 |
 |---|---|
 | 产品名称 | ChipFlow Agent |
-| 文档版本 | v0.2 |
-| 文档状态 | 第二阶段产品需求基线草案 |
-| 更新日期 | 2026-10-27 |
-| 前序版本 | `PRD_v0.1.md` |
-| 目标阶段 | DS、RTL 与 EDA 工具闭环 |
+| 文档性质 | 产品需求与验收基线 |
+| 产品范围 | DS、RTL 与 EDA 工具闭环 |
 | 主要使用者 | 芯片设计工程师、验证工程师、架构师、评审人员 |
 | 运行环境 | Windows 优先，工具执行接口保留 Linux/远程扩展能力 |
 
-## 2. 版本变更摘要
+## 2. 产品能力总览
 
-v0.1 聚焦从 FS、AS、ICD 到 DS 候选的 Multi-Agent MVP。v0.2 在保留该能力的基础上，将产品扩展为覆盖设计执行和工具闭环的芯片工程协作平台。
-
-本版本新增和调整：
+ChipFlow 将规格理解、设计协作、代码候选、工程工具调用和问题闭环组织为统一的芯片工程协作平台。核心能力包括：
 
 1. 产品能力从 DS 扩展到 RTL 候选生成与修改；
 2. 接入 Sim、Lint、CDC、综合和 STA 工具执行框架；
@@ -60,7 +55,7 @@ ChipFlow Agent 是一套面向数字芯片设计与验证流程的 Human-in-the-
 9. 允许设计人员发现并执行验证人员已经维护的用例；
 10. 保存文档、代码、工具结果、问题、修改和用户决策的全链路关系。
 
-### 4.2 第二阶段非目标
+### 4.2 产品约束
 
 - 不自动修改或发布 FS、AS、ICD；
 - 不由系统决定何时进入 RTL、验证、综合或 Sign-off；
@@ -70,7 +65,7 @@ ChipFlow Agent 是一套面向数字芯片设计与验证流程的 Human-in-the-
 - 不保证一次生成即可得到生产可用 RTL；
 - 不自动放宽时序、CDC 或功能约束以消除问题；
 - 不默认帮助设计人员制定验证计划；
-- 不在第二阶段一次性支持所有商业 EDA 工具；
+- 商业 EDA 工具按统一 Adapter 契约由部署环境接入；
 - 不将工具 Warning 自动视为必须修改的问题。
 
 ## 5. 核心产品原则
@@ -415,7 +410,7 @@ apply_approved_patch
 
 ### 10.2 DS 辅助设计
 
-保留 v0.1 的 DS 工作流，并增加：
+DS 能力包括：
 
 - DS 持久化版本；
 - DS 候选 Diff；
@@ -662,7 +657,7 @@ status: candidate
 
 ## 14. 数据对象
 
-v0.2 新增或强化：
+Workspace 与资产管理包括：
 
 - `Workspace`；
 - `Artifact`；
@@ -929,7 +924,7 @@ Memory and Traceability Service
 
 具体工具由项目实际环境决定，PRD 不绑定商业厂商。
 
-## 20. 迭代计划
+## 20. 能力分区
 
 ### Phase 2A：持久化、Workspace 与 RTL
 
@@ -975,7 +970,7 @@ Memory and Traceability Service
 - 约束修改审批；
 - 跨阶段追踪报告。
 
-## 21. 第二阶段验收标准
+## 21. 验收标准
 
 ### 21.1 Phase 2A 验收
 
@@ -1074,7 +1069,7 @@ Memory and Traceability Service
 
 ## 25. 产品结论
 
-ChipFlow Agent v0.2 采用“角色型 Agent + Function Tool”的核心架构：
+ChipFlow Agent 采用“角色型 Agent + Function Tool”的核心架构：
 
 - Agent 对应真实的架构、设计、验证和评审职责；
 - Tool 对应可执行、可复用、可审计的单项工程动作；

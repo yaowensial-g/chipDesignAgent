@@ -20,8 +20,13 @@ from app.domain.models import ChatRequest, ChatResponse, TaskIntent, TaskView, T
 from app.services.run_service import RunService, run_service
 from app.services.delegation_service import DelegationService, delegation_service
 from app.services.session_service import SessionService, session_service
+from app.services.context_builder_service import (
+    ContextBuilderService,
+    context_builder_service,
+)
 from app.services.tool_selector_service import ToolSelectorService, tool_selector_service
 from app.tools.orchestration import register_orchestration_tools
+from app.tools.mock_eda import MOCK_EDA_STAGES, run_mock_eda
 from app.tools.registry import ToolRegistry, tool_registry
 
 
@@ -42,12 +47,14 @@ class OrchestratorService:
         sessions: SessionService = session_service,
         selector: ToolSelectorService = tool_selector_service,
         delegations: DelegationService = delegation_service,
+        contexts: ContextBuilderService = context_builder_service,
     ) -> None:
         self.runs = runs
         self.registry = registry
         self.sessions = sessions
         self.selector = selector
         self.delegations = delegations
+        self.contexts = contexts
         register_orchestration_tools()
 
     async def handle(self, request: ChatRequest) -> ChatResponse:
@@ -60,7 +67,6 @@ class OrchestratorService:
         # 新对话由后端生成 session_id；已有对话必须沿用前端传入的稳定 ID，
         # 这样角色、Run 和后续恢复才能关联到同一会话。
         session_id = request.session_id or str(uuid4())
-        request_payload = request.model_dump(mode="json")
 
         # 读取切换前状态，用来判断是否需要隔离旧角色的私有消息历史。
         previous_conversation = self.sessions.get(session_id)
@@ -70,13 +76,36 @@ class OrchestratorService:
             and previous_conversation.user_role != request.user_role
         )
         conversation = self.sessions.resolve(
-            session_id, request.project_id, request.user_role
+            session_id,
+            request.project_id,
+            request.user_role,
+            request.module_name,
         )
         primary_agent = conversation.primary_agent
-        if role_changed:
-            # 只丢弃角色私有聊天历史。request_payload 中的文档、Workspace 等
-            # 共享工程上下文仍然保留，因此角色切换不会破坏项目资产。
-            request_payload["history"] = []
+        # 用户消息先落库，再组装上下文。ContextBuilder 会排除本条消息，因为 request.message
+        # 会单独发送给模型；这样既保留审计记录，也不会在 Prompt 里重复两次。
+        user_message = self.sessions.add_message(
+            session_id,
+            "user",
+            request.message,
+            agent_role=primary_agent.value,
+        )
+        context = self.contexts.build(
+            session_id,
+            request,
+            primary_agent.value,
+            user_message.message_id,
+        )
+        effective_request = context.effective_request
+        request_payload = effective_request.model_dump(mode="json")
+        # 这两个下划线字段是模型上下文而不是公共 ChatRequest 字段，因此不污染 API 契约。
+        request_payload["_memory_context"] = context.memory_context
+        request_payload["_context_manifest"] = {
+            "message_ids": context.message_ids,
+            "memory_ids": context.memory_ids,
+            "chunk_ids": context.chunk_ids,
+            "sections": context.sections,
+        }
 
         # Intent Enricher 也只能看到当前角色有权使用的 Tool 名称，避免它在最早阶段
         # 就建议一个本角色永远无法执行的动作。
@@ -86,7 +115,19 @@ class OrchestratorService:
         )
         # 先创建 Run，再调用 Selector/模型。这样后续任何错误都有父 Run 可追踪。
         run_id = self.runs.create_orchestration_run(
-            session_id, request, intent.model_dump(mode="json"), primary_agent
+            session_id, effective_request, intent.model_dump(mode="json"), primary_agent
+        )
+        self.sessions.set_active_run(session_id, run_id)
+        manifest = self.contexts.save_manifest(
+            session_id, run_id, primary_agent.value, context
+        )
+        self.runs.append_event(
+            run_id,
+            "context_built",
+            f"ContextBuilder 选择 {len(manifest.message_ids)} 条消息、"
+            f"{len(manifest.memory_ids)} 条长期记忆和 {len(manifest.chunk_ids)} 个文档分块，"
+            f"估算 {manifest.estimated_tokens} tokens。",
+            primary_agent.value,
         )
         if role_changed:
             self.runs.append_event(
@@ -165,7 +206,7 @@ class OrchestratorService:
             # _execute 返回统一 outcome 字典，顶层循环不需要了解各专业服务内部状态机。
             outcome = await self._execute(
                 run_id,
-                request,
+                effective_request,
                 request_payload,
                 selection,
                 primary_agent,
@@ -192,7 +233,7 @@ class OrchestratorService:
             )
             if outcome.get("terminal"):
                 # terminal 表示本轮已经完成或需要用户输入，不再继续消耗模型调用。
-                return ChatResponse(
+                response = ChatResponse(
                     session_id=session_id,
                     assistant_message=str(outcome["message"]),
                     route="orchestrated",
@@ -200,6 +241,14 @@ class OrchestratorService:
                     task=outcome.get("task"),
                     run=self.runs.get(run_id),
                 )
+                self.sessions.add_message(
+                    session_id,
+                    "assistant",
+                    response.assistant_message,
+                    agent_role=primary_agent.value,
+                    run_id=run_id,
+                )
+                return response
 
         # 安全阀：防止模型反复调用分析 Tool、循环委派或为了“闭环”制造虚假进展。
         message = "编排达到最大步骤数，已暂停。请缩小任务范围或补充目标。"
@@ -216,13 +265,21 @@ class OrchestratorService:
             tool_selections=tool_selections,
             delegations=delegation_records,
         )
-        return ChatResponse(
+        response = ChatResponse(
             session_id=session_id,
             assistant_message=message,
             route="orchestrated",
             route_reason="Planner 达到安全步数上限",
             run=self.runs.get(run_id),
         )
+        self.sessions.add_message(
+            session_id,
+            "assistant",
+            response.assistant_message,
+            agent_role=primary_agent.value,
+            run_id=run_id,
+        )
+        return response
 
     async def _execute(
         self,
@@ -307,6 +364,32 @@ class OrchestratorService:
             updates.update(arguments)
             run, _, message = self.runs.execute_rtl_tool(
                 run_id, request.model_copy(update={"tool_arguments": updates})
+            )
+            return {"terminal": True, "message": message, "run": run}
+
+        if name == "run_mock_eda":
+            # 当前环境只验证 Function Call 和编排链路。函数返回明确的 MOCK 字符串，
+            # 不创建 ToolRun、不检查 PATH，也不产生任何真实 EDA “通过”结论。
+            stage = str(arguments.get("stage") or "").strip().lower()
+            if stage not in MOCK_EDA_STAGES:
+                message = "Mock EDA Tool 缺少有效 stage；请选择 compilation、simulation、lint、cdc、synthesis 或 sta。"
+                self.runs.pause_for_user(
+                    run_id,
+                    pending_type="mock_eda_stage_required",
+                    message=message,
+                )
+                return {"terminal": True, "message": message}
+            options = arguments.get("options")
+            if not isinstance(options, dict):
+                options = {}
+            target = str(arguments.get("target") or request.module_name)
+            mock_arguments = {"target": target, "options": options}
+            message = run_mock_eda(stage, target, mock_arguments)
+            run = self.runs.complete_mock_eda(
+                run_id,
+                stage=stage,
+                message=message,
+                arguments=mock_arguments,
             )
             return {"terminal": True, "message": message, "run": run}
 

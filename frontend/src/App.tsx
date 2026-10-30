@@ -23,11 +23,21 @@ import {
 } from "lucide-react";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { extractFile, getModelSettings, getRun, resumeRun, resumeTask, runDiagnostics, sendChat } from "./api";
+import {
+  extractFile,
+  getConversationMessages,
+  getModelSettings,
+  getRun,
+  listConversations,
+  resumeRun,
+  resumeTask,
+  runDiagnostics,
+  sendChat,
+} from "./api";
 import { DiagnosticsModal } from "./DiagnosticsModal";
 import { ModelSettingsModal } from "./ModelSettingsModal";
 import { EngineeringModal } from "./EngineeringModal";
-import type { CandidatePatch, ChatMessage, DiagnosticReport, DocumentKind, ExtractedDocument, ModelSettings, RunView, TaskView, WorkflowRoute } from "./types";
+import type { CandidatePatch, ChatMessage, ConversationView, DiagnosticReport, DocumentKind, ExtractedDocument, ModelSettings, RunView, TaskView, WorkflowRoute } from "./types";
 
 type InspectorTab = "ds" | "findings" | "activity";
 
@@ -70,6 +80,7 @@ function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([initialMessage]);
   const [draft, setDraft] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [conversations, setConversations] = useState<ConversationView[]>([]);
   const [task, setTask] = useState<TaskView | null>(null);
   const [run, setRun] = useState<RunView | null>(null);
   const [busy, setBusy] = useState(false);
@@ -114,6 +125,49 @@ function App() {
     // 页面启动只读取脱敏配置。后端不会把完整 API Key 返回浏览器。
     getModelSettings().then(setModelSettings).catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    // 会话列表来自后端。关闭或刷新页面不会清空聊天记录。
+    listConversations(projectId).then(setConversations).catch(() => undefined);
+  }, [projectId]);
+
+  function startNewConversation() {
+    setSessionId(null);
+    setMessages([initialMessage]);
+    setTask(null);
+    setRun(null);
+    setError(null);
+  }
+
+  async function openConversation(conversation: ConversationView) {
+    setBusy(true);
+    setError(null);
+    try {
+      const page = await getConversationMessages(conversation.session_id);
+      setSessionId(conversation.session_id);
+      setProjectId(conversation.project_id);
+      setModuleName(conversation.module_name || moduleName);
+      setUserRole(conversation.user_role);
+      setMessages(page.items
+        .filter((message) => message.role !== "system")
+        .map((message) => ({
+          id: message.message_id,
+          role: message.role as "user" | "assistant",
+          content: message.content,
+          time: new Date(message.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+        })));
+      setTask(null);
+      if (conversation.active_run_id) {
+        setRun(await getRun(conversation.active_run_id));
+      } else {
+        setRun(null);
+      }
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "加载会话失败");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   useEffect(() => {
     // 外部 Tool 可能在线程池继续执行，因此运行态 Run 需要轮询。
@@ -242,13 +296,9 @@ function App() {
         projectId,
         moduleName,
         message: content,
-        // 只发送最近 20 条可见消息，避免长会话无限膨胀。角色切换会先清空 messages，
-        // 所以这里不会把旧角色的私有历史再次带入新主 Agent。
-        history: messages.slice(-20).map(({ role, content: messageContent }) => ({
-          role,
-          content: messageContent,
-        })),
-        // 文档属于本地页面上下文；当前版本每轮随请求发送，后续可改为 Artifact ID 引用。
+        // 历史以服务端数据库为事实源；空数组只用于兼容旧 API 字段。
+        history: [],
+        // 首次上传的正文会由后端版本化、分块并建索引；模型只接收 RAG 命中的分块。
         documents: documents.map(({ kind, name, version, content: documentContent }) => ({
           kind,
           name,
@@ -260,6 +310,7 @@ function App() {
         userRole,
       });
       setSessionId(response.session_id);
+      void listConversations(projectId).then(setConversations).catch(() => undefined);
       // task 是 DS 专业记录，run 是统一控制面记录，两者可能同时存在但含义不同。
       if (response.task) setTask(response.task);
       if (response.run) setRun(response.run);
@@ -372,6 +423,32 @@ function App() {
       </header>
 
       <aside className="source-panel">
+        <section className="panel-section conversation-list-section">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">后端历史</p>
+              <h2>会话</h2>
+            </div>
+            <button className="icon-button conversation-new" type="button" title="新建会话" onClick={startNewConversation}>
+              <Plus size={16} />
+            </button>
+          </div>
+          <div className="conversation-list">
+            {conversations.map((conversation) => (
+              <button
+                type="button"
+                className={`conversation-list-item ${sessionId === conversation.session_id ? "active" : ""}`}
+                key={conversation.session_id}
+                onClick={() => void openConversation(conversation)}
+              >
+                <strong>{conversation.title}</strong>
+                <span>{conversation.module_name || "未指定模块"} · {conversation.message_count} 条消息</span>
+                <small>{conversation.last_message_preview || "尚无消息"}</small>
+              </button>
+            ))}
+            {!conversations.length && <p className="conversation-list-empty">当前项目还没有历史会话</p>}
+          </div>
+        </section>
         <section className="panel-section project-section">
           <p className="eyebrow">当前工作区</p>
           <label>

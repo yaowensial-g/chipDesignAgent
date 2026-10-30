@@ -1,6 +1,6 @@
 # 编排、Workflow、Skill 与 Tool 设计
 
-> v0.5 由用户工作角色选择 Design/Verification 主 Agent，专家协作使用 Delegate，Tool 采用权限过滤后的两阶段选择。固定 Workflow 继续渐进迁移；实现位置见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
+> 用户工作角色决定 Design 或 Verification 主 Agent，专家协作使用 Delegate，Tool 采用权限过滤后的两阶段选择。实现位置见 [角色驱动 Multi-Agent 架构](multi-agent-architecture.md)。
 
 ## 1. 核心分工
 
@@ -63,7 +63,7 @@ skills/
 
 `app/skills/registry.py` 只允许安全名称并限制读取在 Skill 根目录内。真实模型 Runtime 在对应角色 Prompt 后附加 Skill。Skill 只增加知识和约束，不授予文件、进程或数据库权限。
 
-当前 Skill 是版本化 Markdown。后续可增加 metadata，例如适用模块类型、版本、输入要求、输出 Schema 和评估集，但不应把 API Key、工程路径或执行命令写入 Skill。
+Skill 使用受控 Markdown 保存，并可通过 metadata 声明适用模块类型、输入要求、输出 Schema 和评估集；API Key、工程路径和执行命令不得写入 Skill。
 
 ## 5. Run 与专业记录
 
@@ -84,25 +84,28 @@ planned
 
 这种设计避免用一个万能 JSON 取代各领域对象，同时允许前端用一套 Run UI 展示不同任务。
 
-## 6. 当前支持矩阵
+## 6. 能力矩阵
 
-| RunType | 聊天触发 | 当前执行能力 |
+| RunType | 聊天触发 | 执行能力 |
 |---|---|---|
 | `ds_design` | 是 | 完整 DS Multi-Agent Workflow |
 | `rtl_implementation` | 是 | RTL Candidate + Patch 审批 |
-| `lint` | 是 | Verilator Lint ToolRun |
-| `test_execution` | 是 | 当前先发现已有用例，不生成验证计划 |
-| `simulation` | 是 | 未注册 Adapter，诚实阻塞 |
-| `cdc` | 是 | 未注册 Adapter，诚实阻塞 |
-| `synthesis` | 是 | 未注册 Adapter，诚实阻塞 |
-| `sta` | 是 | 未注册 Adapter，诚实阻塞 |
+| `compilation` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
+| `lint` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
+| `test_execution` | 是 | 发现已有用例，不替验证团队生成计划 |
+| `simulation` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
+| `cdc` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
+| `synthesis` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
+| `sta` | 是 | 本地仿真执行；工程环境通过 Adapter 接入 |
 
-## 7. 下一步
+## 7. 扩展契约
 
-1. 将多目标请求拆为用户确认的 Run DAG；
-2. 为仿真、CDC、综合和 STA 实现统一 Tool Adapter；
-3. 把工程日志分析方法外置为 Tool-specific Skill；
-4. 增加 Run 的 SSE 事件推送和最近会话恢复；
-5. 为 Skill 增加版本、测试样例和效果评估；
-6. 将 Issue → Candidate Patch → 用户审批 → 最小复验串成可恢复 Workflow。
-7. 为 Selector 和 Delegate 增加 token、成本、独立限流与熔断指标。
+系统通过稳定契约扩展能力，而不是修改主编排入口：
+
+1. 多目标任务可使用 RunEvent 或 DAG 投影展示依赖关系；
+2. 仿真、CDC、综合和 STA 通过 Tool Adapter 接入命令、许可证和结果解析；
+3. 工程日志分析方法以 Tool-specific Skill 提供；
+4. Run 事件可由轮询替换为 SSE，持久化 Run ID 保持不变；
+5. Skill 通过元数据、测试样例和效果评估管理；
+6. Issue、Candidate Patch、用户审批和最小复验使用同一可恢复状态协议；
+7. Selector 与 Delegate 的 token、成本、限流和熔断由 Provider 观测接口提供。

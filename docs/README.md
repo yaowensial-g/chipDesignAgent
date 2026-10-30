@@ -1,66 +1,49 @@
-# ChipFlow Agent 技术文档
+# ChipFlow 技术文档
 
-本文档集描述当前代码库的实际实现，技术基线为 **v0.5 角色主 Agent（2026-10-28）**，产品需求以根目录的 [PRD_v0.2.md](../PRD_v0.2.md) 为准。
-
-## 文档导航
-
-| 文档 | 关注内容 | 推荐读者 |
-|---|---|---|
-| [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md) | 角色主 Agent、Delegate、两阶段 Tool Selector | 所有人，建议首先阅读 |
-| [dynamic-orchestration-v0.4.md](dynamic-orchestration-v0.4.md) | Intent Enricher、Planner–Executor Loop、Chat Tool 和动态 Tool Calling | 所有人，建议首先阅读 |
-| [architecture-overview.md](architecture-overview.md) | 系统上下文、动态编排、控制面、数据与安全边界 | 架构师、技术负责人 |
-| [codebase-guide.md](codebase-guide.md) | 目录结构、文件职责、扩展入口 | 开发和维护人员 |
-| [runtime-flow.md](runtime-flow.md) | 对话、DS、RTL、ToolRun、Issue 与恢复流程 | 开发、测试、问题定位人员 |
-| [components-and-interfaces.md](components-and-interfaces.md) | 组件、角色、HTTP API、领域对象和配置 | 前后端和集成人员 |
-| [orchestration-and-skills.md](orchestration-and-skills.md) | Orchestrator、Run、Workflow、Skill 与 Tool 的边界 | 架构设计、面试答辩 |
-| [interview-100-questions.md](interview-100-questions.md) | 基于当前代码的 100 个面试追问与参考答案 | 求职准备、项目答辩 |
-| [../SELF_VALIDATION_v0.4.md](../SELF_VALIDATION_v0.4.md) | v0.4 动态编排、Function Calling 和兼容流程验收结果 | 测试和交付人员 |
-
-## 当前版本一句话说明
-
-ChipFlow 是 Windows 优先的角色型芯片设计 Multi-Agent 工作台：用户工作角色决定 Design 或 Verification 主 Agent；主 Agent 通过受控 Delegate 获得跨专业结论，并只从权限过滤和轻量 Selector 筛选后的 Tool 集合中规划。普通聊天也是只有 `reply_to_user` 的 Run，工程副作用仍由确定性权限、审批和 Workspace 规则约束。
-
-## 已实现能力
-
-- React 正式网页、普通聊天、文件上传和 DS Multi-Agent 流程；
-- 统一 Run 控制面、RunEvent、查询/恢复/取消接口和前端状态展示；
-- 统一 Intent Enricher 与 Planner–Executor Tool Loop；
-- 会话工作角色持久化与 Design/Verification 主 Agent 切换；
-- 有次数、超时、上下文裁剪和持久化结果的 Delegate；
-- 权限优先、Metadata-only 的两阶段 Tool Selector；
-- DeepSeek Chat Completions 和 OpenAI Responses 原生 Function Calling；
-- Chat、角色咨询、DS、RTL、Lint 和用例能力统一注册为 Tool；
-- DS Task、RTL Patch、ToolRun 作为专业执行记录关联到统一 Run；
-- Architecture、Design、Verification、Reviewer 和 Orchestrator 角色定义；
-- DeepSeek/OpenAI 真实模型及不联网的 Deterministic Runtime；
-- 规格冲突讨论、真实架构结论升级、Interrupt/Resume；
-- SQLite 任务快照，等待用户的任务可在服务重启后继续；
-- 隔离 Workspace、Artifact 版本/Hash、路径越界保护；
-- 基于 DS 的 SystemVerilog RTL 候选；
-- Patch/Diff 审批，批准前不修改目标文件；
-- Tool Registry、角色权限、修改等级和显式用户授权；
-- 异步 ToolRun、日志落盘、标准化 Issue、指纹去重；
-- 单 Active Issue 交互和四种用户决策；
-- 真实 Verilator Lint 适配器、已有验证用例发现 Tool；
-- SQLite、Tool Registry、模型和 Verilator 环境自检。
-
-## 当前边界
-
-- DS、RTL、Lint 和已有用例发现已经可以由聊天编排；工程工作台作为调试与兼容入口保留；
-- 仿真、CDC、综合和 STA 能创建统一 Run，但在没有真实 Tool Adapter 时会明确停在 `tool_adapter_required`，不会伪装为已执行；
-- LangGraph 内部仍使用 `MemorySaver`，SQLite 保存应用快照；重启后的等待任务由 TaskService 恢复路径继续，不是持久化 LangGraph Checkpointer；
-- 当前真实 EDA 适配器只有 Verilator Lint；商业仿真、CDC、综合和 STA 尚未接入；
-- 尚未实现 ToolRun 进程取消、自动候选修复 Patch、最小复验和问题单/Git 集成；
-- 长期记忆、Reflection 依赖图、文档变更传播和多用户权限仍未实现；
-- 模型及确定性运行时输出均为候选工程材料，不能替代真实架构批准和正式 Sign-off。
+这套文档描述 ChipFlow 的产品边界、总体架构、运行逻辑、代码组织和验证证据。阅读时不需要了解项目的开发历史；每份文档都以代码库中生效的设计为准。
 
 ## 推荐阅读顺序
 
-1. [v0.5 角色主 Agent](role-driven-multi-agent-v0.5.md)；
-2. [v0.4 动态编排演进背景](dynamic-orchestration-v0.4.md)；
-3. [总体架构](architecture-overview.md)；
-4. [运行逻辑](runtime-flow.md)；
-5. [组件与接口](components-and-interfaces.md)；
-6. [编排与 Skill](orchestration-and-skills.md)；
-7. [代码结构](codebase-guide.md)；
-8. [自验证报告](../SELF_VALIDATION_v0.5.md)。
+| 顺序 | 文档 | 重点 |
+|---:|---|---|
+| 1 | [产品需求](../PRODUCT_REQUIREMENTS.md) | 产品目标、角色、能力、约束和验收条件 |
+| 2 | [总体架构](architecture-overview.md) | 系统上下文、控制面、执行面、数据流和信任边界 |
+| 3 | [角色驱动 Multi-Agent](multi-agent-architecture.md) | 主 Agent、Delegate、Reviewer 与权限模型 |
+| 4 | [动态编排](dynamic-orchestration.md) | TaskIntent、Tool Selector、Function Calling 和 Planner-Executor Loop |
+| 5 | [上下文与记忆](context-and-memory.md) | 后端会话、四层上下文、混合检索、长期记忆和失效传播 |
+| 6 | [运行逻辑](runtime-flow.md) | 从 HTTP 请求到 Run、Tool、Issue、Patch 和响应的完整时序 |
+| 7 | [组件与接口](components-and-interfaces.md) | 服务职责、HTTP API、领域对象和 SQLite Schema |
+| 8 | [代码结构](codebase-guide.md) | 目录、关键文件、扩展点和测试组织 |
+| 9 | [编排与 Skills](orchestration-and-skills.md) | Skill、Tool、Policy 和 Workflow 的边界 |
+| 10 | [系统验证报告](../VALIDATION_REPORT.md) | 自动化验证范围、结果与部署约束 |
+| 11 | [面试 100 问](interview-100-questions.md) | 项目讲解、技术取舍和追问回答 |
+
+## 系统能力地图
+
+ChipFlow 以 Web 对话为统一入口。用户选择设计或验证工作角色后，角色主 Agent 根据请求和上下文决定下一步动作；普通问答、规格检索、DS 候选、RTL 候选、专家咨询和工程阶段调用均通过 Tool 进入同一条可观测运行链。
+
+系统包含以下核心能力：
+
+- 后端持久化会话和历史消息，前端按会话恢复；
+- FS、AS、ICD 的版本化保存、分块、关键词与语义混合检索；
+- 带来源的长期事实与决策，以及文档换版后的失效标记；
+- Design、Verification 主 Agent 与 Architecture、Reviewer 专家 Delegate；
+- 先权限过滤、再轻量筛选、最后原生 Function Calling 的两阶段 Tool 选择；
+- DS 和 RTL 候选生成，正式文件修改采用 Patch、Diff 与用户审批；
+- 统一 Run、事件、错误码、请求编号和 Context Manifest；
+- 编译、仿真、Lint、CDC、综合和 STA 的环境无关执行接口。
+
+## 部署配置
+
+默认配置面向 Windows 单机可信环境。模型可使用 OpenAI 兼容接口，DeepSeek 通过配置 Base URL、模型名和 API Key 接入；密钥由 Windows DPAPI 绑定本机用户保存。
+
+EDA 执行提供两类配置：
+
+- 本地仿真配置：`run_mock_eda` 返回结构化执行结果，不启动外部工具，也不产生 Sign-off 结论，用于验证编排、状态和交互闭环；
+- 工程适配配置：按照 Tool Registry 和 Adapter 契约接入项目实际使用的 Sim、Lint、CDC、综合和 STA 工具，并由部署方配置命令、许可证、Workspace 与审批策略。
+
+两类配置使用相同的 Run 和权限协议，因此切换执行后端不会改变上层 Agent 的角色边界和用户审批方式。
+
+## 事实口径
+
+文档中的“支持”表示代码路径、数据契约和测试证据同时存在；“接口”表示系统已经定义稳定的接入契约，但具体厂商工具由部署环境提供。FS、AS、ICD、问题单和工具原始日志属于证据，Agent 结论属于推断；推断不能覆盖受控证据。

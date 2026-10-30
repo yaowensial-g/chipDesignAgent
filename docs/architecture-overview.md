@@ -1,10 +1,10 @@
-# ChipFlow 总体架构说明（v0.5）
+# ChipFlow 总体架构说明
 
 ## 1. 架构目标
 
 ChipFlow 是面向 RTL 设计与验证工程师的 Windows 本地 Multi-Agent 工作台。系统的核心不是让模型替代工程师，而是把不确定的模型判断放入可审计、可暂停、可审批的工程控制面。
 
-v0.5 遵循以下原则：
+系统采用角色主 Agent、后端会话、混合 RAG 和可追溯长期记忆，遵循以下原则：
 
 - 用户决定任务目标以及是否进入下一研发阶段；
 - 用户工作角色决定 Design 或 Verification 主 Agent，控制平面不冒充专业主 Agent；
@@ -17,6 +17,10 @@ v0.5 遵循以下原则：
 - DS、RTL 和文件修复先形成候选产物，用户 Review 后才能进入正式 Workspace；
 - 本地进程执行必须满足 Tool 注册、角色权限、参数校验和用户授权；
 - Tool Call、Observation、审批、错误和结果都进入统一 Run 证据链。
+- 浏览器不是聊天历史的事实源，会话关闭后可从后端恢复；
+- FS/AS/ICD 版本化保存并按问题混合检索，不把整篇文档顺序塞入 Prompt；
+- Agent 推断不能自动成为长期事实，正式事实和决策必须带来源；
+- 每个 Run 保存 Context Manifest，能追踪模型实际看过的消息、记忆和文档分块。
 
 ## 2. 系统上下文
 
@@ -37,11 +41,39 @@ flowchart LR
 
 | 组件 | 负责 | 明确不负责 |
 |---|---|---|
-| React Web | 对话、上传、设置、状态展示、用户审批 | 不保存 API Key 明文，不直接运行工具 |
+| React Web | 对话、上传、会话恢复、设置、状态展示、用户审批 | 不作为历史事实源，不保存 API Key 明文，不直接运行工具 |
 | FastAPI | HTTP 契约、请求编号、异常转换、Service 装配 | 不在路由函数中实现业务编排 |
 | ConversationService | 保持对话 API 兼容并转交请求 | 不再判断 Chat/DS/RTL 固定分支 |
 
-### 2.2 角色主 Agent 与统一控制主链
+### 2.2 上下文与记忆数据流
+
+```mermaid
+flowchart LR
+    Input[当前用户消息]
+    Chat[(后端消息历史)]
+    Docs[(版本化 FS/AS/ICD)]
+    Memory[(有来源长期记忆)]
+    Search[混合检索]
+    Builder[ContextBuilder]
+    Manifest[(Context Manifest)]
+    Model[主 Agent / Delegate]
+
+    Docs --> Search
+    Input --> Search
+    Input --> Builder
+    Chat --> Builder
+    Search --> Builder
+    Memory --> Builder
+    Builder --> Manifest
+    Builder --> Model
+```
+
+后端先保存用户消息，再由 ContextBuilder 按 project、module、角色和 Token 预算选择近期
+对话、较早摘要、active 长期记忆以及 RAG 命中的文档分块。原始资料、聊天、工具日志和
+长期记忆分开保存。文档换版不会删除历史，而是把旧版本及相关推论标记为
+`superseded/stale`。详细规则见 [上下文与记忆子系统](context-and-memory.md)。
+
+### 2.3 角色主 Agent 与统一控制主链
 
 ```mermaid
 flowchart TB
@@ -65,7 +97,7 @@ flowchart TB
 
 普通聊天没有旁路。Planner 选择 `reply_to_user` 后形成只有一个 Tool Call 的短 Run，因此聊天和工程任务共享相同的事件、错误和审计语义。
 
-### 2.3 Tool 选择与确定性执行边界
+### 2.4 Tool 选择与确定性执行边界
 
 ```mermaid
 flowchart TB
@@ -88,16 +120,16 @@ flowchart TB
 
 权限过滤发生在模型选择之前：无权或禁用 Tool 不会进入 Selector 的 Metadata，也不会进入主 Agent 的完整 Schema。Selector 只决定候选集，主 Agent 再决定“调用哪个 Tool、传哪些参数”。两个模型都不能直接取得数据库、文件系统或 Shell 权限；执行前还会再次检查角色、修改等级、Workspace 路径、参数和用户授权。
 
-### 2.4 状态、证据和外部依赖
+### 2.5 状态、证据和外部依赖
 
 | 类别 | 当前组件 | 主要数据 | 失败时如何处理 |
 |---|---|---|---|
-| 控制面状态 | Conversation、Unified Run、RunEvent、SQLite | 工作角色、主 Agent、Intent、Tool Shortlist、Tool Call、Observation 和结果 | 保留失败状态与请求编号 |
+| 控制面状态 | Conversation、Message、Unified Run、RunEvent、Context Manifest、SQLite | 聊天正文、工作角色、Intent、Tool Call、Observation、上下文来源和结果 | 保留失败状态与请求编号 |
 | 协作状态 | DelegationTask | 专家 instruction、约束、证据、状态和结构化结果 | 超时/失败返回主 Agent，并标记需人工介入 |
 | 专业状态 | DS Task、Patch、ToolRun、EngineeringIssue | DS、Diff、审批、命令、日志和单 Issue 决策 | 专业对象独立恢复或重试 |
 | 本地文件 | Workspace、Artifact、Raw Logs | RTL、候选文件、版本 Hash、stdout/stderr | 路径限制、原子写入、保留原始证据 |
 | 模型服务 | DeepSeek / OpenAI | 意图整理、Planner 和角色判断 | 结构化错误；测试回退 Deterministic Runtime |
-| EDA 进程 | Verilator；未来 Sim/CDC/综合/STA Adapter | 命令、退出码和工具日志 | 超时/失败标准化为 ToolRun 与 Issue |
+| EDA 阶段 | 本地 `run_mock_eda` 或工程工具 Adapter | stage、target、options 和结构化结果 | 本地配置不启动进程，工程配置受权限与审批控制 |
 
 系统当前是一个本机后端进程，不是微服务。图中的组件代表逻辑职责，目的是隔离变化和权限，而不是增加网络调用。
 
@@ -205,10 +237,10 @@ Tool Definition 不只是名称和描述，还包含：
 
 | Tool | 用途 | 关键约束 |
 |---|---|---|
-| `verilator_lint` | 执行受控 HDL Lint | Workspace、文件白名单、显式授权 |
+| `run_mock_eda` | 占位执行 Compile/Sim/Lint/CDC/综合/STA | 返回 `MOCK` 字符串，不依赖 Workspace 或外部环境 |
 | `discover_testcases` | 发现验证目录中的已有用例 | 只读，不生成验证计划 |
 
-当前实现已经不再向主 Agent 发送完整 Catalog：后端先按角色和启用状态过滤，再由 Selector 形成候选集。`reply_to_user` 与 `ask_user` 始终可用；Selector 失败时回退到 Intent 候选和基础 Tool。后续可继续加入环境、Workspace、能力标签和历史成功率等过滤维度。
+后端不向主 Agent 发送完整 Catalog：先按角色和启用状态过滤，再由 Selector 形成候选集。`reply_to_user` 与 `ask_user` 始终可用；Selector 失败时回退到 Intent 候选和基础 Tool。环境、Workspace 和能力标签可作为确定性过滤条件。
 
 ## 7. Agent 角色模型
 
@@ -222,7 +254,7 @@ Tool Definition 不只是名称和描述，还包含：
 | Reviewer | 独立检查规格、微架构、接口和可验证性 | 不自我批准或直接修改 |
 | 确定性控制平面 | 保存 Run、过滤权限、执行 Tool、记录 Observation | 不产生专业结论，不成为默认主 Agent |
 
-Design 和 Verification 当前共享主模型配置，通过提示词、Skill、输入契约和 Tool 权限隔离；轻量 Selector 可以单独配置模型名称。专家委派在同进程中异步执行并持久化为 `DelegationTask`，不是独立微服务。完整设计见 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md)。
+Design 和 Verification 共享主模型配置，通过提示词、Skill、输入契约和 Tool 权限隔离；轻量 Selector 可以单独配置模型名称。专家委派在同进程中异步执行并持久化为 `DelegationTask`，不是独立微服务。完整设计见 [角色驱动 Multi-Agent 架构](multi-agent-architecture.md)。
 
 ## 8. Skill、Tool、Workflow 与 Policy
 
@@ -302,7 +334,7 @@ Architecture Agent 只能建议。文档不清、冲突或疑似错误时，系�
 
 ## 12. EDA、日志与单 Issue 闭环
 
-ToolRunService 在权限检查后创建异步 ToolRun，由线程池执行预注册 Adapter。当前真实 Adapter 是 Verilator Lint；`discover_testcases` 只发现已有用例，不替验证团队生成计划。
+本地配置对 EDA 阶段调用 `run_mock_eda`，同步返回明确的仿真执行结果并完成 Unified Run，不创建 ToolRun。工程配置通过 ToolRunService 和工具 Adapter 执行外部进程；Verilator Adapter 默认禁用，部署方完成环境配置后才能启用。`discover_testcases` 只发现已有用例，不替验证团队生成计划。
 
 ```text
 ToolRun
@@ -314,7 +346,7 @@ ToolRun
 → approve / skip / custom / explain
 ```
 
-仿真、CDC、综合和 STA 尚无真实 Adapter。Planner 会选择 `report_capability_gap`，明确指出缺少工具、命令模板、环境和解析器，不会伪装成功。
+编译、仿真、Lint、CDC、综合和 STA 当前没有真实 Adapter。Planner 统一选择 `run_mock_eda`，返回 `mock=true` 和 `real_execution=false`；这只证明 Function Call 与状态链可用，不表示 EDA 检查通过。
 
 ## 13. 状态与持久化
 
@@ -331,7 +363,7 @@ SQLite 当前保存：
 | `tool_runs` | 工具执行状态和输出 |
 | `engineering_issues` | 标准化工程错误和用户决策 |
 
-SQLite 使用 WAL、外键、线程锁和短连接，适合 Windows 单机 MVP。它不适合多 Worker 高并发；生产部署应迁移 PostgreSQL，并使用可靠任务队列和独立 Worker。
+SQLite 使用 WAL、外键、线程锁和短连接，服务于 Windows 单机部署。多 Worker 高并发部署应采用 PostgreSQL、可靠任务队列和独立 Worker。
 
 DS 正常运行使用 LangGraph `MemorySaver`，同时写应用快照。服务重启后的等待任务通过 TaskService 兼容恢复，并非持久化 LangGraph Checkpointer，这是当前明确边界。
 
@@ -410,14 +442,14 @@ flowchart TB
         SQLite[(chipflow.db)]
         Workspace[data/workspaces]
         Config[model_settings.json]
-        Verilator[Verilator]
+        MockEDA[run_mock_eda]
     end
     Cloud[DeepSeek / OpenAI HTTPS]
     Browser --> Vite --> FastAPI
     FastAPI --> SQLite
     FastAPI --> Workspace
     FastAPI --> Config
-    FastAPI --> Verilator
+    FastAPI --> MockEDA
     FastAPI --> Cloud
 ```
 
@@ -447,35 +479,32 @@ flowchart TB
 
 - 模型不可用：返回 `MODEL_INVOCATION_FAILED`，不伪造结果；
 - Tool 未安装：ToolRun 失败并保留 stderr；
-- Tool Adapter 缺失：Run 进入能力缺口等待；
+- Mock EDA：Run 正常完成，但结果明确标记未真实执行；
 - 路径越界或参数非法：执行前拒绝；
 - Planner 重复或过长：六步上限后暂停；
 - Patch 目标已变化：返回冲突，不覆盖用户修改。
 
-## 19. 已实现能力与边界
+## 19. 能力与部署边界
 
-已实现：
+系统能力：
 
 - 统一 Intent Enricher 与 Planner-Executor Loop；
 - Chat、角色咨询和工程任务统一 Tool Calling；
 - DeepSeek Chat Completions 与 OpenAI Responses 原生 Function Calling；
 - DS Multi-Agent 候选和多视角评审；
 - RTL Candidate、Diff 和人工审批；
-- Verilator Lint、日志、Issue 和逐条处理；
+- 环境无关 EDA Function Call、Run 状态与明确的执行属性；
 - SQLite Run、Task、Patch、ToolRun 和事件持久化；
 - Windows DPAPI 模型密钥保护；
 - React 工作台、系统自检和结构化错误。
 
-尚未实现：
+部署边界：
 
-- 可视化多目标 Run DAG；
-- 通用 `ask_user` 原 Run 自动恢复与继续规划；
-- DS 节点完全拆分成细粒度 Tool；
-- Tool 大规模能力检索和动态过滤；
-- 商业 Sim、CDC、综合和 STA Adapter；
-- Issue 自动修复、最小复验和回归闭环；
-- 问题单、Git PR 和组织权限集成；
-- 来源依赖图、Reflection 演化和长期记忆。
+- Run 以事件列表表达执行轨迹，不提供多目标 DAG 可视化；
+- DS、RTL 和 Tool 审批使用各自的受控恢复协议；
+- 本地配置不执行商业 Sim、CDC、综合和 STA，也不得作为 Sign-off 证据；
+- 问题单、Git PR、商业 EDA 和组织权限通过外部 Adapter 接入；
+- 默认部署面向可信单机用户，多用户部署必须增加认证、ACL、外部数据库和任务队列。
 
 ## 20. 关键架构取舍
 
@@ -485,11 +514,11 @@ flowchart TB
 
 ### 20.2 全量 Tool Catalog vs Tool Retrieval
 
-当前 Tool 少，全量发送简单、容易测试。工具增多后应引入能力检索，否则会增加 Token、延迟和误选概率。
+系统不向主 Agent 发送全量 Tool Schema，而是先进行权限过滤和轻量候选选择，以控制 Token、延迟和误选概率。
 
 ### 20.3 逻辑角色 vs 独立 Agent 服务
 
-逻辑角色共享上下文和模型配置，适合 MVP、测试和本机部署。只有在模型差异、吞吐或故障隔离成为真实需求时，才值得拆成独立服务。
+逻辑角色共享受控上下文和模型配置，适合单机协作部署。需要独立模型、吞吐隔离或故障域时，可在保持领域协议不变的前提下拆成服务。
 
 ### 20.4 SQLite vs PostgreSQL
 
@@ -497,4 +526,4 @@ SQLite 降低 Windows 单机部署成本，但并发和迁移能力有限。多�
 
 ### 20.5 本地 Workspace vs 直接操作 Git 仓库
 
-隔离 Workspace 更安全、可重复，但与真实代码仓库仍有距离。未来接入 Git 时仍应保留 Candidate、Diff、审批和提交协议，而不是让模型直接修改主分支。
+隔离 Workspace 提供安全、可重复的执行边界。Git Adapter 仍必须保留 Candidate、Diff、审批和提交协议，模型不得直接修改主分支。

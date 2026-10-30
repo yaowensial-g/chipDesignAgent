@@ -40,6 +40,10 @@ class ToolRunService:
         # resolve_path(".") 同时验证 Workspace 存在且根路径仍在受控目录中。
         workspace_service.resolve_path(request.workspace_id, ".")
         registered = self.registry.get(request.tool_name)
+        if not registered.definition.enabled:
+            raise ValueError(
+                f"Tool {request.tool_name} is disabled; use run_mock_eda through the chat orchestrator"
+            )
         if request.role not in registered.definition.allowed_roles:
             raise PermissionError(f"Role {request.role.value} cannot call {request.tool_name}")
         if registered.definition.requires_user_approval and not request.user_approved:

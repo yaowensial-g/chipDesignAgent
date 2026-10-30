@@ -13,6 +13,8 @@ import type {
   CandidatePatch,
   RTLCandidate,
   RunView,
+  ConversationView,
+  ConversationMessagesPage,
 } from "./types";
 
 const API_ROOT = "/api/v1";
@@ -96,6 +98,24 @@ export async function sendChat(input: ChatInput): Promise<ChatResponse> {
     }),
   });
   return parseResponse(response);
+}
+
+export async function listConversations(projectId?: string): Promise<ConversationView[]> {
+  const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+  return parseResponse(await fetch(`${API_ROOT}/conversations${query}`, { cache: "no-store" }));
+}
+
+export async function getConversationMessages(
+  sessionId: string,
+  before?: number,
+  limit = 100,
+): Promise<ConversationMessagesPage> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (before) params.set("before", String(before));
+  return parseResponse(await fetch(
+    `${API_ROOT}/conversations/${encodeURIComponent(sessionId)}/messages?${params}`,
+    { cache: "no-store" },
+  ));
 }
 
 export async function getRun(runId: string): Promise<RunView> {

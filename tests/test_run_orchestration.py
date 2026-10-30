@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -85,11 +84,12 @@ def test_tool_catalog_exposes_planning_metadata() -> None:
     response = client.get("/api/v1/tools")
     assert response.status_code == 200
     tools = {item["name"]: item for item in response.json()}
-    assert {"reply_to_user", "ask_user", "create_ds_candidate", "verilator_lint"} <= set(tools)
+    assert {"reply_to_user", "ask_user", "create_ds_candidate", "run_mock_eda", "verilator_lint"} <= set(tools)
     assert tools["reply_to_user"]["execution_kind"] == "orchestration"
     assert tools["create_ds_candidate"]["when_to_use"]
-    assert tools["verilator_lint"]["input_schema"]["required"] == ["files"]
-    assert tools["verilator_lint"]["requires_user_approval"] is True
+    assert tools["run_mock_eda"]["input_schema"]["required"] == ["stage"]
+    assert tools["run_mock_eda"]["requires_user_approval"] is False
+    assert tools["verilator_lint"]["enabled"] is False
 
 
 def test_rtl_chat_creates_reviewable_patch_run() -> None:
@@ -115,40 +115,49 @@ def test_rtl_chat_creates_reviewable_patch_run() -> None:
     assert (workspace_root / "rtl" / "scheduler.sv").exists()
 
 
-def test_lint_chat_starts_tool_run_and_refreshes_unified_status() -> None:
-    project_id = f"lint-run-{uuid4().hex[:8]}"
-    workspace = client.post("/api/v1/workspaces", json={"project_id": project_id}).json()
+def test_lint_chat_uses_mock_function_without_external_environment() -> None:
     response = client.post(
         "/api/v1/chat",
         json=_chat(
             "执行 scheduler 的 lint",
-            project_id=project_id,
-            workspace_id=workspace["workspace_id"],
             tool_arguments={"files": ["rtl/missing.sv"]},
         ),
     )
     assert response.status_code == 200
     run = response.json()["run"]
     assert run["run_type"] == "lint"
-    assert run["tool_run_id"]
-
-    current = run
-    for _ in range(50):
-        current = client.get(f"/api/v1/runs/{run['run_id']}").json()
-        if current["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.02)
-    assert current["status"] == "failed"
-    assert current["result"]["tool_run"]["status"] == "failed"
+    assert run["status"] == "completed"
+    assert run["tool_run_id"] is None
+    assert run["result"]["mock_eda"]["mock"] is True
+    assert run["result"]["mock_eda"]["real_execution"] is False
+    assert "[MOCK EDA]" in response.json()["assistant_message"]
 
 
-def test_unregistered_engineering_stage_is_honest_about_missing_adapter() -> None:
+def test_synthesis_uses_mock_function_instead_of_missing_adapter() -> None:
     response = client.post("/api/v1/chat", json=_chat("执行 scheduler 的综合"))
     assert response.status_code == 200
     run = response.json()["run"]
     assert run["run_type"] == "synthesis"
-    assert run["status"] == "waiting_for_user"
-    assert run["pending_user_request"]["type"] == "tool_adapter_required"
+    assert run["status"] == "completed"
+    assert run["pending_user_request"] is None
+    assert run["result"]["tool_calls"][0]["tool_name"] == "run_mock_eda"
+    assert run["result"]["mock_eda"]["stage"] == "synthesis"
+
+
+def test_all_eda_stages_share_the_same_mock_tool() -> None:
+    cases = (
+        ("运行 RTL 编译", "compilation"),
+        ("开始 sim 仿真", "simulation"),
+        ("执行 CDC 跨时钟检查", "cdc"),
+        ("执行 STA 时序分析", "sta"),
+    )
+    for message, expected_stage in cases:
+        response = client.post("/api/v1/chat", json=_chat(message))
+        assert response.status_code == 200
+        run = response.json()["run"]
+        assert run["status"] == "completed"
+        assert run["result"]["tool_calls"][0]["tool_name"] == "run_mock_eda"
+        assert run["result"]["mock_eda"]["stage"] == expected_stage
 
 
 def test_cancelling_waiting_ds_run_also_cancels_linked_task() -> None:

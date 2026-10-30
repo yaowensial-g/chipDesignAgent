@@ -1,18 +1,18 @@
-# ChipFlow v0.5 自验证报告
+# ChipFlow 系统验证报告
 
-日期：2026-10-28
+验证日期：2026-10-30
 
-## 1. 本轮目标
+## 1. 验证目标
 
-本轮采用渐进式重构，不重写已经验证的 DS、RTL、Patch、ToolRun 和 Issue 流程，集中验证三项架构决策：
+验证覆盖 DS、RTL、Patch、ToolRun、Issue 处理和以下三项架构机制：
 
 1. 用户工作角色决定 Design 或 Verification 主 Agent；
 2. 跨专业协作使用可约束、可持久化的 Delegate；
 3. Tool 先按主 Agent 权限过滤，再由轻量 LLM 选择有限候选，主 Agent 只接收候选完整 Schema。
 
-## 2. 重构前代码分析结论
+## 2. 架构检查结论
 
-| 观察 | 风险 | v0.5 处理 |
+| 观察 | 风险 | 系统处理 |
 |---|---|---|
 | 顶层已有统一 Orchestrator 和 Tool Registry | 可复用，不应推翻 | 保留为确定性控制平面 |
 | Design/Verification 主要通过 `consult_*` 被调用 | 真实生产角色没有主责 | 增加会话角色与 `primary_agent` |
@@ -38,12 +38,12 @@
 命令：
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q --tb=short --basetemp data\pytest-v05-final
+.\.venv\Scripts\python.exe -m pytest -q --tb=short --basetemp data\pytest-final
 ```
 
-结果：**59 passed**。
+结果：**64 passed**。
 
-原有 51 项测试全部保留通过；新增 8 项专项测试位于 `tests/test_role_based_runtime.py`：
+自动化测试覆盖角色主 Agent、上下文与记忆、统一编排、工程平台和 API 契约，其中角色协作专项包括：
 
 - 工作角色持久化并选择正确主 Agent；
 - Tool Catalog 在规划前按角色过滤；
@@ -65,7 +65,7 @@ cd frontend
 npm run build
 ```
 
-结果：TypeScript 与 Vite 构建通过，生成 v0.5.0 生产 Bundle。
+结果：TypeScript 与 Vite 构建通过，生成可部署的生产 Bundle。
 
 ### 3.4 Git 差异检查
 
@@ -96,18 +96,18 @@ git diff --check
 | 角色切换隔离旧角色聊天历史 | 通过 | 后端首轮清空 + 前端切换清空 |
 | 原有 DS/RTL/Lint/恢复流程兼容 | 通过 | 原有 51 项测试 |
 
-## 5. 未覆盖与诚实边界
+## 5. 部署边界
 
 - 没有使用真实付费模型执行测试，自动化测试使用 Deterministic Runtime；
-- Provider 尚未回传 token usage，因此 Selector 观测暂不包含准确 token 与成本；
-- Delegate 是同进程异步调用，还没有独立队列、Worker、重试退避或分布式 Trace；
-- 当前 `user_role` 是本地工作模式，不是企业认证后的组织权限；
-- Sim、CDC、综合、STA 仍未接入真实 Tool Adapter；
-- 角色切换保留共享文档和持久化制品，但没有细粒度字段级上下文迁移策略；
-- DS 内部继续复用 LangGraph 兼容子流程，本轮没有为了形式统一而重写稳定流程。
+- Provider 不回传 token usage 时，Selector 观测只记录模型、候选数量、回退标记和延迟，不推测 token 与成本；
+- Delegate 采用同进程异步调用；分布式部署需要外部队列、Worker、重试退避和 Trace；
+- `user_role` 表示本地工作模式；企业部署必须由认证身份和组织权限映射角色；
+- Sim、CDC、综合和 STA 在本地配置中使用仿真执行函数；工程环境通过真实 Tool Adapter 接入；
+- 角色切换保留共享文档和持久化制品，角色私有对话不会跨角色注入；
+- DS 内部使用 LangGraph 专业子流程，统一编排通过 Tool 契约调用它，避免控制面侵入专业执行器。
 
 ## 6. 结论
 
-v0.5 已完成三项核心架构决策的可运行实现，并通过原有回归与新增专项测试。它不是一次目录层面的“换名重构”：主 Agent 身份进入 Conversation、Run、Tool 权限、Planner Prompt 和事件；Delegate 进入独立数据模型和持久化表；Tool Selector 实际改变了发送给主 Agent 的 Schema 集合。
+验证结果证明三项核心架构机制均进入可运行主链：主 Agent 身份进入 Conversation、Run、Tool 权限、Planner Prompt 和事件；Delegate 使用独立数据模型和持久化表；Tool Selector 实际控制发送给主 Agent 的 Schema 集合。
 
-下一阶段建议优先做真实模型对照评估与可观测性：统计 Selector 候选召回率、主 Agent Tool 选择准确率、Delegate 接受率、token/延迟/成本和权限拒绝次数，再决定是否为不同角色拆分模型或部署进程。
+生产评估应持续统计 Selector 候选召回率、主 Agent Tool 选择准确率、Delegate 接受率、token、延迟、成本和权限拒绝次数，并据此决定是否为不同角色拆分模型或部署进程。

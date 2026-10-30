@@ -13,10 +13,30 @@ import re
 from dataclasses import replace
 from typing import Any
 
+from app.services.token_service import token_counter
+
 from app.config.model_settings import model_settings_service
 from app.domain.models import SourceRef
 from app.models.provider import OpenAIModelProvider
 from app.skills import skill_catalog
+
+
+EDA_STAGE_PATTERNS = (
+    ("compilation", r"编译|compile|compilation"),
+    ("simulation", r"仿真|simulation|sim"),
+    ("lint", r"lint|verilator|静态检查"),
+    ("cdc", r"cdc|跨时钟"),
+    ("synthesis", r"综合|synthesis"),
+    ("sta", r"sta|时序分析|静态时序"),
+)
+
+
+def _detect_eda_stage(message: str) -> str | None:
+    """把中英文工程动作映射为 run_mock_eda 的稳定 stage 枚举。"""
+    for stage, pattern in EDA_STAGE_PATTERNS:
+        if re.search(pattern, message, flags=re.IGNORECASE):
+            return stage
+    return None
 
 
 class DeterministicAgentRuntime:
@@ -68,7 +88,10 @@ class DeterministicAgentRuntime:
         mappings = (
             ("create_rtl_candidate", r"rtl|systemverilog|verilog|硬件代码"),
             ("create_ds_candidate", r"ds|详细设计|设计说明"),
-            ("verilator_lint", r"lint|verilator|静态检查"),
+            (
+                "run_mock_eda",
+                r"编译|compile|仿真|simulation|sim|lint|verilator|静态检查|cdc|跨时钟|综合|synthesis|sta|时序分析|静态时序",
+            ),
             ("discover_testcases", r"testcase|用例|回归"),
         )
         for name, pattern in mappings:
@@ -140,19 +163,26 @@ class DeterministicAgentRuntime:
         choices = (
             ("create_rtl_candidate", create_action, r"rtl|systemverilog|verilog|硬件代码"),
             ("create_ds_candidate", create_action, r"ds|详细设计|设计说明"),
-            ("verilator_lint", execute_action, r"lint|verilator|静态检查"),
             ("discover_testcases", execute_action, r"testcase|用例|回归"),
         )
         available = {tool["name"] for tool in tools}
+        eda_stage = _detect_eda_stage(message)
+        if "run_mock_eda" in available and eda_stage and re.search(execute_action, message):
+            return {
+                "name": "run_mock_eda",
+                "arguments": {
+                    "stage": eda_stage,
+                    "target": request.get("module_name", ""),
+                    "options": dict(request.get("tool_arguments") or {}),
+                },
+                "reason": "当前环境使用 Mock EDA Tool 验证 Function Call 链路",
+            }
         for name, action, target in choices:
             if name in available and (
                 re.search(rf"(?:{action}).{{0,16}}(?:{target})", message)
                 or re.search(rf"(?:{target}).{{0,16}}(?:{action})", message)
             ):
-                arguments: dict[str, Any] = {}
-                if name == "verilator_lint":
-                    arguments = dict(request.get("tool_arguments") or {})
-                return {"name": name, "arguments": arguments, "reason": "模拟 Planner 选择匹配 Tool"}
+                return {"name": name, "arguments": {}, "reason": "模拟 Planner 选择匹配 Tool"}
         delegation_choices = (
             ("consult_architecture_agent", r"架构|微架构|ppa|流水线|规格歧义"),
             ("consult_design_agent", r"ds|详细设计|rtl|systemverilog|verilog|设计根因"),
@@ -165,20 +195,6 @@ class DeterministicAgentRuntime:
                     "arguments": {"focus": request["message"]},
                     "reason": "主 Agent 将跨专业子任务委派给专家",
                 }
-        unsupported = (
-            ("simulation", r"仿真|simulation|sim"),
-            ("cdc", r"cdc|跨时钟"),
-            ("synthesis", r"综合|synthesis"),
-            ("sta", r"sta|时序分析|静态时序"),
-        )
-        if re.search(execute_action, message):
-            for capability, target in unsupported:
-                if re.search(target, message):
-                    return {
-                        "name": "report_capability_gap",
-                        "arguments": {"capability": capability},
-                        "reason": "请求的真实 Tool Adapter 尚未注册",
-                    }
         return {
             "name": "reply_to_user",
             "arguments": {"message": self.chat(request)},
@@ -205,12 +221,14 @@ class DeterministicAgentRuntime:
         keyword_tools = (
             ("create_ds_candidate", r"ds|详细设计"),
             ("create_rtl_candidate", r"rtl|systemverilog|verilog"),
-            ("verilator_lint", r"lint|verilator|静态检查"),
+            (
+                "run_mock_eda",
+                r"编译|compile|仿真|simulation|sim|lint|verilator|静态检查|cdc|跨时钟|综合|synthesis|sta|时序",
+            ),
             ("discover_testcases", r"testcase|用例|回归"),
             ("consult_architecture_agent", r"架构|微架构|ppa|流水线"),
             ("consult_design_agent", r"rtl|systemverilog|verilog|ds|详细设计|设计专家|设计分析|电路实现"),
             ("consult_verification_agent", r"验证|覆盖率|断言|testbench|仿真分析"),
-            ("report_capability_gap", r"仿真|simulation|cdc|综合|synthesis|sta|时序"),
         )
         for name, pattern in keyword_tools:
             if name in available and re.search(pattern, message) and name not in selected:
@@ -435,21 +453,27 @@ class LLMChipDesignRuntime:
 
     @staticmethod
     def _context(request: dict[str, Any]) -> dict[str, Any]:
-        """构造并裁剪模型上下文，防止上传文档无限扩张请求体。"""
+        """把 ContextBuilder 已筛选的上下文转换成模型 Payload。
+
+        文档相关性排序和主要预算分配已经在 ContextBuilder 完成；这里仅保留一个按
+        Token 计数的安全阀，防止绕过正式编排直接调用 Runtime 时产生超大请求。
+        """
         documents = []
-        remaining = 120_000
-        for document in request["documents"]:
-            content = document["content"][:remaining]
-            remaining -= len(content)
+        remaining_tokens = 20_000
+        for document in request.get("documents", []):
+            content = token_counter.trim(document["content"], remaining_tokens)
+            remaining_tokens -= token_counter.count(content)
             documents.append({**document, "content": content})
-            if remaining <= 0:
+            if remaining_tokens <= 0:
                 break
         return {
             "project_id": request["project_id"],
             "module_name": request["module_name"],
             "instruction": request.get("instruction") or request.get("message", ""),
             "documents": documents,
-            "history": request.get("history", [])[-20:],
+            "history": request.get("history", []),
+            "long_term_memory": request.get("_memory_context", []),
+            "context_manifest": request.get("_context_manifest", {}),
         }
 
     def chat(self, request: dict[str, Any]) -> str:

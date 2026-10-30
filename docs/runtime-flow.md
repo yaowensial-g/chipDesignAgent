@@ -1,6 +1,6 @@
-# 运行逻辑说明（v0.5 角色主 Agent）
+# 运行逻辑说明
 
-> 当前对话主链为 Role Resolution → Intent Enricher → Permission Filter → Tool Selector → Primary Agent → Tool/Delegate → Observation。本文件描述 v0.5 当前实现。
+> 当前对话主链为 Backend Message → ContextBuilder/RAG → Role Resolution → Intent Enricher → Permission Filter → Tool Selector → Primary Agent → Tool/Delegate → Observation。
 
 ## 1. 启动
 
@@ -15,14 +15,15 @@
 
 ## 2. 页面初始化
 
-1. 初始化示例项目和模块；
+1. 初始化示例项目和模块，并从后端加载该项目的会话列表；
 2. 读取公开模型设置；
 3. 默认选择设计工程师工作角色，并允许切换验证工程师；
 4. 显示真实模型或模拟运行时；
 5. 用户可以直接聊天，不要求先上传 FS/AS；
 6. 右上角提供工程工作台、系统自检和模型设置。
 
-浏览器刷新仍会清空当前聊天和上传列表；后端持久化的 Task/Workspace 不会自动重新绑定到新页面会话。
+浏览器刷新后可以选择历史会话，网页会分页恢复后端消息，并通过 `active_run_id` 重新绑定
+当前 Run。上传控件的本地文件对象不会恢复，但已入库的文档仍可由后端 RAG 检索。
 
 ## 3. 对话、角色主 Agent 和统一 Run
 
@@ -32,6 +33,8 @@ sequenceDiagram
     participant W as Web
     participant C as ConversationService
     participant S as SessionService
+    participant CB as ContextBuilder
+    participant RAG as Document/Memory Retrieval
     participant O as Control Plane
     participant TS as Tool Selector
     participant P as Primary Agent
@@ -43,7 +46,12 @@ sequenceDiagram
     W->>C: POST /conversations/{id}/messages
     C->>S: session + user_role
     S-->>O: Design / Verification 主 Agent
-    C->>O: message + history + documents
+    S->>DB: 持久化 user message
+    O->>CB: 当前消息 + project/module/role
+    CB->>RAG: 关键词 + 语义混合检索
+    RAG-->>CB: active memory + document chunks
+    CB->>DB: Context Manifest
+    CB-->>O: 有 Token 预算的上下文快照
     O->>O: enrich TaskIntent
     O->>DB: create Unified Run
     loop 最多 6 个 Planner Step
@@ -63,10 +71,30 @@ sequenceDiagram
         O->>DB: RunEvent + result/status
     end
     O-->>C: orchestrated ChatResponse
+    C->>DB: 持久化 assistant message
     C-->>W: assistant + RunView + 可选 TaskView
 ```
 
-上传文件只增加上下文，不自动触发流程。用户决定任务目标和研发阶段；Intent Enricher 只整理有证据的信息，当前主 Agent 从权限安全的候选集中选择 Tool。明确 DS 任务必须至少包含 AS，否则 `ask_user` 让 Run 进入 `waiting_for_user`。
+上传文件只建立版本化证据，不自动触发流程。用户决定任务目标和研发阶段；模型不会直接
+接收全部原文，而是接收与当前问题相关的分块。Intent Enricher 只整理有证据的信息，
+当前主 Agent 从权限安全的候选集中选择 Tool。明确 DS 任务必须能够检索到 AS，否则
+`ask_user` 让 Run 进入 `waiting_for_user`。
+
+## 3.1 上下文选择顺序
+
+```text
+保存本轮用户消息
+→ 首次文档幂等入库、分块、索引
+→ 读取当前角色的近期消息
+→ 较早消息形成可追踪抽取摘要
+→ 检索 active 长期记忆
+→ 对 active 文档分块执行混合 RAG
+→ 按区段 Token 预算组装 effective_request
+→ 保存 Context Manifest
+→ Intent / Selector / Primary Agent / Delegate 复用同一快照
+```
+
+Runtime 只保留按 Token 计数的最后安全阀，不再使用 120,000 字符和上传顺序截断。
 
 统一 Run 和专业执行记录分层：
 
@@ -137,14 +165,14 @@ sequenceDiagram
 7. 日志写入 `logs/<run_id>.*.log`；
 8. 生成 Issue 后进入 `completed`、`failed` 或 `timed_out`。
 
-### Verilator Lint
+### 本地 EDA 仿真执行配置
 
-- 可执行文件由 PATH 查找；
-- HDL 文件必须存在于 Workspace 且后缀允许；
-- `top_module` 必须满足标识符白名单；
-- 使用 `subprocess.run(command_list, shell=False)`；
-- 当前超时 300 秒；
-- 当前机器未安装时生成 `TOOL_ENVIRONMENT` Issue。
+- `run_mock_eda` 接收 `stage`、`target` 和 `options`；
+- stage 支持 compilation、simulation、lint、cdc、synthesis、sta；
+- 不读取 PATH，不要求安装 Verilator 或商业 EDA；
+- 不启动子进程、不生成真实日志和 Issue；
+- 返回带 `[MOCK EDA]` 的明确非真实执行字符串；
+- Run.result 同时保存 `mock=true` 与 `real_execution=false`。
 
 ## 7. 单 Issue 闭环
 
@@ -152,12 +180,12 @@ sequenceDiagram
 
 `GET /tool-runs/{run_id}/issues/next` 只把队列中第一条未处理问题设为 `awaiting_user`。用户动作：
 
-- `approve`：记录接受建议；当前版本不会自动生成/应用修复 Patch；
+- `approve`：记录接受建议；只有生成候选 Patch 并获得单独批准后才能修改文件；
 - `skip`：标记跳过并进入下一条；
-- `custom`：保存自定义原则；当前版本尚未自动重新生成 Patch；
+- `custom`：保存用户自定义处理原则，作为后续候选 Patch 的输入；
 - `explain`：保持当前问题活跃。
 
-当前 v0.4 已实现“单问题展示和决策记录”，但“自动修复 → 应用 → 最小复验 → resolved/reopened”仍是下一步。
+系统提供单问题展示和决策记录。自动修复只有在生成候选 Patch、获得用户批准并完成最小复验后，才能进入 `resolved`；否则保持为开放问题。
 
 ## 8. 模型选择
 
@@ -203,7 +231,7 @@ EngineeringIssue：
 detected → awaiting_user → approved / skipped / custom_requested
 ```
 
-`patch_ready/applied/verifying/resolved/reopened` 已在枚举中保留，但当前自动修复链尚未串通。
+`patch_ready/applied/verifying/resolved/reopened` 定义完整的修复状态语义；只有实际创建 Patch、应用修改并执行复验的 Adapter 才能推进这些状态。
 
 ## 10. 失败行为
 
@@ -215,7 +243,7 @@ detected → awaiting_user → approved / skipped / custom_requested
 | Workspace 路径穿越 | 422 |
 | 无权限或未授权 Tool | 403 |
 | Tool 不存在/Workspace 不存在 | 404 |
-| Verilator 未安装 | Run failed + `TOOL_ENVIRONMENT` Issue |
+| Mock EDA | Run completed，但明确标记未真实执行 |
 | Patch Review 期间目标变化 | 409，不覆盖文件 |
 | 后端重启 | 已落库结果可查；运行中 Tool 不自动续跑 |
 
@@ -225,15 +253,14 @@ detected → awaiting_user → approved / skipped / custom_requested
 |---|---|---|
 | 完成/评审 DS | `ds_design` | 调用 DS Workflow，Task 与 Run 双向关联 |
 | 生成/实现 RTL | `rtl_implementation` | 要求已确认 DS，生成 Candidate/Patch，等待审批 |
-| 执行 Lint | `lint` | 查找项目 Workspace，明确执行意图视为授权，启动 Verilator ToolRun |
+| 执行编译/Sim/Lint/CDC/综合/STA | 对应 RunType | 调用统一 `run_mock_eda`，返回 Mock 字符串 |
 | 执行已有用例 | `test_execution` | 调用 `discover_testcases`，不自动生成验证计划 |
-| 执行仿真/CDC/综合/STA | 对应 RunType | 当前未注册 Adapter，保存 `tool_adapter_required`，不伪造结果 |
 
 直接 `/tasks/ds`、`/rtl/candidates` 和 `/tool-runs` 仍可用于测试与系统集成，但正式网页的主路径是 Conversation → RunService。
 
 ## 11. 自检
 
-`GET /diagnostics` 不调用外部模型，不产生费用。检查后端、默认配置、本地设置、模型就绪状态、数据目录、SQLite、Tool Registry 和 Verilator PATH。
+`GET /diagnostics` 不调用外部模型，不产生费用。检查后端、默认配置、本地设置、模型就绪状态、数据目录、SQLite、Tool Registry 和 Mock EDA 状态。
 
 ## 12. 进程启动与组件初始化顺序
 
@@ -262,7 +289,7 @@ sequenceDiagram
     API-->>U: application ready
 ```
 
-如果 SQLite Schema 初始化失败，应用导入会失败；如果 Verilator 不存在，应用仍可启动，因为可执行文件检查发生在诊断或运行 Tool 时。模型设置也不会在启动时发出外部请求。
+如果 SQLite Schema 初始化失败，应用导入会失败。当前 EDA 路径不检查任何外部可执行文件，因此开发机不需要安装 Verilator。模型设置也不会在启动时发出外部请求。
 
 ### 12.2 前端启动阶段
 
@@ -311,21 +338,22 @@ flowchart TD
     DOCX --> Empty
     Empty -->|是| Reject
     Empty -->|否| Infer[根据独立文件名 Token 推断 FS/AS/ICD]
-    Infer --> Browser[前端保存文本并允许修正类型/版本]
+    Infer --> Store[后端创建文档版本与检索分块]
 ```
 
-后端当前不保存原始二进制文件。前端发起 Chat/DS 时，把抽取后的全文、用户确认类型和版本作为 JSON 传入。因此浏览器刷新会丢失尚未形成后端 Task/Artifact 的上传上下文。
+后端保存抽取后的文档正文、文档版本和检索分块；原始二进制是否作为 Artifact 保留由上传策略决定。浏览器刷新后，前端通过会话和文档查询接口恢复可见上下文，不依赖浏览器内存保存工程历史。
 
 ## 15. 普通聊天详细流程
 
-1. 前端截取最近 20 条消息，连同项目、模块、当前问题和可选文档发送；
+1. 前端发送会话标识、项目、模块和本轮消息；
 2. ConversationService 将请求统一交给 OrchestratorService；
-3. Runtime 形成 TaskIntent，Planner 从完整 Tool Schema 中选择下一步；
-4. 普通问答选择 `reply_to_user`，不校验 AS，也不创建 DS Task；
-5. Chat Tool 接收历史、项目、模块和文档上下文并形成 Observation；
-6. Run 以 `run_type=chat` 完成，返回 `ChatResponse`，其中 `route=orchestrated`、`task=null`。
+3. ContextBuilder 检索会话摘要、近期消息、长期记忆和相关文档 Chunk，并形成 Context Manifest；
+4. Runtime 形成 TaskIntent，Tool Selector 从角色已授权的 Tool 元数据中选择候选，Planner 只接收候选 Schema；
+5. 普通问答选择 `reply_to_user`，不校验 AS，也不创建 DS Task；
+6. Chat Tool 接收受预算控制的上下文并形成 Observation；
+7. Run 以 `run_type=chat` 完成，返回 `ChatResponse`，其中 `route=orchestrated`、`task=null`。
 
-聊天历史目前只由浏览器提交，后端没有 Conversation 表。`session_id` 用于响应关联，但尚未形成可恢复的服务端会话。
+聊天正文和会话元数据保存在后端。前端进入会话时分页读取历史消息，并查询 active Run 恢复任务状态；早期消息由确定性摘要压缩，原文仍保留在存储层。
 
 ## 16. DS 工作流逐节点说明
 
@@ -426,7 +454,7 @@ stateDiagram-v2
     patch_ready --> applied: approve + before unchanged
     patch_ready --> rejected: reject
     patch_ready --> custom_requested: custom
-    custom_requested --> custom_requested: 当前版本仅保存状态
+    custom_requested --> custom_requested: 保存用户自定义处理原则
     patch_ready --> patch_ready: approve 发生冲突并返回 409
     applied --> [*]
     rejected --> [*]
@@ -467,7 +495,7 @@ stateDiagram-v2
     parsing --> failed: other nonzero exit
 ```
 
-枚举还定义 `preparing`、`collecting`、`cancelled`，但当前执行器尚未使用这些中间状态，也没有取消端点。文档和前端不应把预留枚举描述成已实现能力。
+枚举同时定义 `preparing`、`collecting`、`cancelled`，供具备准备、结果收集和取消能力的外部 Adapter 使用；本地执行器只进入与实际动作对应的状态。
 
 ### 20.1 创建阶段
 
@@ -487,7 +515,10 @@ stateDiagram-v2
 
 Service 把状态改为 parsing，保存最大约一百万字符的 stdout/stderr，并把日志写到 Workspace。随后解析标准化 Issue，最后根据 exit_code 写终态。
 
-## 21. Verilator Lint 参数与结果
+## 21. 保留但默认禁用的 Verilator Adapter
+
+以下是工程环境接入外部工具时使用的 Adapter 契约。默认配置中 `verilator_lint.enabled=false`，
+聊天不会选择它，直接 ToolRun 接口也会拒绝执行；日常测试应使用 `run_mock_eda`。
 
 请求示例：
 
@@ -543,7 +574,7 @@ Service 把状态改为 parsing，保存最大约一百万字符的 stdout/stder
 | LATCH | 组合分支未完整赋值 | 8 |
 | 其他 | 需结合源码和 DS 判断 | 6 |
 
-这些是建议，不是最终根因。真实 Agent 分析尚未在 ToolRun 后自动调用。
+这些是确定性解析建议，不是最终根因。需要语义分析时，主 Agent 通过日志分析 Tool 读取原始证据并给出带置信度的判断。
 
 ### 22.3 队列推进
 
@@ -659,9 +690,9 @@ stateDiagram-v2
 - Provider JSON 测试通过 Mock 单独验证格式修复；
 - Phase 2 测试使用真实临时 SQLite 或受控全局 Workspace 验证路径和审批不变量。
 
-前端通过 `tsc -b && vite build` 验证类型和生产打包。当前页面检查是人工/Computer Use 验收，尚未建立 Playwright 自动回归套件。
+前端通过 `tsc -b && vite build` 验证类型和生产打包。页面交互采用人工验收；自动化测试覆盖后端契约与前端编译边界。
 
-## 29. 当前恢复语义总结
+## 29. 恢复语义总结
 
 | 对象 | 可查询 | 可继续 | 精确恢复 |
 |---|---:|---:|---:|
@@ -673,4 +704,4 @@ stateDiagram-v2
 | Patch Ready | 是 | 可批准/拒绝 | 是，但依赖目标未变化 |
 | 已应用 Patch | 是 | 不自动回滚 | 历史保留 |
 
-“可查询”“可继续”和“精确恢复”是三个不同能力。当前 v0.4 完成了专业对象的查询和部分恢复，但仍不能描述为完整容错工作流。
+“可查询”“可继续”和“精确恢复”是三个不同能力。系统对专业对象提供持久化查询，并为等待用户的 DS、RTL 和 Tool 审批提供受控恢复；未纳入恢复协议的外部进程不能宣称精确接管。

@@ -1,10 +1,10 @@
-# 动态编排架构说明（v0.4）
+# 动态编排架构说明
 
-> 本文保留 v0.4 的架构演进背景。当前实现已经升级为 v0.5：Tool 先按角色过滤并由轻量 Selector 形成候选集，Design/Verification 可作为主 Agent，角色咨询已替换为持久化 Delegate。请以 [role-driven-multi-agent-v0.5.md](role-driven-multi-agent-v0.5.md) 为准。
+本文定义 ChipFlow 如何把用户的自然语言请求转换为受权限控制、可追踪的 Tool 调用链。Tool 先按角色权限过滤，再由轻量 Selector 形成候选集；Design 或 Verification 主 Agent 负责逐步决策，专家协作通过持久化 Delegate 完成。
 
-## 1. 变更目标
+## 1. 设计目标
 
-v0.4 将主交互从“Router 分类到 Chat 或固定 Workflow”改为“统一 Orchestrator 动态选择 Tool”。普通聊天也是一个只有 `reply_to_user` 的 Run；DS、RTL 和工程执行则由同一 Planner 根据上下文选择不同 Tool。
+主交互采用统一的动态 Tool 编排。普通聊天是一个只调用 `reply_to_user` 的 Run；DS、RTL 和工程执行由同一 Planner 根据上下文选择不同 Tool。
 
 核心原则：
 
@@ -78,7 +78,7 @@ Provider 将两种协议统一为：
 
 离线测试使用 `DeterministicAgentRuntime`，它遵守同样的 `enrich_intent()` 和 `select_tool()` 契约，不消耗真实 API 配额。
 
-## 5. 当前 Tool Catalog
+## 5. Tool Catalog
 
 ### 编排 Tool
 
@@ -91,7 +91,7 @@ Provider 将两种协议统一为：
 | `consult_verification_agent` | 可验证性和边界分析 | Observation |
 | `create_ds_candidate` | 生成 DS 候选并执行多角色评审 | DS Task |
 | `create_rtl_candidate` | 生成 RTL Candidate 与 Diff | Candidate Patch |
-| `report_capability_gap` | 报告尚未接入的工具适配器 | Run 等待用户 |
+| `report_capability_gap` | 报告部署环境中不可用的工具适配器 | Run 等待用户 |
 
 ### 工程 Tool
 
@@ -119,7 +119,7 @@ Tool 定义包含 `when_to_use`、`when_not_to_use`、输入/输出 Schema、前
 
 角色咨询 Tool 返回 Observation，Observation 会回灌给 Planner。DS、RTL 和 EDA 能力不再由前置 route 决定，而是 Tool 被选择后才设置专业 `RunType`，以兼容现有 UI、审批和恢复逻辑。
 
-当前 DS Handler 内部仍复用已验证的 LangGraph DS 实现。这是迁移适配层，不再是主入口的固定路由。后续可逐步把 DS 节点拆为更细 Tool，并把推荐顺序放入 DS Skill。
+DS Handler 使用 LangGraph 表达并行分析、条件分支和人工暂停；统一编排把整个专业子流程作为中粒度 Tool 调用。这样既保留动态主链，也让专业流程拥有清晰边界。
 
 ## 7. Tool 与 Skill 的边界
 
@@ -128,7 +128,7 @@ Tool 定义包含 `when_to_use`、`when_not_to_use`、输入/输出 Schema、前
 - Role Agent 表示真实生产职责和判断视角；
 - Policy 表示模型不能绕过的系统规则。
 
-例如“完成 DS”由 DS Skill 指导，Orchestrator 可调用架构、设计、验证、生成和评审 Tool；它不应长期保持为一个不可调整的硬编码流程。现阶段 `create_ds_candidate` 是兼容性较强的中粒度 Tool。
+例如“完成 DS”由 DS Skill 给出方法和检查表，Orchestrator 调用架构、设计、验证、生成和评审能力；`create_ds_candidate` 负责封装需要整体一致性的 DS 专业子流程。
 
 ## 8. 不交给模型决定的规则
 
@@ -139,7 +139,7 @@ Tool 定义包含 `when_to_use`、`when_not_to_use`、输入/输出 Schema、前
 - Tool 只能访问指定 Workspace；
 - 未注册 Tool 不得执行；
 - 每个 Run 最多六个 Planner Step；
-- 仿真、CDC、综合和 STA 未接入时必须报告能力缺口；
+- 外部工程 Adapter 不可用时必须返回明确的部署配置说明，不能伪造执行结果；
 - 用户始终决定是否进入下一研发阶段。
 
 ## 9. 主要代码位置
@@ -155,11 +155,11 @@ Tool 定义包含 `when_to_use`、`when_not_to_use`、输入/输出 Schema、前
 | `app/services/run_service.py` | Run 状态、审批、专业对象关联和持久化 |
 | `app/domain/models.py` | TaskIntent、ToolSelection、Tool Definition 契约 |
 
-## 10. 当前边界
+## 10. 执行边界
 
-- 当前一次只选择并执行一个 Tool，再依据 Observation 重新规划，尚未生成可视化 Run DAG；
-- v0.4 当时把完整 Catalog 提供给 Planner；v0.5 已实现按角色权限过滤和 Metadata-only Tool Selector；
-- DS 内部仍有兼容 LangGraph；
-- v0.4 当时角色 Agent 共享同一模型配置；v0.5 已允许 Selector 单独配置模型名称；
-- `ask_user` 后的通用重新规划恢复尚未完成，目前专业 DS/RTL/Tool 审批恢复沿用 RunService；
-- 尚未实现 Sim、CDC、综合和 STA 的真实 Adapter。
+- Planner 一次选择并执行一个 Tool，再依据 Observation 重新规划；RunEvent 保存每一步因果关系；
+- Tool Catalog 先按角色权限和启用状态过滤，Metadata-only Selector 再选择有限候选；
+- DS 使用 LangGraph 专业子流程，其他动作使用 Service 或 Tool Adapter；
+- 主 Agent 共享有效 Provider，Selector 可单独指定模型；
+- DS、RTL 和 Tool 审批的暂停与恢复由 RunService 管理；
+- 本地仿真配置使用 `run_mock_eda`，工程部署通过 Adapter 契约接入 Sim、CDC、综合和 STA。

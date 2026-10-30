@@ -39,6 +39,15 @@ from app.domain.models import (
     WorkspaceView,
     ConversationRoleUpdate,
     ConversationView,
+    ConversationMessagesPage,
+    ContextManifestView,
+    DocumentIngestRequest,
+    StoredDocumentView,
+    RetrievalRequest,
+    RetrievalResult,
+    MemoryCreateRequest,
+    MemoryPromoteRequest,
+    MemoryView,
     DelegationResult,
 )
 from app.domain.enums import AgentRole
@@ -53,6 +62,9 @@ from app.services.tool_run_service import tool_run_service
 from app.services.workspace_service import artifact_service, workspace_service
 from app.services.session_service import session_service
 from app.services.delegation_service import delegation_service
+from app.services.document_service import document_service
+from app.services.memory_service import memory_service
+from app.services.context_builder_service import context_builder_service
 from app.tools.registry import tool_registry
 
 
@@ -65,7 +77,7 @@ router = APIRouter()
 @router.get("/health")
 async def health() -> dict[str, str]:
     """最轻量存活检查，不访问模型或 EDA 工具。"""
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 @router.get("/diagnostics", response_model=DiagnosticReport)
@@ -116,6 +128,25 @@ async def extract_uploaded_document(file: UploadFile = File(...)) -> ExtractedDo
         await file.close()
 
 
+@router.post("/documents", response_model=StoredDocumentView, status_code=status.HTTP_201_CREATED)
+async def ingest_document(request: DocumentIngestRequest) -> StoredDocumentView:
+    """版本化保存并分块文档；相同内容重复提交会返回已有版本。"""
+    return document_service.ingest(request)
+
+
+@router.get("/documents", response_model=list[StoredDocumentView])
+async def list_documents(
+    project_id: str = Query(min_length=1), module_name: str | None = Query(default=None)
+) -> list[StoredDocumentView]:
+    return document_service.list(project_id, module_name)
+
+
+@router.post("/retrieval/search", response_model=RetrievalResult)
+async def search_documents(request: RetrievalRequest) -> RetrievalResult:
+    """调试混合检索结果；正式聊天由 ContextBuilder 自动调用。"""
+    return document_service.retrieve(request)
+
+
 # ---------------------------------------------------------------------------
 # 统一对话、会话角色、Run 和 Delegate
 # ---------------------------------------------------------------------------
@@ -141,6 +172,29 @@ async def send_conversation_message(session_id: str, request: ChatRequest) -> Ch
         if str(exc) == "Conversation belongs to a different project":
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
+
+
+@router.get("/conversations", response_model=list[ConversationView])
+async def list_conversations(
+    project_id: str | None = Query(default=None),
+) -> list[ConversationView]:
+    """前端启动时加载会话索引；消息正文通过分页接口按需恢复。"""
+    return session_service.list(project_id)
+
+
+@router.get(
+    "/conversations/{session_id}/messages",
+    response_model=ConversationMessagesPage,
+)
+async def get_conversation_messages(
+    session_id: str,
+    before: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> ConversationMessagesPage:
+    try:
+        return session_service.messages(session_id, before=before, limit=limit)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Conversation not found") from exc
 
 
 @router.get("/conversations/{session_id}", response_model=ConversationView)
@@ -180,6 +234,45 @@ async def get_run_events(run_id: str) -> list[RunEventView]:
     return run.events
 
 
+@router.get("/runs/{run_id}/contexts", response_model=list[ContextManifestView])
+async def get_run_contexts(run_id: str) -> list[ContextManifestView]:
+    """查看一次 Run 实际使用的上下文来源，便于解释遗漏或错误引用。"""
+    if run_service.get(run_id) is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return context_builder_service.list_for_run(run_id)
+
+
+@router.get("/contexts/{context_id}", response_model=ContextManifestView)
+async def get_context_manifest(context_id: str) -> ContextManifestView:
+    manifest = context_builder_service.get_manifest(context_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Context manifest not found")
+    return manifest
+
+
+@router.post("/memories", response_model=MemoryView, status_code=status.HTTP_201_CREATED)
+async def create_memory(request: MemoryCreateRequest) -> MemoryView:
+    """显式形成候选/正式记忆；普通 Agent 回复不会自动成为长期事实。"""
+    return memory_service.create(request)
+
+
+@router.get("/memories", response_model=list[MemoryView])
+async def list_memories(
+    project_id: str = Query(min_length=1),
+    module_name: str | None = Query(default=None),
+    memory_status: str | None = Query(default=None, alias="status"),
+) -> list[MemoryView]:
+    return memory_service.list(project_id, module_name, memory_status)
+
+
+@router.post("/memories/{memory_id}/promote", response_model=MemoryView)
+async def promote_memory(memory_id: str, request: MemoryPromoteRequest) -> MemoryView:
+    try:
+        return memory_service.promote(memory_id, request)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Memory not found") from exc
+
+
 @router.get("/runs/{run_id}/delegations", response_model=list[DelegationResult])
 async def get_run_delegations(run_id: str) -> list[DelegationResult]:
     """查询一个 Run 下全部专家任务，便于 UI 或调试工具展示协作证据。"""
@@ -191,7 +284,44 @@ async def get_run_delegations(run_id: str) -> list[DelegationResult]:
 @router.post("/runs/{run_id}/resume", response_model=RunView)
 async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
     try:
-        return await run_service.resume(run_id, request)
+        existing = run_service.get(run_id)
+        if existing is None:
+            raise KeyError(run_id)
+        updated = await run_service.resume(run_id, request)
+        # Run 决策也是对话的一部分。若只由前端临时追加，页面刷新后“真实架构结论”
+        # 和审批动作会消失，导致审计历史不完整。
+        user_text = request.content.strip() or {
+            "accept_assumption": "允许按临时假设继续",
+            "ignore": "忽略当前建议",
+            "approve": "批准候选修改",
+            "reject": "拒绝候选修改",
+            "custom": "采用自定义修改方式",
+            "cancel": "取消当前任务",
+        }.get(request.action, request.action)
+        agent_role = existing.primary_agent.value if existing.primary_agent else None
+        session_service.add_message(
+            existing.session_id,
+            "user",
+            user_text,
+            agent_role=agent_role,
+            message_type="run_decision",
+            run_id=run_id,
+            metadata={"action": request.action, "evidence_reference": request.evidence_reference},
+        )
+        assistant_text = (
+            str(updated.pending_user_request.get("message"))
+            if updated.pending_user_request and updated.pending_user_request.get("message")
+            else f"Run 已处理用户操作“{request.action}”，当前状态：{updated.status.value}。"
+        )
+        session_service.add_message(
+            existing.session_id,
+            "assistant",
+            assistant_text,
+            agent_role=agent_role,
+            message_type="run_status",
+            run_id=run_id,
+        )
+        return updated
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Run not found") from exc
     except ValueError as exc:

@@ -1,5 +1,4 @@
 import os
-import shutil
 from datetime import datetime, timezone
 
 from app.config.model_settings import (
@@ -156,14 +155,16 @@ class DiagnosticsService:
                 action=None if tool_names else "检查 app/tools/builtin.py 的注册过程。",
             )
         )
-        verilator = shutil.which("verilator")
         checks.append(
             DiagnosticCheck(
                 check_id="verilator",
-                label="Verilator Lint 环境",
-                status="pass" if verilator else "warning",
-                detail=f"可执行文件：{verilator}" if verilator else "当前 PATH 中未发现 Verilator。",
-                action=None if verilator else "安装 Verilator 并重启后端；未安装时系统会返回明确的环境 Issue。",
+                label="EDA 占位执行环境",
+                status="pass",
+                detail=(
+                    "当前编译、仿真、Lint、CDC、综合和 STA 使用 run_mock_eda；"
+                    "不要求安装 Verilator 或商业 EDA 工具。"
+                ),
+                action=None,
             )
         )
 
@@ -172,7 +173,7 @@ class DiagnosticsService:
         return DiagnosticReport(
             status=overall,
             generated_at=datetime.now(timezone.utc).isoformat(),
-            version="0.5.0",
+            version="0.6.0",
             checks=checks,
         )
 

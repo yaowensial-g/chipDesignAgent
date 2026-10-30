@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 
 import pytest
@@ -88,7 +87,7 @@ def test_rtl_candidate_is_a_patch_not_a_direct_write() -> None:
     assert not (Path(payload["workspace"]["root_path"]) / "rtl" / "scheduler.sv").exists()
 
 
-def test_tool_requires_approval_and_reports_environment_issue() -> None:
+def test_real_verilator_tool_is_disabled_in_mock_environment() -> None:
     workspace = client.post(
         "/api/v1/workspaces", json={"project_id": "phase2-tool-test"}
     ).json()
@@ -99,21 +98,11 @@ def test_tool_requires_approval_and_reports_environment_issue() -> None:
         "arguments": {"files": ["rtl/missing.sv"]},
         "user_approved": False,
     }
-    assert client.post("/api/v1/tool-runs", json=body).status_code == 403
+    disabled = client.post("/api/v1/tool-runs", json=body)
+    assert disabled.status_code == 422
+    assert "disabled" in disabled.json()["detail"]
     body["user_approved"] = True
-    started = client.post("/api/v1/tool-runs", json=body)
-    assert started.status_code == 202
-    run_id = started.json()["run_id"]
-    run = started.json()
-    for _ in range(50):
-        run = client.get(f"/api/v1/tool-runs/{run_id}").json()
-        if run["status"] in {"completed", "failed"}:
-            break
-        time.sleep(0.02)
-    assert run["status"] == "failed"
-    issue = client.get(f"/api/v1/tool-runs/{run_id}/issues/next").json()
-    assert issue["status"] == "awaiting_user"
-    assert issue["code"] in {"TOOL_ENVIRONMENT", "TOOL_ARGUMENT"}
+    assert client.post("/api/v1/tool-runs", json=body).status_code == 422
 
 
 def test_verilator_log_parser_deduplicates_findings() -> None:

@@ -2,9 +2,11 @@
 
 完整技术文档入口：[docs/README.md](docs/README.md)，包含总体架构、代码结构、运行逻辑及组件与接口说明。
 
-当前代码已升级到 v0.5，产品基线见 [PRD_v0.2.md](PRD_v0.2.md)。主交互采用“工作角色决定主 Agent + Delegate 专家协作 + 两阶段动态 Tool 选择”：
+产品需求见 [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md)，技术文档见 [docs/README.md](docs/README.md)。主交互采用“后端会话与 RAG 上下文 + 工作角色决定主 Agent + Delegate 专家协作 + 两阶段动态 Tool 选择”：
 
 - FastAPI 服务；
+- 后端聊天持久化、历史会话恢复、版本化文档与混合 RAG；
+- 有来源的长期记忆、文档换版失效和 Context Manifest；
 - LangGraph DS 工作流；
 - 架构、设计、验证三角色分析；
 - 两轮规格冲突讨论；
@@ -33,11 +35,11 @@
 - 带角色权限、修改等级和审批策略的 Tool Registry；
 - 异步 ToolRun、原始日志落盘、统一 Issue 和指纹去重；
 - 一次一个 Active Issue，以及“按建议/跳过/自定义/解释”决策；
-- Verilator Lint 真实适配器和已有验证用例发现 Tool；
+- `run_mock_eda` 占位 Tool 覆盖编译、Sim、Lint、CDC、综合和 STA，并明确标记非真实执行；
 - 工程工作台网页：RTL Diff Review、Lint 执行和逐条 Issue 处理；
-- 自检覆盖 SQLite、Tool Registry 与 Verilator 环境。
+- 自检覆盖 SQLite、Tool Registry、模型环境与 Mock EDA 状态。
 
-当前版本已经具备真实模型调用能力；未配置或未启用模型时自动使用确定性模拟运行时。当前真实 EDA 适配器为 Verilator Lint；商业 Sim、CDC、综合、STA、生产问题单系统以及自动最小复验仍需要按目标工具和项目环境继续接入。系统不会把“工具未安装”伪装成执行成功。
+系统支持真实模型调用；未配置或未启用模型时使用确定性运行时。默认 EDA 配置通过 `run_mock_eda` 为编译、Sim、Lint、CDC、综合和 STA 返回带 `[MOCK EDA]` 标识的非真实执行结果，不启动外部进程，也不得作为工程检查或 Sign-off 证据。工程部署按照 Tool Adapter 契约接入项目使用的 EDA 工具、问题单系统和复验策略。
 
 ## Windows 环境启动
 
@@ -115,7 +117,7 @@ $env:CHIP_AGENT_MODEL_ENABLED = "true"
 - 健康检查：http://127.0.0.1:8000/api/v1/health
 - 系统自检：http://127.0.0.1:8000/api/v1/diagnostics
 
-页面右上角提供“系统自检”。它检查后端、默认配置、本地设置、DPAPI 密钥可读性、模型运行状态、数据目录、SQLite、Tool Registry 和 Verilator 环境，不会连接外部模型或产生 API 费用。发生错误时，对话区错误条也可以直接打开自检面板。
+页面右上角提供“系统自检”。它检查后端、默认配置、本地设置、DPAPI 密钥可读性、模型运行状态、数据目录、SQLite、Tool Registry 和 Mock EDA 状态，不会连接外部模型或产生 API 费用。发生错误时，对话区错误条也可以直接打开自检面板。
 
 ## 运行测试
 

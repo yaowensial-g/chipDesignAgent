@@ -96,6 +96,37 @@ export interface ChatMessage {
   route?: WorkflowRoute;
 }
 
+export interface ConversationView {
+  session_id: string;
+  project_id: string;
+  module_name: string;
+  title: string;
+  user_role: "design_engineer" | "verification_engineer";
+  primary_agent: "design" | "verification";
+  last_message_preview: string;
+  message_count: number;
+  active_run_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationMessage {
+  message_id: string;
+  session_id: string;
+  sequence: number;
+  role: "user" | "assistant" | "system";
+  agent_role: string | null;
+  content: string;
+  message_type: string;
+  run_id: string | null;
+  created_at: string;
+}
+
+export interface ConversationMessagesPage {
+  items: ConversationMessage[];
+  next_before: number | null;
+}
+
 export interface ModelSettings {
   enabled: boolean;
   provider: string;

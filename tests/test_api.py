@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from uuid import uuid4
 
 from app.config.model_settings import model_settings_service
 from app.config.secret_protection import SecretProtectionError
@@ -275,7 +276,8 @@ def test_chat_without_documents_asks_for_upload() -> None:
     response = client.post(
         "/api/v1/chat",
         json={
-            "project_id": "demo-project",
+            # v0.6 会复用同项目已入库文档，因此这里使用隔离项目来验证真正的空知识库。
+            "project_id": f"empty-project-{uuid4()}",
             "module_name": "dma_ctrl",
             "message": "帮我生成 DS",
             "documents": [],

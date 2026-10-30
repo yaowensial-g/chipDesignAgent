@@ -26,6 +26,7 @@ class RunType(str, Enum):
     CHAT = "chat"
     DS_DESIGN = "ds_design"
     RTL_IMPLEMENTATION = "rtl_implementation"
+    COMPILATION = "compilation"
     SIMULATION = "simulation"
     LINT = "lint"
     CDC = "cdc"

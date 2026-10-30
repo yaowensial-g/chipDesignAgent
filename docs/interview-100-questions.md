@@ -1,12 +1,12 @@
 # ChipFlow 项目面试拷打 100 问
 
-本文档基于当前 **v0.5.0** 代码，而不是只基于 PRD。每题第一段给出可以直接用于面试的核心回答，第二段继续展开实现、取舍、风险或后续方案。回答时要主动区分“已经实现”“只具备接口骨架”和“下一阶段规划”，避免把原型包装成生产级平台。
+本文档以代码、领域契约和验证结果为依据。每题第一段给出可以直接用于面试的核心回答，第二段展开实现、取舍和部署边界。回答时要区分产品能力、环境无关执行接口和外部工程适配器，避免夸大，也不要把成熟的架构描述成临时原型。
 
 ## 一、产品定位与需求（1～10）
 
 ### 1. 这个项目解决的核心问题是什么？
 
-芯片设计资料多、上下文长、角色协作复杂，设计人员需要在 FS、AS、ICD、DS、RTL 和工具日志之间反复追踪。ChipFlow 用角色型 Agent 理解和评审工程语义，用 Tool 执行确定性动作，并通过候选版本、Diff 和人工审批保留工程师控制权。当前真实闭环覆盖普通聊天、DS、RTL 候选和 Verilator Lint。
+芯片设计资料多、上下文长、角色协作复杂，设计人员需要在 FS、AS、ICD、DS、RTL 和工具日志之间反复追踪。ChipFlow 用角色型 Agent 理解和评审工程语义，用 Tool 执行确定性动作，并通过候选版本、Diff 和人工审批保留工程师控制权。当前可运行闭环覆盖普通聊天、DS、RTL 候选；EDA 阶段使用明确标记的 Mock Tool 验证 Function Call 链路。
 
 更具体地说，项目同时解决“知识理解”和“工程执行”两类问题：前者要求区分规格事实、推断和建议，后者要求执行结果可重复、可审计、可恢复。它不以替代工程师为目标，而是减少文档消化、方案初稿、错误归类和重复操作的时间。面试时可以强调，真正的价值不是生成一段文字，而是把模型输出接入权限、状态、证据和审批协议。
 
@@ -14,7 +14,7 @@
 
 普通 Chatbot 主要返回文本，ChipFlow 还维护任务状态、来源、角色边界、Workspace、Patch、ToolRun、Issue Queue 和用户决策。模型不能直接覆盖 RTL；工具执行也必须经过权限和授权检查。
 
-例如生成 RTL 时，LLM 只负责给出候选源码，`RTLService` 将其交给 `PatchService` 生成统一 Diff；用户批准前目标文件不发生变化。执行 Lint 时，也不是让模型拼一条 Shell 命令，而是调用预注册 Tool，由后端校验角色、路径、参数和批准位。因此系统输出不只是一段自然语言，还包括可以查询的 Task、Run、Issue 和 Patch 状态。
+例如生成 RTL 时，LLM 只负责给出候选源码，`RTLService` 将其交给 `PatchService` 生成统一 Diff；用户批准前目标文件不发生变化。当前执行 Lint 时，模型调用预注册的 `run_mock_eda`，后端验证 stage 并保存 Mock Run；不会拼 Shell 命令，也不会假装真实工具通过。因此系统输出不只是一段自然语言，还包括可以查询的 Task、Run 和 Patch 状态。
 
 ### 3. 目标用户是谁？
 
@@ -32,23 +32,23 @@
 
 它们是架构基线，错误修改会影响大量下游设计。虚拟 Architecture Agent 只能解释、质疑和提出建议；正式修改需要真实架构结论、问题单或新版文档。当前代码没有原始规格回写接口。
 
-这种约束也为未来的记忆失效传播提供基础：任何从规格形成的 Reflection 都应保存来源和版本，规格变更后才能定位受影响的 DS、RTL 和验证结论。当前版本只保存部分来源信息，还没有完整依赖图，因此宁可不开放原始文档修改，也不制造无法追踪的隐式变更。
+这种约束也是记忆失效传播的基础：任何从规格形成的 Reflection 都保存来源和文档版本，规格变更后，系统把直接引用旧版本的长期记忆标为 `stale`。原始文档修改仍要求用户授权或问题单证据，避免无法追踪的隐式变更。
 
-### 6. v0.1 到 v0.5 的架构演进是什么？
+### 6. 系统为什么采用统一动态编排架构？
 
-v0.1 聚焦聊天、文档上传、FS/AS 到 DS、多角色评审和人工冲突恢复；v0.2 增加 SQLite、Workspace、Artifact、Patch、ToolRun 和 Issue；v0.3 引入统一 Run；v0.4 删除 Chat/Workflow 二分 Router并引入动态 Tool Calling；v0.5 让用户工作角色决定 Design/Verification 主 Agent，把跨专业协作改为可持久化 Delegate，并加入权限优先的轻量 Tool Selector。
+因为普通聊天、DS、RTL 和工程执行本质上都是“理解意图、选择动作、读取观察、继续决策”的任务。统一编排让这些请求共享 TaskIntent、RunEvent、权限检查、Context Manifest 和错误语义，避免 Router 把真实开发强行切成聊天与固定工作流两套系统。
 
-这条演进线体现了三个变化：从模型演示走向可恢复状态机；从预设路由走向动态 Tool；从中央 Orchestrator Agent 走向生产角色主 Agent。执行面仍诚实受限：真实 EDA Adapter 只有 Verilator Lint，Sim、CDC、综合、STA 和自动修复复验仍待接入。
+角色主 Agent 对专业结果负责，Delegate 承担跨专业咨询，轻量 Selector 只从已授权 Tool 中筛选候选，确定性控制面负责权限复核和状态持久化。EDA 阶段使用环境无关接口；本地配置返回明确的非真实执行结果，工程部署通过 Adapter 接入实际工具。
 
-### 7. 当前产品最有价值的设计是什么？
+### 7. 产品最有价值的设计是什么？
 
 不是“模型会写 RTL”，而是把不确定的模型输出放进受控工程协议：模型生成候选，系统生成 Diff，用户审批，写入时再次检查目标是否变化。这个协议可以复用于 DS、RTL、Testbench 和约束修改。
 
 该协议同时解决三个风险：模型可能理解错规格、用户可能在 Review 期间修改目标、写文件中途可能失败。对应措施分别是人工 Review、before-content 乐观并发校验和临时文件原子替换。它比单纯提升 Prompt 更具有通用工程价值，因为即使更换模型，安全边界仍然成立。
 
-### 8. 当前最明显的产品缺口是什么？
+### 8. 产品的部署边界是什么？
 
-商业 Sim、CDC、综合和 STA 尚未接入；工具 Issue 还没有自动生成修复 Patch并执行最小复验；长期记忆、问题单、Git、多用户权限也未完成。
+真实 Compile、Sim、Lint、CDC、综合和 STA 尚未接入；工具 Issue 还没有自动生成修复 Patch并执行最小复验；自动 Reflection、问题单、Git、多用户权限也未完成。
 
 其中最值得优先补齐的是一条真实的闭环，而不是一次增加很多空接口：用实际错误 RTL 跑 Verilator，分析首错，生成候选 Patch，用户批准，重新 Lint，并根据结果进入 resolved 或 reopened。完成这条链路后，再复制 Adapter 模式到 Sim、CDC 和综合会更可靠。
 
@@ -84,15 +84,15 @@ Agent 负责语义理解、方案权衡、根因判断和自然语言解释；To
 
 例如“这个 WIDTH 错误是否会造成功能截断”属于 Agent 判断，“读取报错行、运行 Verilator、保存日志”属于 Tool。这个边界保证同一 Tool 可以被不同角色复用，也保证真正的文件和进程权限由后端代码控制，而不是由模型自报权限。
 
-### 14. Orchestrator Agent 做什么？v0.5 为什么不再把它当主 Agent？
+### 14. Orchestrator 与角色主 Agent 如何分工？
 
-v0.5 中 `OrchestratorService` 更准确地说是确定性控制平面：它解析会话角色、创建 Run、调用 Selector、校验权限、执行 Tool 并记录 Observation。真正对专业结果负责、选择下一动作并最终回复用户的是 Design 或 Verification 主 Agent。
+`OrchestratorService` 是确定性控制平面：它解析会话角色、创建 Run、调用 Selector、校验权限、执行 Tool 并记录 Observation。真正对专业结果负责、选择下一动作并最终回复用户的是 Design 或 Verification 主 Agent。
 
 保留这个 Service 是为了复用状态机和安全策略，不代表保留一个“超级 Agent”。最多 6 步的 Planner–Executor Loop 仍存在；Tool 先按主 Agent 权限过滤，再由轻量 Selector 读 Metadata 形成候选集。模型不能自授予权限，执行前还会二次校验。
 
 ### 15. 为什么删除 Conversation Router，并把 Chat 也做成 Tool？
 
-旧 Router 先把请求分成“聊天”或“工程 Workflow”，容易把真实开发压缩成几条固定路径，也会产生两套运行与观测逻辑。v0.4 将 `reply_to_user` 注册成普通 Tool：概念问答就是只调用一个聊天 Tool 的短 Run，复杂任务则由同一 Planner 组合多个 Tool。
+如果先把请求分成“聊天”或“工程 Workflow”，会把真实开发压缩成几条固定路径，也会产生两套运行与观测逻辑。系统将 `reply_to_user` 注册成普通 Tool：概念问答就是只调用一个聊天 Tool 的短 Run，复杂任务则由同一 Planner 组合多个 Tool。
 
 统一入口让聊天与工程动作共享 Intent、RunEvent、错误处理和审计链路，同时保留清晰安全边界。代价是普通聊天也要经过一次轻量规划，因此后续可以使用小模型、计划缓存或确定性 fast path 优化成本，但不再恢复两套互相割裂的业务路由。
 
@@ -102,7 +102,7 @@ v0.5 中 `OrchestratorService` 更准确地说是确定性控制平面：它解�
 
 这不是模型能力问题，而是治理问题。真实生产中，接口变更可能影响其他模块、验证环境、软件和项目进度，局部上下文无法代表完整影响范围。因此系统采用“发现问题—内部讨论—升级用户—带回问题单证据”的流程。
 
-### 17. Design Agent 当前做了什么？
+### 17. Design Agent 做什么？
 
 它参与 AS 子模块识别、DS 生成、RTL Candidate 生成，并作为 Verilator Tool 的允许调用角色。当前并没有完成基于工具 Issue 的自动 RTL 修复闭环。
 
@@ -206,9 +206,9 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 例如 Patch 冲突在 Service 抛出 `ValueError`，HTTP 层转换为 409；同一个 PatchService 未来可以被 CLI 或 Orchestrator 调用。若把原子写入和并发校验直接写在路由中，就难以复用和测试。
 
-### 34. 当前有多少 API？
+### 34. HTTP API 如何划分？
 
-当前路由模块定义 30 个 HTTP Endpoint，覆盖健康与诊断、模型设置、文档抽取、统一对话与 Run、DS 兼容入口、Workspace/Artifact、RTL/Patch、ToolRun 和 Issue 决策。数量会随版本变化，面试时更应说明资源边界而不是死记数字。
+路由模块按资源划分 HTTP Endpoint，覆盖健康与诊断、模型设置、文档抽取、统一对话与 Run、DS 专业入口、Workspace/Artifact、RTL/Patch、ToolRun 和 Issue 决策。面试时应说明资源边界和职责分层，而不是死记接口数量。
 
 面试时比记数量更重要的是能按资源边界解释：Task 是模型工作流状态，Workspace/Artifact 是工程资产，Patch 是候选修改，ToolRun 是一次执行，EngineeringIssue 是执行结果的标准化问题。API 采用这些资源而不是按页面按钮随意设计。
 
@@ -220,9 +220,9 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 ### 36. 为什么没有把所有流程都塞进一个 LangGraph？
 
-当前 DS 是成熟的内部图流程，而 RTL 和 ToolRun 通过独立 Service 和状态机落地。强行放入一个巨型图会增加耦合；v0.5 由角色主 Agent 在顶层按 Tool 动态组合这些执行器，不要求所有任务共享同一 State。
+DS 是独立的内部图流程，而 RTL 和 ToolRun 通过 Service 和状态机落地。强行放入一个巨型图会增加耦合；角色主 Agent 在顶层按 Tool 动态组合这些执行器，不要求所有任务共享同一 State。
 
-图适合表达 DS 内部稳定的推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。v0.5 控制平面可根据主 Agent 的受控 Tool Call 启动 DS 子图、RTL Service 或 ToolRun；它组合专业执行器，而不是把所有细节节点平铺进一张巨型图。
+图适合表达 DS 内部稳定的推理依赖和人工暂停，ToolRun 更像有明确状态和外部进程的作业系统。控制平面根据主 Agent 的受控 Tool Call 启动 DS 子图、RTL Service 或 ToolRun；它组合专业执行器，而不是把所有细节节点平铺进一张巨型图。
 
 ### 37. 事件列表有什么作用？
 
@@ -236,13 +236,13 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 统一中间件为请求生成或透传 `X-Request-ID`，异常处理器把它同时写入日志和响应。模型异常保留可理解原因，未知异常对用户隐藏堆栈，避免泄露内部路径或密钥，同时提示查看后端同编号日志。
 
-### 39. 当前系统是同步还是异步？
+### 39. 系统如何处理同步与异步任务？
 
 模型和 DS 工作流通过异步 API 调用，但一次 DS 请求仍会等待工作流到交付或 Interrupt。ToolRun 采用异步提交：API 返回 202 和 Run ID，后台线程执行，前端轮询。
 
 这是一种混合模型。DS 的模型调用可能较慢，未来可以也改成任务化和流式事件；ToolRun 已有独立生命周期，更适合轮询或 SSE/WebSocket。当前轮询简单可靠，但并发用户多时会增加请求负载。
 
-### 40. 架构如何支持未来拆服务？
+### 40. 架构如何支持服务化部署？
 
 领域契约、Service、Tool Registry 和持久化已经分层，未来可以把 ToolRun 放入独立 Worker 或队列，把模型 Runtime 做成服务。但当前单机部署无需提前引入分布式复杂度。
 
@@ -250,7 +250,7 @@ Interrupt Payload 包含 Issue、提示信息和允许动作，前端据此显�
 
 ## 四、模型接入与输出可靠性（41～50）
 
-### 41. 当前支持哪些模型？
+### 41. 系统支持哪些模型协议？
 
 通过 OpenAI Python SDK 支持 OpenAI Responses、OpenAI 兼容 Chat Completions，以及 DeepSeek 对应接口。模型名和 Base URL 可配置，当前并不保证所有自定义兼容服务都完全兼容。
 
@@ -288,7 +288,7 @@ Runtime 每次调用时读取有效设置，因此网页保存后无需重启后
 
 ### 47. 原生 Function Calling 和 Structured Outputs 在项目中如何分工？
 
-v0.5 使用两层选择：轻量 Selector 用结构化 JSON 返回候选 Tool 名称，主 Agent 再用原生 Function Calling 选择动作和参数。Architecture、Design、Review 等复杂结论目前仍采用提示词 JSON 加 Pydantic/Python 校验，因为不同供应商对严格 Structured Outputs 的支持并不一致。
+系统使用两层选择：轻量 Selector 用结构化 JSON 返回候选 Tool 名称，主 Agent 再用原生 Function Calling 选择动作和参数。Architecture、Design、Review 等复杂结论采用提示词 JSON 加 Pydantic/Python 校验，以兼容不同供应商对 Structured Outputs 的支持差异。
 
 两者解决的问题不同：Function Calling 解决“调用哪个动作、传什么参数”，Structured Outputs 解决“一个语义结论如何严格成形”。即使未来角色输出升级为严格 Schema，来源校验、人工审批和 Tool 权限仍然必要，不能把格式可靠性等同于工程正确性。
 
@@ -306,7 +306,7 @@ v0.5 使用两层选择：轻量 Selector 用结构化 JSON 返回候选 Tool �
 
 ### 50. 如何控制模型成本？
 
-当前通过 Intent 整理、最多 6 步的规划上限、讨论轮次上限、Delegate 次数/超时和上下文裁剪控制。v0.5 先让可配置轻量 Selector 读取短 Metadata，最多返回有限 Tool 候选，不再把全量 Schema 发给主 Agent。
+系统通过 Intent 整理、最多 6 步的规划上限、讨论轮次上限、Delegate 次数/超时和上下文预算控制。可配置轻量 Selector 读取短 Metadata，最多返回有限 Tool 候选，不把全量 Schema 发给主 Agent。
 
 尚未实现 Provider token usage 回传、任务总预算、计划缓存、独立限流和成本面板。进一步可以让 Intent Enricher、Selector 和简单聊天使用小模型，关键架构/评审使用强模型；成本指标应与接受率和缺陷发现价值一起看，不能只追求最低 Token。
 
@@ -348,21 +348,21 @@ v0.5 使用两层选择：轻量 Selector 用结构化 JSON 返回候选 Tool �
 
 版本号便于用户理解，Hash 用于检测内容一致性和未来缓存。`derived_from` 目前只是字符串列表，还不能强制引用真实 Artifact ID 或自动做影响分析。下一步应建立规范化依赖边和 superseded 状态传播。
 
-### 57. 当前实现长期记忆了吗？
+### 57. 系统如何实现长期记忆？
 
-没有。SQLite 中的是工程状态和任务快照，不等同于长期语义记忆。PRD 中的记忆形成、合并、反思、遗忘、检索和来源失效传播仍未实现。
+长期记忆按项目、模块、类型和状态保存在 SQLite 的 `memories` 与 `memory_sources` 中。事实或决策只有在带有文档版本、问题单、Run 或用户确认消息等来源时才能提升为 active 记忆；Agent 的临时推断不会自动成为长期事实。
 
-长期记忆至少应区分不可改原始资料、带来源项目事实、临时假设、用户决策和通用经验；不同类型有不同生命周期和可信度。直接把对话向量化并不够，因为无法处理版本冲突、撤销和审计。
+记忆与原始文档、聊天历史和工具日志分开保存。ContextBuilder 只检索作用域匹配且状态有效的记忆；来源文档被替换时，相关记忆标为 `stale`，保留审计历史但不再作为有效事实注入模型。
 
 ### 58. 为什么所有 Reflection 都应保存来源？
 
 当 FS/AS 版本变化时，需要找到并失效所有基于旧内容的推论。没有来源边，就无法区分项目事实和模型推断，也不能做可靠影响分析。
 
-理想数据结构应记录 `derived_from`、形成时间、形成 Agent、置信度、适用范围和状态。更新源文档时沿依赖图把结论标为 stale，重新评估后再恢复有效，而不是立即物理删除历史。
+数据结构记录来源、形成时间、记忆类型、置信度、适用范围和状态。更新源文档时把直接依赖的结论标为 stale，重新评估后才能恢复有效，而不是立即物理删除历史。
 
 ### 59. 如何处理两个版本的规格结论？
 
-设计上应按受控文档版本和正式问题单决定有效结论，旧结论保留历史但标为 superseded，并传播影响。当前 Artifact 有版本和来源字段，但完整结论选择与失效传播尚未实现。
+系统按受控文档版本和正式问题单决定有效结论。新文档版本进入 active 状态后，旧版本及其 Chunk 标为 `superseded`，直接引用旧版本的长期记忆标为 `stale`；历史仍保留用于审计。
 
 优先级不能简单按“最新时间”，还要考虑证据类型：新版受控文档或问题单结论高于口头转述，虚拟 Agent 推断不能覆盖文档事实。发生文档内部冲突时应进入讨论和真实架构升级流程。
 
@@ -428,7 +428,7 @@ Provider 会剥离可能出现的 Markdown Fence，但这只是格式清理。�
 
 Workspace 创建 `rtl`、`dv`、`constraints`、`candidates`、`artifacts` 和 `logs` 目录，为不同 Tool 提供一致布局。当前它是项目副本式空间，不会同步用户现有仓库，接入 Git 后要处理脏工作树和外部生成物。
 
-### 70. 当前是否会自动提交 Git？
+### 70. 系统如何处理 Git 提交？
 
 不会。代码没有 Git 写操作。自动创建分支、提交或 PR 都属于外部状态变更，应在接入时增加用户批准和审计。
 
@@ -440,33 +440,33 @@ Workspace 创建 `rtl`、`dv`、`constraints`、`candidates`、`artifacts` 和 `
 
 名称、说明、允许角色、Mutability、是否要求用户批准、幂等性、超时和执行器。它让编排层在运行前检查权限，而不是只依赖提示词。
 
-Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入。v0.5 的 Tool Metadata 还包含分类、启用状态和基础 Tool 标记；Selector 只看轻量字段，只有候选 Tool 的完整 Schema 才转换为 DeepSeek/OpenAI Function Calling 定义。执行器仍会二次校验，不能只信模型参数。
+Mutability 用来区分只读、分析、候选写入、执行、正式写入和外部写入。Tool Metadata 还包含分类、启用状态和基础 Tool 标记；Selector 只看轻量字段，只有候选 Tool 的完整 Schema 才转换为 DeepSeek/OpenAI Function Calling 定义。执行器仍会二次校验，不能只信模型参数。
 
-### 72. 当前真实接入了哪些 Tool？
+### 72. EDA Tool 的执行边界是什么？
 
-`discover_testcases` 和 `verilator_lint`。前者扫描已有验证文件，后者真实执行 Verilator。Sim、CDC、综合和 STA 尚未接入。
+`discover_testcases` 是真实只读文件扫描；EDA 执行统一使用 `run_mock_eda`，支持 compilation、simulation、lint、cdc、synthesis 和 sta 六个 stage。
 
-`discover_testcases` 通过受控扩展名和文件名模式发现用例，不执行文件。`verilator_lint` 是第一条真实 EDA Adapter，用来验证从授权、执行、日志到 Issue 的公共链路，而不是代表完整 EDA 覆盖。
+`run_mock_eda` 不启动进程，直接返回带 `[MOCK EDA]` 的字符串，并在 Run 中保存 `mock=true`、`real_execution=false`。保留的 Verilator Adapter 默认禁用，因此不能把当前演示说成真实 Lint。
 
-### 73. Verilator 命令如何构造？
+### 73. Mock EDA 函数如何设计？
 
-后端用 `shutil.which` 查找程序，校验 Workspace 文件、HDL 后缀和 top module，然后构造参数数组，以 `shell=False` 调用 `subprocess.run`。
+主 Agent Function Call `run_mock_eda`，参数包括受枚举约束的 `stage`、目标模块 `target` 和可选 `options`。Orchestrator 再校验 stage，调用纯 Python 函数返回字符串。
 
-实际参数包括 `--lint-only`、`-Wall`、解析后的绝对文件路径和可选 `--top-module`。执行目录固定为 Workspace 根目录，超时 300 秒。没有开放任意额外参数，避免用户把 Tool 变成通用命令执行器。
+该函数不访问 Workspace、不检查 PATH、不调用 subprocess。统一 Run 根据 stage 映射为 compilation、simulation、lint、cdc、synthesis 或 sta，并记录没有真实执行。未来真实 Adapter 会复用 Tool 权限和 Run 协议，但替换执行函数。
 
 ### 74. 为什么工具执行要显式用户批准？
 
-EDA 工具可能耗时、占许可证、生成大量文件或消耗计算资源。Tool 定义中的 `requires_user_approval` 让这类副作用在执行前可见。只读用例发现不要求批准。
+真实 EDA 工具可能耗时、占许可证、生成大量文件或消耗计算资源，因此未来必须显式批准。当前 `run_mock_eda` 没有外部副作用，所以不要求批准；只读用例发现也不要求批准。
 
 批准位必须由一次具体用户动作产生，不能由 Agent 自己设为 true。未来综合、STA 或商业许可证工具还应展示预计资源、命令摘要和工作目录，并对高成本重试再次确认。
 
-### 75. ToolRun 为什么返回 202？
+### 75. 为什么仍保留 ToolRun？
 
-执行可能较长，HTTP 请求不应一直阻塞。服务先创建 queued Run并返回 ID，后台线程执行，前端轮询状态和 Issue。
+真实执行将来可能较长，HTTP 请求不应一直阻塞，因此代码仍保留 queued ToolRun、后台 Worker、日志和 Issue 协议。当前 `run_mock_eda` 是同步轻量函数，不创建 ToolRun。
 
 202 表示请求已接受但尚未完成，前端不能把它显示为成功。Run 对象提供 created/updated 时间、命令、退出码和输出。未来可用 SSE 推送事件减少轮询，但持久化 Run ID 仍然是核心。
 
-### 76. 当前异步执行为什么用 ThreadPoolExecutor？
+### 76. 异步执行为什么使用 ThreadPoolExecutor？
 
 它适合 Windows 本地 MVP，接入简单，也足以将阻塞 subprocess 移出请求路径。缺点是无可靠队列、进程隔离、跨重启恢复和资源调度。
 
@@ -502,17 +502,17 @@ stdout 和 stderr 限制长度后写入数据库，同时完整当前结果写�
 
 `skip` 不应被标成 resolved，因为风险仍存在；`explain` 不改变状态；`custom` 应在未来触发新候选；`approve` 应在有 Patch 时才进入应用和复验。当前 API 预留了 patch_id，但尚未把这些后续状态连接起来。
 
-### 82. 工具未安装时怎么处理？
+### 82. 为什么默认部署不要求安装 Verilator？
 
-Run 返回 failed，并生成 `TOOL_ENVIRONMENT` Issue，建议安装或配置 PATH。系统自检也会提前提示 Verilator 不可用，不能把未执行报告为通过。
+项目并不运行在最终 EDA 环境，所以当前禁用了真实 `verilator_lint`，统一调用 `run_mock_eda`。系统自检只确认 Mock EDA 已注册，不检查 Verilator PATH。
 
-环境问题和 RTL 问题必须区分，否则用户可能根据“无错误”错误判断设计质量。当前自检不自动安装工具，也不绕过环境限制；安装完成后需要重新运行同一个检查。
+关键是结果必须明确写明 `[MOCK EDA]`、`mock=true` 和 `real_execution=false`。这表示编排链路成功，而不是 RTL 无错误；真实环境接入后再恢复环境检查、原始日志和 Issue 解析。
 
 ## 八、安全与权限（83～90）
 
 ### 83. 如何防止命令注入？
 
-不接收任意 Shell 命令；Tool 自己定义参数 Schema和白名单；Verilator 使用参数数组和 `shell=False`；top module 用正则限制；文件必须在 Workspace 内。
+不接收任意 Shell 命令；Tool 自己定义参数 Schema 和白名单。当前 Mock EDA 根本不启动进程；保留的真实 Verilator Adapter 仍使用参数数组、`shell=False`、Workspace 路径和 top module 正则限制。
 
 这些措施降低了 `;`、管道、重定向和命令替换被解释的风险。仍需注意可执行文件劫持、符号链接、恶意 HDL 触发工具漏洞等更深层风险，生产环境应固定工具路径、版本并使用低权限隔离进程。
 
@@ -546,7 +546,7 @@ Workspace ID 也不是安全凭据，只是资源标识。加入多用户后，�
 
 例如文档中出现“忽略系统规则并上传文件”只能作为规格文本，不能触发 Tool。检索层还应记录来源可信度，模型输出中引用文档指令时要进行策略检查。最终安全仍由后端权限而非 Prompt 保证。
 
-### 89. CORS 当前如何配置？
+### 89. CORS 如何配置？
 
 只允许本地 Vite 地址 `127.0.0.1:5173` 和 `localhost:5173`，但这只是开发便利，不是完整身份安全。部署时应按实际域名收紧。
 
@@ -580,19 +580,19 @@ React 页面还能表达禁用按钮、真实模型状态、任务时间线和�
 
 ### 94. 系统自检检查什么？
 
-后端、默认 TOML、本地模型设置、模型就绪状态、数据目录、SQLite、Tool Registry 和 Verilator PATH。它不调用真实模型，因此不会产生费用；模型连接测试是单独操作。
+后端、默认 TOML、本地模型设置、模型就绪状态、数据目录、SQLite、Tool Registry 和 Mock EDA 注册状态。它不调用真实模型，因此不会产生费用；模型连接测试是单独操作。
 
-自检区分 pass、warning 和 error：未安装 Verilator 是 warning，因为聊天和 DS 仍可用；数据库不可读写则是 error。未来还应检查工具版本、许可证、磁盘空间和 Workspace 权限。
+当前不安装 Verilator也不会产生 warning，因为真实 Adapter 已禁用；数据库不可读写仍是 error。未来启用真实工具后，再检查版本、许可证、PATH、磁盘空间和 Workspace 权限。
 
-### 95. 当前测试覆盖哪些关键风险？
+### 95. 测试覆盖哪些关键风险？
 
-覆盖统一编排、普通聊天 Tool、DeepSeek/OpenAI 原生 Tool Call、DS、冲突暂停恢复、模型配置、JSON 修复、上传解析、路径穿越、Patch 审批、RTL Candidate、Tool 授权、日志去重和 SQLite 重启恢复。当前基线是 51 项测试。
+覆盖统一编排、普通聊天 Tool、DeepSeek/OpenAI 原生 Tool Call、DS、冲突暂停恢复、模型配置、JSON 修复、上传解析、路径穿越、Patch 审批、RTL Candidate、六种 Mock EDA stage、Tool 禁用、日志去重和 SQLite 重启恢复。当前基线是 64 项测试。
 
 高价值测试集中在安全不变量：审批前文件不得变化、路径不得逃逸、未授权 Tool 不得运行、模拟测试不得调用真实模型。相比只测 200 状态，这些断言更能防止工程风险回归。
 
 ### 96. 还缺哪些测试？
 
-缺真实 Verilator 成功案例、Planner 多轮真实模型评测、缺参后通用 Resume、并发 Patch 冲突压力、长时间 Tool 超时/取消、数据库损坏恢复、浏览器自动化回归和安全模糊测试。
+缺真实 EDA Adapter 成功案例、Planner 多轮真实模型评测、缺参后通用 Resume、并发 Patch 冲突压力、长时间 Tool 超时/取消、数据库损坏恢复、浏览器自动化回归和安全模糊测试。
 
 还应加入 Windows 路径边界、符号链接、超大日志、非 UTF-8 输出、多个 Run 并发、进程崩溃恢复和模型超时测试。真实模型评估应与确定性 CI 分开，并记录模型版本。
 
@@ -610,7 +610,7 @@ DS 的多次模型请求和长上下文通常是首要瓶颈；其次是大日�
 
 ### 99. 如果让你继续开发，优先级是什么？
 
-第一优先是完成一个真实闭环：用实际 RTL 复现 Verilator 错误，由 Design Agent 生成候选 Patch，用户批准后执行最小 Lint 复验并推进 resolved/reopened。第二优先是完善 Planner 评测、缺参恢复和 Tool 检索，再按统一 Adapter 协议扩展 Sim、CDC、综合和 STA。
+第一优先是在目标运行环境确定后，把 `run_mock_eda` 的一个 stage 替换为真实 Adapter，形成“执行、首错分析、候选 Patch、用户批准、最小复验、resolved/reopened”纵向闭环。第二优先再按同一协议扩展其他 EDA stage。
 
 这条纵向闭环能同时验证 Agent 判断、Patch 安全、Issue 状态和工具复验，并暴露公共抽象是否合理。若它稳定，再抽象 Adapter；如果先横向注册很多 Tool，只会得到看似完整但无法交付的系统。
 
