@@ -9,13 +9,44 @@ import json
 import re
 from typing import Any
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    OpenAI,
+    OpenAIError,
+    RateLimitError,
+)
 
 from app.config.model_settings import EffectiveModelSettings
+from app.services.token_usage_service import token_usage_tracker
 
 
 class ModelInvocationError(RuntimeError):
-    """模型连接、响应格式或 Tool 参数不满足约定时抛出的统一异常。"""
+    """可安全返回前端的模型异常。
+
+    ``code`` 让前端和日志可以区分认证、限流、超时等原因；``http_status`` 是本后端
+    对浏览器返回的状态，不直接照搬上游状态，避免把上游认证失败误解为用户没有登录
+    ChipFlow。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "MODEL_INVOCATION_FAILED",
+        http_status: int = 502,
+        suggestions: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+        self.suggestions = suggestions or [
+            "运行系统自检",
+            "检查模型名称、Base URL、API Key 和网络连接",
+        ]
 
 
 class OpenAIModelProvider:
@@ -52,6 +83,7 @@ class OpenAIModelProvider:
                 else:
                     options["max_completion_tokens"] = self.settings.max_output_tokens
                 completion = self.client.chat.completions.create(**options)
+                token_usage_tracker.record_response(completion)
                 return completion.choices[0].message.content or ""
 
             # Responses API 将 instructions 与 input 分开，并可显式禁止服务端存储。
@@ -64,9 +96,10 @@ class OpenAIModelProvider:
             if self.settings.provider == "openai":
                 options["store"] = False
             response = self.client.responses.create(**options)
+            token_usage_tracker.record_response(response)
             return response.output_text
         except Exception as exc:
-            raise ModelInvocationError(f"模型调用失败：{_safe_error(exc)}") from exc
+            raise _model_error(exc, "模型调用") from exc
 
     def generate_json(
         self,
@@ -141,6 +174,7 @@ class OpenAIModelProvider:
                 else:
                     options["max_completion_tokens"] = self.settings.max_output_tokens
                 completion = self.client.chat.completions.create(**options)
+                token_usage_tracker.record_response(completion)
                 message = completion.choices[0].message
                 if message.tool_calls:
                     # 当前 Planner 一轮只执行一个 Tool，因此只读取第一个 Tool Call。
@@ -178,6 +212,7 @@ class OpenAIModelProvider:
             if self.settings.provider == "openai":
                 options["store"] = False
             response = self.client.responses.create(**options)
+            token_usage_tracker.record_response(response)
             for item in response.output:
                 if getattr(item, "type", "") == "function_call":
                     return {
@@ -191,7 +226,7 @@ class OpenAIModelProvider:
                 "reason": "模型直接回答已归一化为 Chat Tool",
             }
         except Exception as exc:
-            raise ModelInvocationError(f"模型 Tool Calling 失败：{_safe_error(exc)}") from exc
+            raise _model_error(exc, "模型 Tool Calling") from exc
 
     def test_connection(self) -> str:
         """执行最小连接探针；成功只说明端点/Key/模型可响应。"""
@@ -208,7 +243,70 @@ class OpenAIModelProvider:
 def _safe_error(exc: Exception) -> str:
     """压缩外部异常，避免把多行响应或过长 HTML 原样返回前端。"""
     message = str(exc).replace("\n", " ").strip()
+    # 上游异常通常不会回显密钥，但这里仍做最后一道脱敏，避免兼容服务把请求头或
+    # key 片段拼进错误正文后被浏览器显示或写入日志聚合系统。
+    message = re.sub(
+        r"(?i)(authorization\s*[:=]\s*(?:bearer\s+)?)[^\s,;]+",
+        r"\1***",
+        message,
+    )
+    message = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-***", message)
     return message[:500] or exc.__class__.__name__
+
+
+def _model_error(exc: Exception, operation: str) -> ModelInvocationError:
+    """把 OpenAI SDK 异常转换成稳定、可操作且不泄露 Key 的前端错误。
+
+    DeepSeek 使用 OpenAI-compatible SDK 时也会抛出这些异常类型，因此同一映射同时
+    适用于两个 Provider。服务端日志仍通过异常链保留原始异常和 traceback。
+    """
+    if isinstance(exc, ModelInvocationError):
+        return exc
+    detail = _safe_error(exc)
+    if isinstance(exc, AuthenticationError):
+        return ModelInvocationError(
+            f"{operation}认证失败：请检查 API Key 是否正确、有效并属于当前服务商。{detail}",
+            code="MODEL_AUTHENTICATION_FAILED",
+            suggestions=["重新保存 API Key", "确认 Provider 与 API Key 所属平台一致"],
+        )
+    if isinstance(exc, RateLimitError):
+        return ModelInvocationError(
+            f"{operation}被模型服务限流或账户额度不足：{detail}",
+            code="MODEL_RATE_LIMITED",
+            http_status=429,
+            suggestions=["稍后重试", "检查账户余额、并发限制和速率限制"],
+        )
+    if isinstance(exc, APITimeoutError):
+        return ModelInvocationError(
+            f"{operation}超时：{detail}",
+            code="MODEL_TIMEOUT",
+            http_status=504,
+            suggestions=["稍后重试", "在模型设置中适当增加超时时间"],
+        )
+    if isinstance(exc, APIConnectionError):
+        return ModelInvocationError(
+            f"无法连接模型服务：{detail}",
+            code="MODEL_CONNECTION_FAILED",
+            suggestions=["检查 Base URL 和网络连接", "确认代理、防火墙或 DNS 配置"],
+        )
+    if isinstance(exc, BadRequestError):
+        return ModelInvocationError(
+            f"模型服务拒绝了请求：{detail}",
+            code="MODEL_REQUEST_REJECTED",
+            suggestions=["检查模型名称和 API 风格", "检查该模型是否支持当前 Tool/参数"],
+        )
+    if isinstance(exc, APIStatusError):
+        return ModelInvocationError(
+            f"模型服务返回异常状态：{detail}",
+            code="MODEL_UPSTREAM_FAILED",
+            suggestions=["稍后重试", "查看服务商状态页或切换可用模型"],
+        )
+    if isinstance(exc, OpenAIError):
+        return ModelInvocationError(
+            f"模型 SDK 调用失败：{detail}",
+            code="MODEL_SDK_ERROR",
+        )
+    return ModelInvocationError(f"{operation}失败：{detail}")
 
 
 def _parse_tool_arguments(value: str | dict[str, Any] | None) -> dict[str, Any]:

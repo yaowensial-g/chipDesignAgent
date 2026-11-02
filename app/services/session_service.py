@@ -21,6 +21,7 @@ from app.domain.models import (
     ConversationView,
 )
 from app.services.workspace_service import utc_now
+from app.services.token_usage_service import TokenUsage
 from app.storage.database import Database, database
 
 
@@ -176,6 +177,60 @@ class SessionService:
             (title, preview, now, session_id),
         )
         return self.get_message(message_id)  # type: ignore[return-value]
+
+    def record_token_usage(
+        self,
+        session_id: str,
+        usage: TokenUsage,
+        *,
+        run_id: str | None = None,
+    ) -> ConversationView:
+        """持久化本轮用量，并累计到会话总量。
+
+        单轮用量写入对应 assistant 消息的 metadata，便于刷新页面后恢复每条消息下方
+        的小字；会话累计值使用独立整数列，列表页和聊天页不必扫描全部历史消息。
+        """
+        payload = usage.as_dict()
+        self.db.execute(
+            """UPDATE conversations SET
+                input_tokens = input_tokens + ?,
+                output_tokens = output_tokens + ?,
+                total_tokens = total_tokens + ?,
+                model_calls = model_calls + ?,
+                updated_at = ?
+            WHERE session_id = ?""",
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.model_calls,
+                utc_now(),
+                session_id,
+            ),
+        )
+
+        if run_id:
+            row = self.db.fetch_one(
+                """SELECT message_id, metadata_json FROM conversation_messages
+                WHERE session_id = ? AND role = 'assistant' AND run_id = ?
+                ORDER BY sequence DESC LIMIT 1""",
+                (session_id, run_id),
+            )
+        else:
+            row = self.db.fetch_one(
+                """SELECT message_id, metadata_json FROM conversation_messages
+                WHERE session_id = ? AND role = 'assistant'
+                ORDER BY sequence DESC LIMIT 1""",
+                (session_id,),
+            )
+        if row:
+            metadata = self.db.loads(row.get("metadata_json"), {})
+            metadata["token_usage"] = payload
+            self.db.execute(
+                "UPDATE conversation_messages SET metadata_json = ? WHERE message_id = ?",
+                (self.db.dumps(metadata), row["message_id"]),
+            )
+        return self.get(session_id)  # type: ignore[return-value]
 
     def get_message(self, message_id: str) -> ConversationMessageView | None:
         row = self.db.fetch_one(

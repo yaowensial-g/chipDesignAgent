@@ -198,6 +198,10 @@ class ConversationView(BaseModel):
     primary_agent: AgentRole
     last_message_preview: str = ""
     message_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    model_calls: int = 0
     active_run_id: str | None = None
     created_at: str
     updated_at: str
@@ -224,6 +228,15 @@ class ConversationMessagesPage(BaseModel):
 
     items: list[ConversationMessageView]
     next_before: int | None = None
+
+
+class TokenUsageView(BaseModel):
+    """一次用户请求或整个会话的真实模型 Token 用量。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    model_calls: int = 0
 
 
 class ConversationSummaryView(BaseModel):
@@ -444,6 +457,8 @@ class ChatResponse(BaseModel):
     route_reason: str | None = None
     task: TaskView | None = None
     run: RunView | None = None
+    usage: TokenUsageView = Field(default_factory=TokenUsageView)
+    session_usage: TokenUsageView = Field(default_factory=TokenUsageView)
 
 
 class ModelSettingsUpdate(BaseModel):

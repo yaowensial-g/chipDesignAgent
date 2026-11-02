@@ -56,9 +56,9 @@ async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         message = str(exc)
         suggestions = ["使用保存该 Key 的同一 Windows 用户启动服务", "在模型设置中重新输入并保存 API Key"]
     elif isinstance(exc, ModelInvocationError):
-        code = "MODEL_INVOCATION_FAILED"
+        code = exc.code
         message = str(exc)
-        suggestions = ["运行系统自检", "检查模型名称、Base URL、API Key 和网络连接"]
+        suggestions = exc.suggestions
     elif isinstance(exc, ValueError) and "model settings" in str(exc).lower():
         code = "MODEL_CONFIG_INVALID"
         message = str(exc)
@@ -69,8 +69,9 @@ async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
         suggestions = ["运行系统自检查看具体检查项", "查看后端控制台中相同请求编号的错误日志"]
 
     logger.exception("request_id=%s code=%s path=%s", request_id, code, request.url.path)
+    status_code = exc.http_status if isinstance(exc, ModelInvocationError) else 500
     return JSONResponse(
-        status_code=500,
+        status_code=status_code,
         content={
             "error": {
                 "code": code,

@@ -53,6 +53,15 @@ export interface ChatResponse {
   route_reason: string | null;
   task: TaskView | null;
   run: RunView | null;
+  usage: TokenUsage;
+  session_usage: TokenUsage;
+}
+
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  model_calls: number;
 }
 
 export type WorkflowRoute = "orchestrated";
@@ -94,6 +103,7 @@ export interface ChatMessage {
   content: string;
   time: string;
   route?: WorkflowRoute;
+  tokenUsage?: TokenUsage;
 }
 
 export interface ConversationView {
@@ -105,6 +115,10 @@ export interface ConversationView {
   primary_agent: "design" | "verification";
   last_message_preview: string;
   message_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  model_calls: number;
   active_run_id: string | null;
   created_at: string;
   updated_at: string;
@@ -119,6 +133,10 @@ export interface ConversationMessage {
   content: string;
   message_type: string;
   run_id: string | null;
+  metadata: {
+    token_usage?: TokenUsage;
+    [key: string]: unknown;
+  };
   created_at: string;
 }
 

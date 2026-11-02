@@ -3,6 +3,7 @@ import {
   Activity,
   Bot,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   CircuitBoard,
   Clock3,
@@ -37,12 +38,20 @@ import {
 import { DiagnosticsModal } from "./DiagnosticsModal";
 import { ModelSettingsModal } from "./ModelSettingsModal";
 import { EngineeringModal } from "./EngineeringModal";
-import type { CandidatePatch, ChatMessage, ConversationView, DiagnosticReport, DocumentKind, ExtractedDocument, ModelSettings, RunView, TaskView, WorkflowRoute } from "./types";
+import { SessionOrbit } from "./SessionOrbit";
+import type { CandidatePatch, ChatMessage, ConversationView, DiagnosticReport, DocumentKind, ExtractedDocument, ModelSettings, RunView, TaskView, TokenUsage, WorkflowRoute } from "./types";
 
 type InspectorTab = "ds" | "findings" | "activity";
 
 const workflowLabels: Record<WorkflowRoute, string> = {
   orchestrated: "动态编排",
+};
+
+const emptyTokenUsage: TokenUsage = {
+  input_tokens: 0,
+  output_tokens: 0,
+  total_tokens: 0,
+  model_calls: 0,
 };
 
 const defaultModelSettings: ModelSettings = {
@@ -74,12 +83,14 @@ function App() {
   // projectId/moduleName/documents 属于共享工程上下文；userRole 属于当前工作身份。
   // 角色切换时共享工程资料可以保留，但旧角色的私有聊天历史不能继续发送给新主 Agent。
   const [projectId, setProjectId] = useState("demo-project");
+  const [page, setPage] = useState<"orbit" | "workspace">("orbit");
   const [moduleName, setModuleName] = useState("dma_ctrl");
   const [userRole, setUserRole] = useState<"design_engineer" | "verification_engineer">("design_engineer");
   const [documents, setDocuments] = useState<ExtractedDocument[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([initialMessage]);
   const [draft, setDraft] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [sessionUsage, setSessionUsage] = useState<TokenUsage>(emptyTokenUsage);
   const [conversations, setConversations] = useState<ConversationView[]>([]);
   const [task, setTask] = useState<TaskView | null>(null);
   const [run, setRun] = useState<RunView | null>(null);
@@ -127,19 +138,29 @@ function App() {
   }, []);
 
   useEffect(() => {
-    // 会话列表来自后端。关闭或刷新页面不会清空聊天记录。
-    listConversations(projectId).then(setConversations).catch(() => undefined);
-  }, [projectId]);
+    // 星环需要跨项目展示最近会话，因此读取完整会话索引；项目筛选只发生在前端。
+    // 消息正文仍在用户点击节点后按 session_id 分页读取。
+    listConversations().then(setConversations).catch(() => undefined);
+  }, []);
 
   function startNewConversation() {
     setSessionId(null);
     setMessages([initialMessage]);
     setTask(null);
     setRun(null);
+    setSessionUsage(emptyTokenUsage);
     setError(null);
   }
 
+  function createConversationFromOrbit() {
+    startNewConversation();
+    setPage("workspace");
+  }
+
   async function openConversation(conversation: ConversationView) {
+    // 先进入工作台，使加载中状态或后端错误能够在现有消息区域显示；如果继续停留在
+    // 星环页，加载失败只会写入隐藏的 error state，用户看不到任何反馈。
+    setPage("workspace");
     setBusy(true);
     setError(null);
     try {
@@ -148,6 +169,12 @@ function App() {
       setProjectId(conversation.project_id);
       setModuleName(conversation.module_name || moduleName);
       setUserRole(conversation.user_role);
+      setSessionUsage({
+        input_tokens: conversation.input_tokens,
+        output_tokens: conversation.output_tokens,
+        total_tokens: conversation.total_tokens,
+        model_calls: conversation.model_calls,
+      });
       setMessages(page.items
         .filter((message) => message.role !== "system")
         .map((message) => ({
@@ -155,6 +182,7 @@ function App() {
           role: message.role as "user" | "assistant",
           content: message.content,
           time: new Date(message.created_at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
+          tokenUsage: message.metadata?.token_usage,
         })));
       setTask(null);
       if (conversation.active_run_id) {
@@ -259,7 +287,7 @@ function App() {
     void handleFiles(event.dataTransfer.files);
   }
 
-  function addAssistant(content: string, route?: ChatMessage["route"]) {
+  function addAssistant(content: string, route?: ChatMessage["route"], tokenUsage?: TokenUsage) {
     setMessages((current) => [
       ...current,
       {
@@ -267,6 +295,7 @@ function App() {
         role: "assistant",
         content,
         route,
+        tokenUsage,
         time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }),
       },
     ]);
@@ -310,11 +339,12 @@ function App() {
         userRole,
       });
       setSessionId(response.session_id);
-      void listConversations(projectId).then(setConversations).catch(() => undefined);
+      setSessionUsage(response.session_usage);
+      void listConversations().then(setConversations).catch(() => undefined);
       // task 是 DS 专业记录，run 是统一控制面记录，两者可能同时存在但含义不同。
       if (response.task) setTask(response.task);
       if (response.run) setRun(response.run);
-      addAssistant(response.assistant_message, response.route);
+      addAssistant(response.assistant_message, response.route, response.usage);
       if (response.task?.status === "waiting_for_user") setInspectorTab("activity");
       if (response.task?.status === "delivered") setInspectorTab("ds");
     } catch (requestError) {
@@ -394,6 +424,16 @@ function App() {
     setDocuments((current) => current.map((document) => (document.id === id ? { ...document, ...patch } : document)));
   }
 
+  if (page === "orbit") {
+    return (
+      <SessionOrbit
+        conversations={conversations}
+        onOpenConversation={(conversation) => { void openConversation(conversation); }}
+        onCreateConversation={createConversationFromOrbit}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -404,7 +444,21 @@ function App() {
             <span>芯片设计协作工作台</span>
           </div>
         </div>
+        <div className="workspace-header-signal" aria-hidden="true">
+          <span className="header-wave"><i /><i /><i /><i /><i /><i /><i /><i /><i /></span>
+          <strong>AI-POWERED CHIP DESIGN ORCHESTRATION</strong>
+        </div>
         <div className="topbar-actions">
+          <button
+            className="settings-button orbit-return-button"
+            type="button"
+            onClick={() => {
+              void listConversations().then(setConversations).catch(() => undefined);
+              setPage("orbit");
+            }}
+          >
+            <ChevronLeft size={16} /> 返回桌面
+          </button>
           <span className={`runtime-badge ${modelSettings?.ready ? "runtime-live" : ""}`}>
             <span className="pulse-dot" />
             {modelSettings?.ready ? `真实模型 · ${modelSettings.model}` : "模拟运行时"}
@@ -426,8 +480,8 @@ function App() {
         <section className="panel-section conversation-list-section">
           <div className="section-heading">
             <div>
-              <p className="eyebrow">后端历史</p>
-              <h2>会话</h2>
+              <p className="eyebrow">SESSION ARCHIVE</p>
+              <h2>会话历史</h2>
             </div>
             <button className="icon-button conversation-new" type="button" title="新建会话" onClick={startNewConversation}>
               <Plus size={16} />
@@ -442,7 +496,10 @@ function App() {
                 onClick={() => void openConversation(conversation)}
               >
                 <strong>{conversation.title}</strong>
-                <span>{conversation.module_name || "未指定模块"} · {conversation.message_count} 条消息</span>
+                <span>
+                  {conversation.module_name || "未指定模块"} · {conversation.message_count} 条消息
+                  · {conversation.total_tokens.toLocaleString()} tokens
+                </span>
                 <small>{conversation.last_message_preview || "尚无消息"}</small>
               </button>
             ))}
@@ -554,9 +611,15 @@ function App() {
             <p className="eyebrow">任务对话</p>
             <h1>{moduleName || "未命名模块"}</h1>
           </div>
-          {run
-            ? <span className="task-id">RUN · {run.run_id.slice(0, 8)} · {run.run_type}</span>
-            : task && <span className="task-id">TASK · {task.task_id.slice(0, 8)}</span>}
+          <div className="conversation-heading-meta">
+            <span className="session-token-usage">
+              会话累计 {sessionUsage.total_tokens.toLocaleString()} tokens
+              {sessionUsage.model_calls > 0 && ` · ${sessionUsage.model_calls} 次模型调用`}
+            </span>
+            {run
+              ? <span className="task-id">RUN · {run.run_id.slice(0, 8)} · {run.run_type}</span>
+              : task && <span className="task-id">TASK · {task.task_id.slice(0, 8)}</span>}
+          </div>
         </div>
 
         <div className="message-stream">
@@ -576,6 +639,15 @@ function App() {
                   <time>{message.time}</time>
                 </div>
                 <p>{message.content}</p>
+                {message.tokenUsage && (
+                  <small className="message-token-usage">
+                    {message.tokenUsage.model_calls > 0
+                      ? <>本轮 {message.tokenUsage.total_tokens.toLocaleString()} tokens
+                        （输入 {message.tokenUsage.input_tokens.toLocaleString()} · 输出 {message.tokenUsage.output_tokens.toLocaleString()}）
+                        · {message.tokenUsage.model_calls} 次模型调用</>
+                      : "本轮 0 tokens · 未调用真实模型"}
+                  </small>
+                )}
               </div>
             </article>
           ))}
@@ -654,6 +726,29 @@ function App() {
               </div>
             </section>
           )}
+        </div>
+
+        <div className="workspace-core-scene" aria-hidden="true">
+          <span className="core-scene-beam" />
+          <span className="core-scene-orbit orbit-one" />
+          <span className="core-scene-orbit orbit-two" />
+          <div className="core-scene-chip">
+            <CircuitBoard size={28} />
+            <strong>ChipFlow<br />Agent</strong>
+          </div>
+          <div className="core-scene-card core-scene-module">
+            <span>MODULE</span><strong>{moduleName || "scheduler"}</strong>
+            <span>FLOW</span><strong>{run?.run_type || "orchestration"}</strong>
+            <span>STATUS</span><strong>{statusLabel}</strong>
+          </div>
+          <div className="core-scene-card core-scene-wave">
+            <i /><i /><i /><i /><i /><i /><i /><i />
+          </div>
+        </div>
+        <div className="workspace-capability-strip" aria-hidden="true">
+          <span><ShieldCheck size={14} /> MEMORY LINKED</span>
+          <span><CircuitBoard size={14} /> MULTI-AGENT CORE</span>
+          <span><Activity size={14} /> DYNAMIC TOOL ROUTING</span>
         </div>
 
         {error && (
@@ -771,6 +866,12 @@ function App() {
               ))}
             </div>
           )}
+        </div>
+        <div className="workspace-result-reactor" aria-hidden="true">
+          <span className="result-cube cube-top" />
+          <span className="result-cube cube-middle" />
+          <span className="result-cube cube-bottom" />
+          <i />
         </div>
       </aside>
       {settingsOpen && (

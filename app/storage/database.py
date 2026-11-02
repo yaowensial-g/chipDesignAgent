@@ -170,6 +170,10 @@ class Database:
             primary_agent TEXT NOT NULL,
             last_message_preview TEXT NOT NULL DEFAULT '',
             message_count INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            model_calls INTEGER NOT NULL DEFAULT 0,
             active_run_id TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -349,6 +353,10 @@ class Database:
                 "title": "TEXT NOT NULL DEFAULT '新会话'",
                 "last_message_preview": "TEXT NOT NULL DEFAULT ''",
                 "message_count": "INTEGER NOT NULL DEFAULT 0",
+                "input_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "output_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "total_tokens": "INTEGER NOT NULL DEFAULT 0",
+                "model_calls": "INTEGER NOT NULL DEFAULT 0",
                 "active_run_id": "TEXT",
             }
             for column, declaration in conversation_migrations.items():

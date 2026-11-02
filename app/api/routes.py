@@ -51,7 +51,7 @@ from app.domain.models import (
     DelegationResult,
 )
 from app.domain.enums import AgentRole
-from app.models.provider import ModelInvocationError, OpenAIModelProvider
+from app.models.provider import OpenAIModelProvider
 from app.services.conversation_service import conversation_service
 from app.services.diagnostics_service import diagnostics_service
 from app.services.task_service import task_service
@@ -105,10 +105,9 @@ async def test_model_connection() -> ModelConnectionResult:
     settings = model_settings_service.effective()
     if not settings.api_key:
         raise HTTPException(status_code=400, detail="请先保存 API Key")
-    try:
-        OpenAIModelProvider(settings).test_connection()
-    except ModelInvocationError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # Provider 会把认证、限流、超时、网络和参数异常转换成结构化
+    # ModelInvocationError；交给全局异常处理器返回统一 error JSON 和请求编号。
+    OpenAIModelProvider(settings).test_connection()
     return ModelConnectionResult(
         ok=True,
         message="模型连接成功",

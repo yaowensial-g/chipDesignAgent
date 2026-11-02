@@ -25,6 +25,7 @@ from app.services.context_builder_service import (
     context_builder_service,
 )
 from app.services.tool_selector_service import ToolSelectorService, tool_selector_service
+from app.services.token_usage_service import token_usage_tracker
 from app.tools.orchestration import register_orchestration_tools
 from app.tools.mock_eda import MOCK_EDA_STAGES, run_mock_eda
 from app.tools.registry import ToolRegistry, tool_registry
@@ -58,6 +59,33 @@ class OrchestratorService:
         register_orchestration_tools()
 
     async def handle(self, request: ChatRequest) -> ChatResponse:
+        """建立本轮 Token 统计作用域，并把用量写入响应和后端会话。"""
+        usage_token = token_usage_tracker.start()
+        try:
+            response = await self._handle(request)
+        finally:
+            # 即使业务层抛错也必须恢复 ContextVar，防止后续请求继承本轮累计值。
+            usage = token_usage_tracker.finish(usage_token)
+
+        run_id = response.run.run_id if response.run else None
+        conversation = self.sessions.record_token_usage(
+            response.session_id,
+            usage,
+            run_id=run_id,
+        )
+        return response.model_copy(
+            update={
+                "usage": usage.as_dict(),
+                "session_usage": {
+                    "input_tokens": conversation.input_tokens,
+                    "output_tokens": conversation.output_tokens,
+                    "total_tokens": conversation.total_tokens,
+                    "model_calls": conversation.model_calls,
+                },
+            }
+        )
+
+    async def _handle(self, request: ChatRequest) -> ChatResponse:
         """处理一条用户消息，并返回统一 ``ChatResponse``。
 
         这个方法较长，是因为它清楚展示了顶层状态机。具体专业动作被拆到

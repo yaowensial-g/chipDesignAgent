@@ -25,18 +25,27 @@ def test_chat_is_persisted_and_context_manifest_is_auditable() -> None:
     )
     assert response.status_code == 200, response.text
     payload = response.json()
+    assert payload["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "model_calls": 0,
+    }
+    assert payload["session_usage"]["total_tokens"] == 0
 
     conversations = client.get(
         "/api/v1/conversations", params={"project_id": project_id}
     ).json()
     assert conversations[0]["session_id"] == payload["session_id"]
     assert conversations[0]["message_count"] == 2
+    assert conversations[0]["total_tokens"] == 0
 
     messages = client.get(
         f"/api/v1/conversations/{payload['session_id']}/messages"
     ).json()["items"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
     assert "ready/valid" in messages[0]["content"]
+    assert messages[1]["metadata"]["token_usage"]["total_tokens"] == 0
 
     manifests = client.get(
         f"/api/v1/runs/{payload['run']['run_id']}/contexts"
