@@ -20,7 +20,7 @@ from openai import (
     RateLimitError,
 )
 
-from app.config.model_settings import EffectiveModelSettings
+from app.config.model_settings import ModelEndpointSettings
 from app.services.token_usage_service import token_usage_tracker
 
 
@@ -51,16 +51,22 @@ class ModelInvocationError(RuntimeError):
 
 class OpenAIModelProvider:
     """把不同 API 风格归一化成项目内部稳定接口。"""
-    def __init__(self, settings: EffectiveModelSettings) -> None:
+    def __init__(self, settings: ModelEndpointSettings, *, client: OpenAI | None = None) -> None:
         # Provider 不允许在没有 Key 时初始化，避免请求发出后才得到难理解的 401。
         if not settings.api_key:
             raise ModelInvocationError("尚未配置 API Key")
         self.settings = settings
-        self.client = OpenAI(
+        self._owns_client = client is None
+        self.client = client or OpenAI(
             api_key=settings.api_key,
             base_url=settings.base_url,
             timeout=settings.timeout_seconds,
         )
+
+    def close(self) -> None:
+        """释放底层 HTTP Client；由 ProviderFactory 在失效或退出时调用。"""
+        if self._owns_client:
+            self.client.close()
 
     def generate_text(self, instructions: str, input_text: str) -> str:
         """生成自由文本，并处理不同供应商的 role 和 Token 参数差异。"""

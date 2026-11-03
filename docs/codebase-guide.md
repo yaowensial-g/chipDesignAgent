@@ -111,7 +111,7 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型与对应响应模�
 
 ### `app/agents/runtime.py`
 
-- `DeterministicAgentRuntime`：离线测试和演示；
+- `DeterministicAgentRuntime`：仅用于自动化测试和显式 Mock；
 - `LLMChipDesignRuntime`：真实提示词和结果归一化；
 - `ConfigurableAgentRuntime`：按当前设置动态选择；
 - 支持 TaskIntent、ToolSelection、聊天、DS 分析/生成/评审和 RTL 候选生成。

@@ -10,4 +10,11 @@ max_output_tokens = 6000
 selector_model = "deepseek-chat"
 selector_max_tools = 6
 selector_max_output_tokens = 1000
+# 默认继承主模型的 Provider、API 类型、Base URL、Key 和 Timeout。
+# 关闭继承后，网页或环境变量可以为 Selector 配置完整独立端点。
+selector_inherit_main = true
+selector_provider = "deepseek"
+selector_api_style = "responses"
+selector_base_url = "https://api.deepseek.com"
+selector_timeout_seconds = 120
 

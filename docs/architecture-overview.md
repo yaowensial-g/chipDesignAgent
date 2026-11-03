@@ -847,7 +847,7 @@ enabled
 | Reviewer | 独立检查规格、微架构、接口和可验证性 | 不自我批准或直接修改 |
 | 确定性控制平面 | 保存 Run、过滤权限、执行 Tool、记录 Observation | 不产生专业结论，不成为默认主 Agent |
 
-Design 和 Verification 共享主模型配置，通过提示词、Skill、输入契约和 Tool 权限隔离；轻量 Selector 可以单独配置模型名称。专家委派在同进程中异步执行并持久化为 `DelegationTask`，不是独立微服务。完整设计见 [角色驱动 Multi-Agent 架构](multi-agent-architecture.md)。
+Architecture、Design、Verification 由独立 Agent 类和 `AgentRegistry` 管理，默认共享主模型端点；轻量 Selector 可继承主端点或使用完整独立配置。专家委派在同进程中异步执行并持久化为 `DelegationTask`，不是独立微服务。完整设计见 [角色驱动 Multi-Agent 架构](multi-agent-architecture.md)。
 
 ### 7.1 静态角色目录与运行时权限
 

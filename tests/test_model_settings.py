@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config.model_settings import ModelSettingsService, model_settings_service
 from app.config.model_settings import EffectiveModelSettings
 from app.agents.runtime import runtime
+from app.models.provider import ModelInvocationError
 from app.main import app
 
 
@@ -109,7 +111,10 @@ def test_connection_endpoint_uses_saved_settings(tmp_path: Path, monkeypatch) ->
         def test_connection(self):
             return "CHIP_AGENT_CONNECTION_OK"
 
-    monkeypatch.setattr("app.api.routes.OpenAIModelProvider", FakeProvider)
+    monkeypatch.setattr(
+        "app.api.routes.provider_factory.get",
+        lambda settings: FakeProvider(settings),
+    )
     response = client.post("/api/v1/settings/model/test")
 
     assert response.status_code == 200
@@ -122,6 +127,7 @@ def test_connection_endpoint_uses_saved_settings(tmp_path: Path, monkeypatch) ->
 
 def test_configurable_runtime_switches_to_real_model_when_ready(monkeypatch) -> None:
     monkeypatch.setenv("CHIP_AGENT_MODEL_ENABLED", "true")
+    monkeypatch.setenv("CHIP_AGENT_RUNTIME_MODE", "production")
     settings = EffectiveModelSettings(
         enabled=True,
         provider="openai",
@@ -143,6 +149,25 @@ def test_configurable_runtime_switches_to_real_model_when_ready(monkeypatch) -> 
 
     result = runtime.architecture_analysis({"module_name": "demo"})
     assert result["summary"] == "来自真实模型路径"
+
+
+def test_production_runtime_does_not_fall_back_to_mock(monkeypatch) -> None:
+    monkeypatch.setenv("CHIP_AGENT_RUNTIME_MODE", "production")
+    settings = EffectiveModelSettings(
+        enabled=False,
+        provider="openai",
+        api_style="responses",
+        model="test-model",
+        base_url="https://api.example.test/v1",
+        api_key="",
+        timeout_seconds=60,
+        max_output_tokens=2048,
+        api_key_source="none",
+    )
+    monkeypatch.setattr(model_settings_service, "effective", lambda: settings)
+
+    with pytest.raises(ModelInvocationError, match="不会自动返回模拟设计结果"):
+        runtime.chat({"message": "hello"})
 
 
 def test_deepseek_uses_its_own_encrypted_key(tmp_path: Path, monkeypatch) -> None:
@@ -172,4 +197,39 @@ def test_deepseek_uses_its_own_encrypted_key(tmp_path: Path, monkeypatch) -> Non
     assert settings.ready is True
     assert stored["deepseek_api_key_protected"]
     assert "sk-deepseek-secret" not in saved.read_text(encoding="utf-8")
+
+
+def test_selector_can_use_an_independent_encrypted_endpoint(tmp_path: Path, monkeypatch) -> None:
+    defaults = tmp_path / "model.toml"
+    saved = tmp_path / "model_settings.json"
+    _defaults(defaults)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CHIP_AGENT_SELECTOR_API_KEY", raising=False)
+    service = ModelSettingsService(defaults, saved)
+
+    service.save(
+        {
+            "enabled": True,
+            "api_key": "sk-main-secret",
+            "selector_inherit_main": False,
+            "selector_provider": "deepseek",
+            "selector_api_style": "chat_completions",
+            "selector_model": "deepseek-chat",
+            "selector_base_url": "https://selector.example.test",
+            "selector_api_key": "sk-selector-secret",
+            "selector_timeout_seconds": 45,
+            "selector_max_output_tokens": 512,
+        }
+    )
+
+    settings = service.effective()
+    endpoint = settings.selector_endpoint()
+    assert endpoint.provider == "deepseek"
+    assert endpoint.api_style == "chat_completions"
+    assert endpoint.base_url == "https://selector.example.test"
+    assert endpoint.api_key == "sk-selector-secret"
+    assert endpoint.timeout_seconds == 45
+    assert endpoint.max_output_tokens == 512
+    assert "sk-selector-secret" not in saved.read_text(encoding="utf-8")
+    assert "selector_api_key" not in service.public_view()
 

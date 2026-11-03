@@ -156,6 +156,15 @@ export interface ModelSettings {
   selector_model: string;
   selector_max_tools: number;
   selector_max_output_tokens: number;
+  selector_inherit_main: boolean;
+  selector_provider: "openai" | "deepseek";
+  selector_api_style: "responses" | "chat_completions";
+  selector_base_url: string;
+  selector_timeout_seconds: number;
+  selector_api_key_source: string;
+  selector_has_api_key: boolean;
+  selector_api_key_masked: string | null;
+  selector_ready: boolean;
   api_key_source: string;
   has_api_key: boolean;
   api_key_masked: string | null;
@@ -175,6 +184,13 @@ export interface ModelSettingsInput {
   selector_model: string;
   selector_max_tools: number;
   selector_max_output_tokens: number;
+  selector_inherit_main: boolean;
+  selector_provider: "openai" | "deepseek";
+  selector_api_style: "responses" | "chat_completions";
+  selector_base_url: string;
+  selector_api_key?: string;
+  selector_clear_api_key?: boolean;
+  selector_timeout_seconds: number;
 }
 
 export interface DiagnosticCheck {

@@ -1,23 +1,23 @@
 """Agent 推理运行时。
 
 这个文件提供两套实现，但暴露相同方法：
-- ``DeterministicAgentRuntime``：离线测试和无 Key 演示，结果可预测；
+- ``DeterministicAgentRuntime``：仅供自动化测试和显式 Mock 模式使用；
 - ``LLMChipDesignRuntime``：调用 DeepSeek/OpenAI 等真实模型。
 
 业务 Service 只依赖底部的 ``ConfigurableAgentRuntime``，因此切换模型不会改变
 DS、Run、Patch 或 Tool 权限逻辑。模型负责语义判断，确定性 Service 负责安全边界。
 """
 
-import os
 import re
-from dataclasses import replace
 from typing import Any
 
 from app.services.token_service import token_counter
 
 from app.config.model_settings import model_settings_service
+from app.agents.registry import agent_registry
 from app.domain.models import SourceRef
-from app.models.provider import OpenAIModelProvider
+from app.models.factory import provider_factory
+from app.models.provider import ModelInvocationError, OpenAIModelProvider
 from app.skills import skill_catalog
 
 
@@ -42,7 +42,7 @@ def _detect_eda_stage(message: str) -> str | None:
 class DeterministicAgentRuntime:
     """真实模型层的确定性替身，主要验证控制流而不是回答质量。
 
-    它让项目在没有网络和 API Key 时仍可运行、演示和测试。所有公开方法都返回
+    它让测试在没有网络和 API Key 时仍可验证控制流。所有公开方法都返回
     与真实模型相同的结构化契约，因此上层 Service 不需要针对测试模式写分支。
     """
 
@@ -433,23 +433,15 @@ class LLMChipDesignRuntime:
     @staticmethod
     def _provider() -> OpenAIModelProvider:
         """为主 Agent和专业角色创建使用主模型配置的 Provider。"""
-        return OpenAIModelProvider(model_settings_service.effective())
+        return provider_factory.get(model_settings_service.effective().main_endpoint())
 
     @staticmethod
     def _selector_provider() -> OpenAIModelProvider:
         """创建轻量 Selector Provider。
 
-        Provider、Base URL 和 Key 仍复用主配置，只替换模型名与输出 Token 上限。
-        因此本地用户只需维护一套服务商凭据。
+        默认继承主端点，也支持完全独立的 Provider、URL、Key 和超时。
         """
-        settings = model_settings_service.effective()
-        return OpenAIModelProvider(
-            replace(
-                settings,
-                model=settings.selector_model,
-                max_output_tokens=settings.selector_max_output_tokens,
-            )
-        )
+        return provider_factory.get(model_settings_service.effective().selector_endpoint())
 
     @staticmethod
     def _context(request: dict[str, Any]) -> dict[str, Any]:
@@ -591,84 +583,18 @@ class LLMChipDesignRuntime:
         }
 
     def architecture_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
-        result = self._provider().generate_json(
-            """你是芯片架构顾问 Agent。FS、AS、ICD 是受控原始资料，你只能解释、质疑和指出歧义，不能擅自修改或虚构架构决策。输出 JSON 对象：summary（中文总结）、knowledge_type（fact/inference/suggestion）。必须区分文档事实与推断。"""
-            + skill_catalog.prompt("architecture/specification-analysis"),
-            self._context(request),
-            operation="架构顾问 Agent",
-            expected_shape='{"summary":"中文总结","knowledge_type":"fact|inference|suggestion"}',
-        )
-        if not isinstance(result, dict):
-            raise ValueError("架构 Agent 输出必须是 JSON 对象")
-        return {
-            "summary": str(result.get("summary", "架构分析已完成。")),
-            "knowledge_type": str(result.get("knowledge_type", "inference")),
-            "sources": DeterministicAgentRuntime.source_refs(request),
-        }
+        return agent_registry.invoke("architecture_advisor", request, self._context(request))
 
     def design_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
-        result = self._provider().generate_json(
-            """你是资深 RTL 设计 Agent。依据 AS 识别子模块和职责，不得重新定义外部接口，不得补造没有证据的规格。输出 JSON 对象：summary（中文）、submodules（字符串数组，只列实际识别出的子模块）。""",
-            self._context(request),
-            operation="设计分析 Agent",
-            expected_shape='{"summary":"中文总结","submodules":["子模块名"]}',
-        )
-        if not isinstance(result, dict):
-            raise ValueError("设计 Agent 输出必须是 JSON 对象")
-        submodules = [str(item) for item in result.get("submodules", []) if str(item).strip()]
-        return {
-            "summary": str(result.get("summary", "设计分析已完成。")),
-            "submodules": submodules or [f"{request['module_name']}_core"],
-            "sources": DeterministicAgentRuntime.source_refs(request),
-        }
+        return agent_registry.invoke("design", request, self._context(request))
 
     def verification_analysis(self, request: dict[str, Any]) -> dict[str, Any]:
-        result = self._provider().generate_json(
-            """你是芯片验证 Agent。检查规格的可观察性、边界条件、异常行为和可验证性。输出 JSON 对象：summary（中文）、recommended_checks（字符串数组）。不要把建议说成规格事实。""",
-            self._context(request),
-            operation="验证分析 Agent",
-            expected_shape='{"summary":"中文总结","recommended_checks":["检查项"]}',
-        )
-        if not isinstance(result, dict):
-            raise ValueError("验证 Agent 输出必须是 JSON 对象")
-        return {
-            "summary": str(result.get("summary", "验证分析已完成。")),
-            "recommended_checks": [str(item) for item in result.get("recommended_checks", [])],
-            "sources": DeterministicAgentRuntime.source_refs(request),
-        }
+        return agent_registry.invoke("verification", request, self._context(request))
 
     def detect_issues(self, request: dict[str, Any]) -> list[dict[str, Any]]:
-        result = self._provider().generate_json(
-            """你是规格质疑 Agent。对比 FS、AS、ICD，仅识别会影响设计的明确冲突、歧义、缺失或疑似错误。不要为了产生问题而制造问题。输出 JSON 对象 {\"issues\":[{\"title\":中文标题,\"description\":具体问题,\"document\":来源文档名,\"location\":章节或描述}]}。没有问题时 issues 为空数组。""",
-            self._context(request),
-            operation="规格质疑 Agent",
-            expected_shape='{"issues":[{"title":"标题","description":"描述","document":"文档名","location":"位置"}]}',
+        return agent_registry.call(
+            "architecture_advisor", "detect_issues", request, self._context(request)
         )
-        if not isinstance(result, dict):
-            raise ValueError("规格质疑 Agent 输出必须是 JSON 对象")
-        versions = {doc["name"]: doc["version"] for doc in request["documents"]}
-        issues = []
-        for index, item in enumerate(result.get("issues", []), start=1):
-            if not isinstance(item, dict):
-                continue
-            document = str(item.get("document") or request["documents"][0]["name"])
-            issues.append(
-                {
-                    "issue_id": f"ISSUE-{index:03d}",
-                    "title": str(item.get("title", "待确认的规格问题")),
-                    "description": str(item.get("description", "现有资料不足以形成结论。")),
-                    "sources": [
-                        {
-                            "document": document,
-                            "version": versions.get(document, "unknown"),
-                            "location": str(item.get("location", "document")),
-                        }
-                    ],
-                    "status": "open",
-                    "discussion_round": 0,
-                }
-            )
-        return issues
 
     def generate_ds(
         self,
@@ -676,23 +602,18 @@ class LLMChipDesignRuntime:
         design_analysis: dict[str, Any],
         user_resolution: dict[str, Any] | None,
     ) -> str:
-        payload = self._context(request)
-        payload["design_analysis"] = design_analysis
-        payload["user_resolution"] = user_resolution
-        return self._provider().generate_text(
-            """你是资深芯片 RTL 设计 Agent。根据受控 FS、AS、ICD 生成中文 Markdown DS 候选。只输出 Markdown 正文。"""
-            + skill_catalog.prompt("design/ds-authoring"),
-            json_payload(payload),
+        return agent_registry.call(
+            "design",
+            "generate_ds",
+            self._context(request),
+            design_analysis,
+            user_resolution,
         )
 
     def generate_rtl(self, request: dict[str, Any]) -> str:
-        payload = self._context(request)
-        payload["ds_markdown"] = request["ds_markdown"]
-        return self._provider().generate_text(
-            """你是资深数字芯片设计工程师。输出必须只有可保存为 .sv 文件的源码，不要 Markdown 代码块。"""
-            + skill_catalog.prompt("design/rtl-implementation"),
-            json_payload(payload),
-        ).removeprefix("```systemverilog").removeprefix("```sv").removeprefix("```").removesuffix("```").strip()
+        return agent_registry.call(
+            "design", "generate_rtl", self._context(request), request["ds_markdown"]
+        )
 
     def review(
         self,
@@ -742,17 +663,27 @@ def json_payload(payload: dict[str, Any]) -> str:
 
 
 class ConfigurableAgentRuntime:
-    """运行时门面：每次调用都根据最新配置选择真实模型或确定性实现。"""
+    """运行时门面：确定性实现仅允许在显式测试/Mock 模式下启用。"""
     def __init__(self) -> None:
         self.deterministic = DeterministicAgentRuntime()
         self.llm = LLMChipDesignRuntime()
 
     def _active(self):
-        """测试环境强制确定性 Runtime；正常环境在配置 ready 时使用真实模型。"""
-        forced_enabled = os.getenv("CHIP_AGENT_MODEL_ENABLED")
-        if forced_enabled is not None and forced_enabled.strip().lower() in {"0", "false", "no", "off"}:
+        """正式环境缺少模型时明确失败，本地无 LLM 工具不受此门面影响。"""
+        import os
+
+        mode = os.getenv("CHIP_AGENT_RUNTIME_MODE", "production").strip().lower()
+        if mode in {"test", "mock", "deterministic"}:
             return self.deterministic
-        return self.llm if model_settings_service.effective().ready else self.deterministic
+        settings = model_settings_service.effective()
+        if not settings.ready:
+            raise ModelInvocationError(
+                "真实模型未启用或尚未配置 API Key；正式环境不会自动返回模拟设计结果",
+                code="MODEL_NOT_CONFIGURED",
+                http_status=503,
+                suggestions=["在模型设置中启用并配置主模型", "仅在自动化测试中使用 CHIP_AGENT_RUNTIME_MODE=test"],
+            )
+        return self.llm
 
     def __getattr__(self, name: str):
         # 属性代理让调用端始终使用 runtime.generate_ds(...) 这一种写法。

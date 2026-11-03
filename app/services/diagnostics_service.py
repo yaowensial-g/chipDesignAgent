@@ -86,8 +86,8 @@ class DiagnosticsService:
                 action = "打开模型设置，填写并保存当前提供商的 API Key。"
             else:
                 status = "warning"
-                detail = "真实模型未启用，系统将使用确定性模拟运行时。"
-                action = "如需开放式问答和真实 Agent 推理，请在模型设置中启用真实模型。"
+                detail = "真实模型未启用；模型相关任务会明确失败，不会生成模拟设计结果。"
+                action = "如需开放式问答和 Agent 推理，请在模型设置中启用并配置真实模型。"
             checks.append(
                 DiagnosticCheck(
                     check_id="model_runtime",

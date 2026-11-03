@@ -171,8 +171,8 @@ export async function saveModelSettings(input: ModelSettingsInput): Promise<Mode
   return parseResponse(response);
 }
 
-export async function testModelConnection(): Promise<{ ok: boolean; message: string; model: string }> {
-  const response = await fetch(`${API_ROOT}/settings/model/test`, { method: "POST" });
+export async function testModelConnection(target: "main" | "selector" = "main"): Promise<{ ok: boolean; message: string; model: string }> {
+  const response = await fetch(`${API_ROOT}/settings/model/test?target=${target}`, { method: "POST" });
   return parseResponse(response);
 }
 

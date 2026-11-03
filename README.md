@@ -14,7 +14,8 @@
 - 四类独立评审；
 - DS Markdown 生成；
 - Agent 禁用和质量降级提示；
-- 可切换的模拟运行时与真实模型运行时；
+- 正式环境使用真实模型；确定性运行时仅用于自动化测试和显式 Mock；
+- 主 Agent 与轻量 Tool Selector 可继承或分别配置完整模型端点；
 - OpenAI Responses API 和 OpenAI 兼容 Chat Completions；
 - 网页模型配置、连接测试和 API Key 持久化；
 - 网页系统自检、结构化错误分类和请求编号；

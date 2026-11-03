@@ -475,6 +475,13 @@ class ModelSettingsUpdate(BaseModel):
     selector_model: str = Field(default="deepseek-chat", min_length=1)
     selector_max_tools: int = Field(default=6, ge=2, le=20)
     selector_max_output_tokens: int = Field(default=1000, ge=128, le=8000)
+    selector_inherit_main: bool = True
+    selector_provider: Literal["openai", "deepseek"] = "openai"
+    selector_api_style: Literal["responses", "chat_completions"] = "responses"
+    selector_base_url: str = Field(default="https://api.openai.com/v1", min_length=1)
+    selector_api_key: str | None = None
+    selector_clear_api_key: bool = False
+    selector_timeout_seconds: int = Field(default=120, ge=10, le=600)
 
 
 class ModelSettingsView(BaseModel):
@@ -489,6 +496,15 @@ class ModelSettingsView(BaseModel):
     selector_model: str
     selector_max_tools: int
     selector_max_output_tokens: int
+    selector_inherit_main: bool
+    selector_provider: str
+    selector_api_style: str
+    selector_base_url: str
+    selector_timeout_seconds: int
+    selector_api_key_source: str
+    selector_has_api_key: bool
+    selector_api_key_masked: str | None
+    selector_ready: bool
     api_key_source: str
     has_api_key: bool
     api_key_masked: str | None

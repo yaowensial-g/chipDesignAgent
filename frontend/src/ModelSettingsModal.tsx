@@ -11,7 +11,7 @@ interface Props {
 
 export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
   // 主模型负责专业判断和最终 Tool Call；Selector 模型只根据短 Metadata 筛选候选 Tool。
-  // 两者共享 Provider/Base URL/API Key，但可以使用不同模型名和输出 Token 上限。
+  // Selector 默认继承主端点，也可以切换为完全独立的服务商配置。
   const [enabled, setEnabled] = useState(settings.enabled);
   const [provider, setProvider] = useState<"openai" | "deepseek">(
     settings.provider === "deepseek" ? "deepseek" : "openai",
@@ -25,6 +25,13 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
   const [selectorModel, setSelectorModel] = useState(settings.selector_model);
   const [selectorMaxTools, setSelectorMaxTools] = useState(settings.selector_max_tools);
   const [selectorMaxOutputTokens, setSelectorMaxOutputTokens] = useState(settings.selector_max_output_tokens);
+  const [selectorInheritMain, setSelectorInheritMain] = useState(settings.selector_inherit_main);
+  const [selectorProvider, setSelectorProvider] = useState<"openai" | "deepseek">(settings.selector_provider);
+  const [selectorApiStyle, setSelectorApiStyle] = useState(settings.selector_api_style);
+  const [selectorBaseUrl, setSelectorBaseUrl] = useState(settings.selector_base_url);
+  const [selectorApiKey, setSelectorApiKey] = useState("");
+  const [selectorTimeout, setSelectorTimeout] = useState(settings.selector_timeout_seconds);
+  const [selectorClearApiKey, setSelectorClearApiKey] = useState(false);
   const [clearApiKey, setClearApiKey] = useState(false);
   const [busy, setBusy] = useState<"save" | "test" | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -47,7 +54,23 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
       selector_model: selectorModel.trim(),
       selector_max_tools: selectorMaxTools,
       selector_max_output_tokens: selectorMaxOutputTokens,
+      selector_inherit_main: selectorInheritMain,
+      selector_provider: selectorProvider,
+      selector_api_style: selectorApiStyle,
+      selector_base_url: selectorBaseUrl.trim(),
+      selector_api_key: selectorApiKey.trim() || undefined,
+      selector_clear_api_key: selectorClearApiKey,
+      selector_timeout_seconds: selectorTimeout,
     };
+  }
+
+  function changeSelectorProvider(nextProvider: "openai" | "deepseek") {
+    setSelectorProvider(nextProvider);
+    setSelectorApiStyle("responses");
+    setSelectorBaseUrl(nextProvider === "deepseek" ? "https://api.deepseek.com" : "https://api.openai.com/v1");
+    setSelectorModel(nextProvider === "deepseek" ? "deepseek-chat" : "gpt-4.1-mini");
+    setSelectorApiKey("");
+    setSelectorClearApiKey(false);
   }
 
   function changeProvider(nextProvider: "openai" | "deepseek") {
@@ -80,6 +103,8 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
       onSaved(updated);
       setApiKey("");
       setClearApiKey(false);
+      setSelectorApiKey("");
+      setSelectorClearApiKey(false);
       setFeedback("设置已保存，后续任务会立即使用新配置。完整 API Key 不会返回前端。");
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "保存失败");
@@ -88,7 +113,7 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
     }
   }
 
-  async function saveAndTest() {
+  async function saveAndTest(target: "main" | "selector") {
     setBusy("test");
     setError(null);
     setFeedback(null);
@@ -97,8 +122,10 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
       onSaved(updated);
       setApiKey("");
       setClearApiKey(false);
-      const result = await testModelConnection();
-      setFeedback(`${result.message}：${result.model}`);
+      setSelectorApiKey("");
+      setSelectorClearApiKey(false);
+      const result = await testModelConnection(target);
+      setFeedback(`${target === "main" ? "主模型" : "Selector"}${result.message}：${result.model}`);
     } catch (testError) {
       setError(testError instanceof Error ? testError.message : "连接测试失败");
     } finally {
@@ -121,7 +148,7 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
           <label className="toggle-row">
             <span>
               <strong>启用真实模型</strong>
-              <small>关闭时继续使用确定性模拟运行时</small>
+              <small>关闭后模型任务会明确报错；Workspace 和本地工程工具仍可使用</small>
             </span>
             <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
           </label>
@@ -152,6 +179,62 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
             <input required value={selectorModel} onChange={(event) => setSelectorModel(event.target.value)} placeholder={provider === "deepseek" ? "deepseek-chat" : "gpt-4.1-mini"} />
             <small>只接收已授权 Tool 的简短元数据，主 Agent 只看到筛选后的完整 Schema。</small>
           </label>
+          <label className="toggle-row">
+            <span>
+              <strong>Selector 继承主模型端点</strong>
+              <small>继承 Provider、API 类型、Base URL、API Key 和超时，仅模型名与 Token 上限独立。</small>
+            </span>
+            <input type="checkbox" checked={selectorInheritMain} onChange={(event) => setSelectorInheritMain(event.target.checked)} />
+          </label>
+
+          {!selectorInheritMain && (
+            <>
+              <div className="form-grid">
+                <label>
+                  <span>Selector 提供商</span>
+                  <select value={selectorProvider} onChange={(event) => changeSelectorProvider(event.target.value as "openai" | "deepseek")}>
+                    <option value="openai">OpenAI</option>
+                    <option value="deepseek">DeepSeek</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Selector API 类型</span>
+                  <select value={selectorApiStyle} onChange={(event) => setSelectorApiStyle(event.target.value as ModelSettings["api_style"])}>
+                    <option value="responses">Responses API</option>
+                    <option value="chat_completions">Chat Completions</option>
+                  </select>
+                </label>
+              </div>
+              <label>
+                <span>Selector Base URL</span>
+                <input required value={selectorBaseUrl} onChange={(event) => setSelectorBaseUrl(event.target.value)} />
+              </label>
+              <label>
+                <span>Selector API Key</span>
+                <div className="key-input-wrap">
+                  <KeyRound size={16} />
+                  <input
+                    type="password"
+                    value={selectorApiKey}
+                    onChange={(event) => { setSelectorApiKey(event.target.value); setSelectorClearApiKey(false); }}
+                    placeholder={settings.selector_provider === selectorProvider && settings.selector_has_api_key ? settings.selector_api_key_masked ?? "sk-..." : "sk-..."}
+                    autoComplete="new-password"
+                  />
+                </div>
+                <small>独立 Key 同样只在本机后端加密保存；留空不会覆盖已有值。</small>
+              </label>
+              {settings.selector_provider === selectorProvider && settings.selector_has_api_key && settings.selector_api_key_source !== "environment" && (
+                <label className="clear-key-row">
+                  <input type="checkbox" checked={selectorClearApiKey} onChange={(event) => { setSelectorClearApiKey(event.target.checked); if (event.target.checked) setSelectorApiKey(""); }} />
+                  保存时清除 Selector 本地 API Key
+                </label>
+              )}
+              <label>
+                <span>Selector 超时（秒）</span>
+                <input type="number" min={10} max={600} value={selectorTimeout} onChange={(event) => setSelectorTimeout(Number(event.target.value))} />
+              </label>
+            </>
+          )}
           <label>
             <span>Base URL</span>
             <input required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.openai.com/v1" />
@@ -211,8 +294,13 @@ export function ModelSettingsModal({ settings, onClose, onSaved }: Props) {
 
           <footer className="modal-actions">
             <button className="secondary-button" type="button" onClick={onClose}>取消</button>
-            <button className="secondary-button" type="button" onClick={saveAndTest} disabled={busy !== null}>
-              {busy === "test" && <LoaderCircle className="spin" size={15} />} 保存并测试
+            {!selectorInheritMain && (
+              <button className="secondary-button" type="button" onClick={() => saveAndTest("selector")} disabled={busy !== null}>
+                {busy === "test" && <LoaderCircle className="spin" size={15} />} 测试 Selector
+              </button>
+            )}
+            <button className="secondary-button" type="button" onClick={() => saveAndTest("main")} disabled={busy !== null}>
+              {busy === "test" && <LoaderCircle className="spin" size={15} />} 测试主模型
             </button>
             <button className="primary-button" type="submit" disabled={busy !== null}>
               {busy === "save" && <LoaderCircle className="spin" size={15} />} 保存设置

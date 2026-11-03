@@ -5,6 +5,8 @@
 可以被网页、CLI 或测试复用，而不会依赖 FastAPI Request 对象。
 """
 
+from typing import Literal
+
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 
 from app.documents.extractor import DocumentExtractionError, extract_document
@@ -51,7 +53,7 @@ from app.domain.models import (
     DelegationResult,
 )
 from app.domain.enums import AgentRole
-from app.models.provider import OpenAIModelProvider
+from app.models.factory import provider_factory
 from app.services.conversation_service import conversation_service
 from app.services.diagnostics_service import diagnostics_service
 from app.services.task_service import task_service
@@ -100,18 +102,22 @@ async def update_model_settings(request: ModelSettingsUpdate) -> ModelSettingsVi
 
 
 @router.post("/settings/model/test", response_model=ModelConnectionResult)
-async def test_model_connection() -> ModelConnectionResult:
+async def test_model_connection(
+    target: Literal["main", "selector"] = Query(default="main"),
+) -> ModelConnectionResult:
     """发送最小真实模型请求；只证明连接可用，不证明所有任务输出质量。"""
     settings = model_settings_service.effective()
-    if not settings.api_key:
-        raise HTTPException(status_code=400, detail="请先保存 API Key")
+    endpoint = settings.main_endpoint() if target == "main" else settings.selector_endpoint()
+    if not endpoint.api_key:
+        label = "主模型" if target == "main" else "Selector"
+        raise HTTPException(status_code=400, detail=f"请先保存 {label} API Key")
     # Provider 会把认证、限流、超时、网络和参数异常转换成结构化
     # ModelInvocationError；交给全局异常处理器返回统一 error JSON 和请求编号。
-    OpenAIModelProvider(settings).test_connection()
+    provider_factory.get(endpoint).test_connection()
     return ModelConnectionResult(
         ok=True,
         message="模型连接成功",
-        model=settings.model,
+        model=endpoint.model,
     )
 
 

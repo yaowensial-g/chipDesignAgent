@@ -42,7 +42,7 @@
 | `interface_reviewer` | 接口一致性 | DS Review |
 | `specialist_reviewer` | CDC/低功耗/安全/DFT/PPA/时序专项 | 由任务标签和用户提示按需选择 |
 
-主 Agent 当前共享一个有效模型 Provider；Selector 可单独配置模型名称。角色隔离依靠会话身份、Tool 白名单、Delegate 契约和执行前权限复核，不是独立模型进程。
+主 Agent 和专家 Agent 使用主模型端点；Selector 默认继承，也可使用完整独立端点。`ProviderFactory` 按配置缓存 Provider，并让同连接配置复用底层 Client。角色隔离依靠会话身份、Tool 白名单、Delegate 契约和执行前权限复核，不是独立模型进程。
 
 ## 3. Tool Catalog
 

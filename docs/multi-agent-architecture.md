@@ -166,7 +166,7 @@ sequenceDiagram
 
 ## 6. 模型配置
 
-主 Agent 和轻量 Selector 可使用不同模型名称，但当前共享 Provider、Base URL 和 API Key：
+主 Agent 和轻量 Selector 默认共享端点；关闭继承后可分别配置 Provider、API 类型、Base URL、API Key、模型、Token 上限和超时：
 
 ```toml
 [model]
@@ -219,7 +219,7 @@ selector_max_output_tokens = 1000
 
 已经实现的是角色主 Agent 控制面、受控专家委派和两阶段 Tool 选择。以下能力仍不应在面试或产品说明中夸大：
 
-- Selector 与主 Agent 默认共享 Provider 和 API Key；独立部署时由 Provider 网关实施限流与熔断；
+- Selector 默认继承主模型端点，也可使用独立 Provider 和加密凭据；相同连接配置由 `ProviderFactory` 复用底层 Client；
 - Provider 不返回 token usage 时，控制平面只记录模型名、候选数量、回退标记和延迟；
 - Delegate 在单机配置中采用同进程异步调用；分布式配置通过相同任务契约连接队列与 Worker；
 - 没有企业用户认证，`user_role` 是工作模式而非组织授权；

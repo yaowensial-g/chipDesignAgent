@@ -1,2 +1,2 @@
-"""Role definitions and configurable deterministic/LLM agent runtime."""
+"""Agent definitions, registry, specialist implementations and runtime facade."""
 
