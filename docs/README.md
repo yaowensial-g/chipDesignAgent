@@ -11,12 +11,13 @@
 | 3 | [角色驱动 Multi-Agent](multi-agent-architecture.md) | 主 Agent、Delegate、Reviewer 与权限模型 |
 | 4 | [动态编排](dynamic-orchestration.md) | TaskIntent、Tool Selector、Function Calling 和 Planner-Executor Loop |
 | 5 | [上下文与记忆](context-and-memory.md) | 后端会话、四层上下文、混合检索、长期记忆和失效传播 |
-| 6 | [运行逻辑](runtime-flow.md) | 从 HTTP 请求到 Run、Tool、Issue、Patch 和响应的完整时序 |
-| 7 | [组件与接口](components-and-interfaces.md) | 服务职责、HTTP API、领域对象和 SQLite Schema |
-| 8 | [代码结构](codebase-guide.md) | 目录、关键文件、扩展点和测试组织 |
-| 9 | [编排与 Skills](orchestration-and-skills.md) | Skill、Tool、Policy 和 Workflow 的边界 |
-| 10 | [系统验证报告](../VALIDATION_REPORT.md) | 自动化验证范围、结果与部署约束 |
-| 11 | [面试 100 问](interview-100-questions.md) | 项目讲解、技术取舍和追问回答 |
+| 6 | [上下文与记忆实现详解](context-memory-implementation.md) | 结合代码说明摘要、记忆生命周期、检索、预算、Manifest、失败路径和测试 |
+| 7 | [运行逻辑](runtime-flow.md) | 从 HTTP 请求到 Run、Tool、Issue、Patch 和响应的完整时序 |
+| 8 | [组件与接口](components-and-interfaces.md) | 服务职责、HTTP API、领域对象和 SQLite Schema |
+| 9 | [代码结构](codebase-guide.md) | 目录、关键文件、扩展点和测试组织 |
+| 10 | [编排与 Skills](orchestration-and-skills.md) | Skill、Tool、Policy 和 Workflow 的边界 |
+| 11 | [系统验证报告](../VALIDATION_REPORT.md) | 自动化验证范围、结果与部署约束 |
+| 12 | [面试 100 问](interview-100-questions.md) | 项目讲解、技术取舍和追问回答 |
 
 ## 系统能力地图
 

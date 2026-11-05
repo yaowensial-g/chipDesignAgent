@@ -448,7 +448,7 @@ flowchart LR
 | 数据表怎样定义 | [`database.py`](../app/storage/database.py#L162) |
 | 调试 API 在哪里 | [`routes.py`](../app/api/routes.py#L131) |
 
-更完整的数据契约和治理规则见 [上下文与记忆子系统](context-and-memory.md)。
+架构边界见[上下文与记忆子系统](context-and-memory.md)；逐代码的数据结构、算法、预算和失败路径见[上下文构建与长期记忆实现详解](context-memory-implementation.md)。
 
 ### 2.3 角色主 Agent 与统一控制主链
 
