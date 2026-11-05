@@ -143,39 +143,36 @@ class SessionService:
             raise KeyError(session_id)
         message_id = str(uuid4())
         now = utc_now()
-        # sequence 在 SQL 内计算；唯一索引会阻止极端并发下出现重复游标。
-        self.db.execute(
-            """INSERT INTO conversation_messages
-            (message_id, session_id, sequence, role, agent_role, content, message_type,
-             run_id, delegation_task_id, metadata_json, created_at)
-            VALUES (?, ?,
-                COALESCE((SELECT MAX(sequence) + 1 FROM conversation_messages WHERE session_id = ?), 1),
-                ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                message_id,
-                session_id,
-                session_id,
-                role,
-                agent_role,
-                content,
-                message_type,
-                run_id,
-                delegation_task_id,
-                self.db.dumps(metadata or {}),
-                now,
-            ),
-        )
         preview = " ".join(content.strip().split())[:120]
-        conversation = self.get(session_id)
-        title = conversation.title if conversation else "新会话"
-        if role == "user" and title == "新会话":
-            title = preview[:40] or title
-        self.db.execute(
-            """UPDATE conversations
-            SET title = ?, last_message_preview = ?, message_count = message_count + 1,
-                updated_at = ? WHERE session_id = ?""",
-            (title, preview, now, session_id),
-        )
+        with self.db.transaction() as connection:
+            conversation = connection.execute(
+                "SELECT title FROM conversations WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            if conversation is None:
+                raise KeyError(session_id)
+            title = conversation["title"]
+            if role == "user" and title == "新会话":
+                title = preview[:40] or title
+            # sequence 与会话索引在同一事务内更新，避免正文已写入但计数未更新。
+            connection.execute(
+                """INSERT INTO conversation_messages
+                (message_id, session_id, sequence, role, agent_role, content, message_type,
+                 run_id, delegation_task_id, metadata_json, created_at)
+                VALUES (?, ?,
+                    COALESCE((SELECT MAX(sequence) + 1 FROM conversation_messages WHERE session_id = ?), 1),
+                    ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message_id, session_id, session_id, role, agent_role, content,
+                    message_type, run_id, delegation_task_id,
+                    self.db.dumps(metadata or {}), now,
+                ),
+            )
+            connection.execute(
+                """UPDATE conversations
+                SET title = ?, last_message_preview = ?, message_count = message_count + 1,
+                    updated_at = ? WHERE session_id = ?""",
+                (title, preview, now, session_id),
+            )
         return self.get_message(message_id)  # type: ignore[return-value]
 
     def record_token_usage(
@@ -290,20 +287,85 @@ class SessionService:
         )
         return [self._message_from_row(row) for row in reversed(rows)]
 
-    def get_summary(self, session_id: str) -> ConversationSummaryView | None:
-        row = self.db.fetch_one(
-            "SELECT * FROM conversation_summaries WHERE session_id = ?", (session_id,)
+    def visible_messages_between(
+        self,
+        session_id: str,
+        *,
+        agent_role: str,
+        after_sequence: int,
+        through_sequence: int,
+    ) -> list[ConversationMessageView]:
+        """使用与 recent_messages 相同的角色可见性规则读取待摘要消息。"""
+        rows = self.db.fetch_all(
+            """SELECT * FROM conversation_messages
+            WHERE session_id = ? AND sequence > ? AND sequence <= ?
+              AND (agent_role IS NULL OR agent_role = ?)
+            ORDER BY sequence""",
+            (session_id, after_sequence, through_sequence, agent_role),
         )
-        return ConversationSummaryView(**row) if row else None
+        return [self._message_from_row(row) for row in rows]
 
-    def upsert_summary(self, session_id: str, summary: str, covered_until: int) -> None:
+    def get_summary(
+        self, session_id: str, agent_role: str | None = None
+    ) -> ConversationSummaryView | None:
+        if agent_role is None:
+            conversation = self.get(session_id)
+            agent_role = conversation.primary_agent.value if conversation else "design"
+        row = self.db.fetch_one(
+            """SELECT * FROM conversation_role_summaries
+            WHERE session_id = ? AND agent_role = ?""",
+            (session_id, agent_role),
+        )
+        if not row:
+            return None
+        payload = dict(row)
+        payload["summary_json"] = self.db.loads(payload["summary_json"], {})
+        payload["source_message_ids"] = self.db.loads(
+            payload.pop("source_message_ids_json"), []
+        )
+        return ConversationSummaryView(**payload)
+
+    def upsert_summary(
+        self,
+        session_id: str,
+        agent_role: str,
+        summary_json: dict,
+        summary_text: str,
+        covered_from: int,
+        covered_until: int,
+        source_message_ids: list[str],
+        *,
+        generation_mode: str,
+        last_error: str | None = None,
+    ) -> None:
         self.db.execute(
-            """INSERT INTO conversation_summaries
-            (session_id, summary, covered_until_sequence, updated_at) VALUES (?, ?, ?, ?)
-            ON CONFLICT(session_id) DO UPDATE SET summary = excluded.summary,
+            """INSERT INTO conversation_role_summaries
+            (session_id, agent_role, summary_json, summary_text,
+             covered_from_sequence, covered_until_sequence, source_message_ids_json,
+             summary_version, generation_mode, last_error, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ON CONFLICT(session_id, agent_role) DO UPDATE SET
+                summary_json = excluded.summary_json,
+                summary_text = excluded.summary_text,
+                covered_from_sequence = excluded.covered_from_sequence,
                 covered_until_sequence = excluded.covered_until_sequence,
+                source_message_ids_json = excluded.source_message_ids_json,
+                summary_version = conversation_role_summaries.summary_version + 1,
+                generation_mode = excluded.generation_mode,
+                last_error = excluded.last_error,
                 updated_at = excluded.updated_at""",
-            (session_id, summary, covered_until, utc_now()),
+            (
+                session_id,
+                agent_role,
+                self.db.dumps(summary_json),
+                summary_text,
+                covered_from,
+                covered_until,
+                self.db.dumps(source_message_ids),
+                generation_mode,
+                last_error,
+                utc_now(),
+            ),
         )
 
     def _message_from_row(self, row: dict) -> ConversationMessageView:

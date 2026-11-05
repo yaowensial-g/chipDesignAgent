@@ -83,6 +83,18 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型与对应响应模�
 
 持久化会话工作角色，将 `design_engineer` / `verification_engineer` 映射到对应主 Agent；角色切换时由主链隔离旧角色私有历史。
 
+### `app/services/conversation_summary_service.py`
+
+按 `session_id + agent_role` 增量处理即将移出原文窗口的消息。模型结构化摘要失败时不推进游标；离线回退保留待语义处理原文，不伪造总结。
+
+### `app/services/memory_extractor_service.py` 与 `memory_service.py`
+
+前者只在高价值工程事件触发 proposed 候选，记录幂等事件和失败原因；后者负责真实来源校验、状态转换、冲突替代、可见性、来源级失效和两阶段检索。LLM 不直接更新 Memory 状态。
+
+### `app/services/context_builder_service.py`
+
+统一分配 System/Run/近期原文/摘要/长期记忆/RAG/输出预留预算，并把实际 ID、分数、排除原因、摘要覆盖范围和 Prompt Hash 保存到 Context Manifest。
+
 ### `app/services/tool_selector_service.py`
 
 先用 Tool Registry 按角色和启用状态硬过滤，再把轻量 Metadata 发送给 Selector Model；校验返回名称、加入基础 Tool，并记录模型、延迟、候选数量和回退状态。

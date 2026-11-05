@@ -1,113 +1,173 @@
-# 上下文与记忆子系统
+# 上下文与长期记忆子系统
 
-## 1. 为什么不能把“上下文”等同于聊天记录
+## 1. 目标与边界
 
-一次模型调用真正需要的上下文由四类信息组成：
+系统把上下文分成四层，避免把聊天、模型推断和正式工程事实混为一谈：
 
-1. 当前输入：用户本轮消息、当前角色、项目、模块和 Run 状态；
-2. 短期记忆：本会话近期原文、较早对话摘要、当前 Run 的 Observation；
-3. 长期记忆：有来源的项目事实、架构决策、已确认约束和用户偏好；
-4. 外部证据：FS、AS、ICD 的相关分块，以及 Workspace、日志和工具结果。
-
-原始资料、聊天消息、工具日志和长期记忆分别存储。它们的可信度、生命周期和更新
-规则不同，不能混在一个“memory”表里，也不能把 Agent 的一句推测自动提升为事实。
-
-## 2. 四层上下文
-
-| 层 | 典型内容 | 生命周期 | 当前存储 |
+| 层 | 内容 | 生命周期 | 主要存储 |
 |---|---|---|---|
-| L0 当前请求 | 当前消息、角色、TaskIntent、Run 状态 | 单次模型调用 | Request + Run |
-| L1 短期记忆 | 近期消息、较早消息摘要、本 Run Observation | Session / Run | `conversation_messages`、`conversation_summaries`、Run result |
-| L2 长期记忆 | 项目事实、正式决策、已确认假设 | Project / Module / 文档版本 | `memories`、`memory_sources` |
-| L3 原始证据 | FS/AS/ICD、工具日志、Workspace 制品 | 长期保留、版本化 | `document_versions`、`document_chunks`、Artifact、Raw Logs |
+| L0 当前执行状态 | 当前请求、Run、Observation、审批与执行进度 | 单次 Run | `runs`、`run_events` |
+| L1 短期记忆 | 近期原文、按角色摘要、目标与待办 | Session | `conversation_messages`、`conversation_role_summaries` |
+| L2 长期记忆 | 项目事实、设计约束、正式决策、工程经验 | Project / Module | `memories`、`memory_sources`、`memory_relations` |
+| L3 原始证据 | 规格、RTL、Artifact、Tool 日志及版本 | 长期版本化保存 | `document_versions`、`document_chunks`、Workspace |
 
-短期和长期的区别不是“文本长短”，而是作用域、权威性和生命周期。一次临时讨论即使
-很长仍是短期记忆；一条只有十个字但经问题单确认的接口决策属于长期记忆。
+LLM 生成的摘要、推断和专家建议不是正式事实。原始消息和历史证据不因摘要、文档换版或记忆替代而删除。
 
-## 3. 后端会话持久化
+## 2. 总体流程
 
-浏览器不再是聊天历史的事实源。每次用户消息先写入 `conversation_messages`，模型响应
-也在返回前写入同一会话；Run 的审批和真实架构结论同样作为消息保存。
-
-前端启动时调用：
-
-- `GET /api/v1/conversations` 获取会话列表；
-- `GET /api/v1/conversations/{session_id}/messages` 分页恢复正文；
-- `GET /api/v1/runs/{active_run_id}` 恢复当前任务状态。
-
-消息带有会话内 `sequence`、`agent_role` 和可选 `run_id`。角色切换不会删除历史，但
-ContextBuilder 只选择当前主 Agent 可见的角色私有消息。
-
-## 4. 文档版本与混合 RAG
-
-文档进入知识库后按以下方式处理：
-
-```text
-上传/聊天携带文档
-→ 计算内容 Hash 并幂等入库
-→ 保留 document + document_version
-→ 按标题和段落分块
-→ 提取关键词与本地语义特征
-→ 用户问题触发关键词 + 语义混合检索
-→ 仅把高排名分块交给 ContextBuilder
+```mermaid
+flowchart TD
+    U[用户消息 / 工程事件] --> P[保存真实消息或事件]
+    P --> X{高价值触发?}
+    X -- 否 --> C[ContextBuilder]
+    X -- 是 --> E[MemoryExtractorService]
+    E --> V[结构校验 + 真实来源校验]
+    V --> M[proposed / needs_review Memory]
+    M --> C
+    P --> S[ConversationSummaryService]
+    S --> R[按 session + agent_role 增量摘要]
+    R --> C
+    D[版本化文档 / Chunk] --> C
+    C --> F[确定性过滤与两阶段检索]
+    F --> B[统一 Token 预算选择]
+    B --> Q[实际模型上下文]
+    B --> A[Context Manifest 审计]
 ```
 
-关键词评分适合 `ready`、寄存器名和信号名等精确匹配；语义特征处理
-`backpressure/背压`、`handshake/握手` 等表达差异。当前语义特征是无需额外模型的
-确定性本地实现，接口可替换为企业内部 Embedding 服务。它不声称等价于通用向量模型。
+## 3. 会话摘要
 
-同一逻辑文档的新内容会创建新版本。旧版本和旧分块标记为 `superseded`，不会物理
-删除，默认检索只使用 active 版本。
+`ConversationSummaryService` 从 `ContextBuilderService` 中独立出来。摘要键是
+`session_id + agent_role`，Design 和 Verification 使用各自可见的历史。可见性规则与
+`SessionService.recent_messages()` 完全一致：只读取 `agent_role IS NULL` 或当前角色的消息。
 
-## 5. 长期记忆形成与演化
+更新过程：
 
-长期记忆状态：
+1. 永久保留最近 24 条可见消息原文；
+2. 计算即将移出窗口且尚未覆盖的消息范围；
+3. 当近期原文超过约 4,000 Token 时也提前移动最旧部分；窗口、批量和阈值由 `SummaryPolicy` 配置；
+4. 每批最多处理 10 条，复用已有结构化摘要；
+5. 真实模型可用时，通过 Provider 的结构化 JSON 输出合并目标、阶段、要求、决策、完成项、待办和问题；
+6. 对 `confirmed_requirements` 和 `important_decisions` 校验真实消息 ID。没有用户消息来源时，模型不能将条目标为 `user_confirmed`；
+7. 保存覆盖起止序号、全部来源消息 ID、内容 Hash、版本、生成模式和失败原因；
+8. 只有一批成功持久化后才推进 `covered_until_sequence`。
 
-```text
-proposed ──用户/文档/问题单确认──> active
-active ──来源版本被替代─────────> stale
+模型不可用时使用 `deterministic_extract`：它保存待处理消息的完整原文和来源，并明确写入“尚未完成语义摘要”。它不会用字符截断冒充语义总结。摘要整体放不进上下文时会被排除并写入 Manifest，不会裁掉摘要末尾后继续声称覆盖成功。
+
+旧 `conversation_summaries` 表保留，不删除。由于历史记录无法可靠判断角色，新代码不会直接注入旧混合摘要，而是从永久保存的原始消息按角色重建 `conversation_role_summaries`。
+
+## 4. 自动长期记忆提取
+
+`MemoryExtractorService` 不是每轮聊天都运行。只有以下事件进入提取流程：
+
+- 命中“确定、确认、必须、约束、后续按照”等高价值表达的用户消息；
+- 明确的时钟频率等可确定性识别的工程约束；
+- 正式文档版本入库；
+- Run 完成或审批恢复完成；
+- Delegate 完成并返回专家结论。
+
+明确的时钟约束可由确定性规则形成候选；其他复杂事件仅在真实模型可用时调用结构化提取。无模型时记录事件已检查或失败，不伪造候选。每个事件写入 `memory_extraction_events`，以 `source_type:source_id` 幂等；失败保存原因和尝试次数，可安全重试。
+
+模型只返回候选字段，不能直接更新数据库。Service 会检查：
+
+- `memory_key` 格式、类型、置信度和重要性；
+- 来源 ID 在消息、文档、Run、Delegate 或 Patch 表中真实存在；
+- Run、Delegate、Patch 等权威来源已经处于对应完成/应用状态；
+- `extraction_key` 未被处理过。
+
+自动提取结果始终是 `proposed`，与现有 active 事实冲突时进入 `needs_review`。
+
+## 5. 生命周期、冲突与权威性
+
+```mermaid
+stateDiagram-v2
+    [*] --> proposed
+    proposed --> active: 用户/正式来源确认
+    proposed --> needs_review: 与 active memory_key 冲突
+    needs_review --> active: 人工确认新约束
+    active --> stale: 全部有效来源被替代
+    active --> superseded: 更高权威的新事实生效
+    proposed --> rejected: 明确拒绝
+    stale --> active: 重新验证并绑定有效来源
 ```
 
-- Agent 推断默认只能形成 `proposed inference`，不能自动成为 active fact；
-- active 的 `fact` 和 `decision` 至少需要一个 `source_ref`；
-- 来源可指向文档版本、问题单、Run 或用户确认消息；
-- 文档换版时，引用旧 `version_id` 的记忆标记为 stale；
-- stale 记忆保留审计，但不会默认进入模型上下文；
-- `POST /memories/{id}/promote` 用于有权威证据后的显式提升。
+`fact` 和 `decision` 成为 active 时必须有可追溯来源。自动提取、模型摘要、Agent 建议和 Delegate 结论不能自动成为 active。当前系统允许以下方式激活：
 
-系统对记忆执行存储、来源约束、检索、提升与文档换版失效。Reflection 合并、矛盾
-聚类和遗忘属于受控治理动作，未经用户确认不得自动改变项目事实。
+- `POST /memories/{id}/promote`，并提供真实用户确认、正式文档、已完成 Run 或已应用 Patch 等来源；
+- 兼容旧 API 的显式 active 创建，但同样必须通过来源校验。
 
-## 6. ContextBuilder 与 Token 预算
+同一 `memory_key` 的新事实正式生效时，旧 active 事实原子地变为 `superseded`，并在 `memory_relations` 中建立 `supersedes` 关系。默认检索不会同时返回冲突的新旧事实。
 
-`ContextBuilderService` 在每次 Planner 调用前统一选择内容：
+## 6. 文档换版与来源级失效
 
-1. 近期消息优先，较早消息使用可追踪的抽取摘要；
-2. 只检索当前 project/module 的 active 长期记忆；
-3. 按当前问题对 active 文档分块做混合检索；
-4. 分别给历史、记忆和文档证据设置 Token 预算；
-5. 生成新的 `ChatRequest` 快照供 Intent、Selector、主 Agent 和 Delegate 共用。
+文档身份、版本、Chunk 和关联记忆更新位于一个 SQLite 事务中：
 
-Token 计数优先使用可选的 `tiktoken`，没有安装时使用偏保守的中英文估算。Runtime 仍有
-最后一道 Token 安全阀，但不再按字符数和上传顺序裁剪整篇文档。
+```text
+读取当前 active 版本
+→ 标记旧 version/chunk 为 superseded
+→ 将对应 memory_source 标记为 invalidated
+→ 检查每条 Memory 的其他 active 来源
+→ 写入新 version 和 chunks
+→ 一次提交
+```
 
-## 7. Context Manifest
+没有其他有效来源的 active 记忆变为 `stale`；仍有独立来源的记忆保持 active，但记录
+`review_reason`。历史版本、来源和记忆都不会删除。重新上传完全相同的历史版本是幂等查询，不会意外恢复为 active；显式“恢复旧版本”仍需要后续单独的治理接口。
 
-每次 Unified Run 都保存一条 `context_manifests`：
+## 7. 两阶段长期记忆检索
 
-- 使用的消息 ID；
-- 使用的长期记忆 ID；
-- 使用的文档 chunk ID；
-- 各区段估算 Token；
-- 主 Agent、总预算和创建时间。
+第一阶段进行确定性过滤：
 
-`GET /api/v1/runs/{run_id}/contexts` 可以回答：模型当时看到过哪版规格、为什么某段没有
-进入上下文、是否引用了已经失效的记忆。这是排查 RAG 和模型输出问题的审计入口。
+- `project_id`、`module_name`；
+- 默认只允许 `active`；
+- `project_shared` 或当前 Agent 自己的 `role_private`；
+- active fact/decision 必须仍有 active 来源；
+- Delegate 使用 `shared_only=True`，不会取得主 Agent 私有记忆。
 
-## 8. 部署与治理边界
+第二阶段计算关键词交集、importance、confidence、authority 和作用域匹配度。普通记忆必须达到最低关键词相关性，不会因为 `limit=8` 就填满八条无关内容；importance ≥ 9 的 active fact/decision 作为少量关键约束可强制候选。每条入选记忆在 Manifest 中记录分数和选择原因。
 
-- 文档语义特征使用本地轻量索引，适用于单机项目知识库；企业部署可通过检索适配器连接向量数据库；
-- 对话摘要使用确定性抽取，不调用模型补写事实，避免把推测写入历史；
-- Run Observation 随编排结果持久化，由 Run 标识完成追踪；
-- 记忆合并、反思和遗忘必须经过明确的治理策略与审计；
-- 默认部署面向可信单机用户；多用户环境必须在 API 前增加身份认证与项目 ACL。
+## 8. 统一 Token 预算
+
+默认总预算为 32,000 Token，并根据主模型 `max_output_tokens` 调整输出预留。默认参考额度：
+
+| 区段 | Token |
+|---|---:|
+| System / Tool Schema | 4,000 |
+| 当前请求与 Run | 3,000 |
+| 近期消息 | 6,000 |
+| 历史摘要 | 2,000 |
+| 长期记忆 | 2,000 |
+| RAG 文档 | 12,000 |
+| 输出安全预留 | 3,000（至少） |
+
+当前请求和安全预留先占用预算；摘要整体选择；近期消息从新到旧；长期记忆优先关键约束；文档最后使用本区额度以及前面未用额度。本轮刚提交的文档即使查询相关性为零，也作为当前请求证据保留候选，避免破坏 DS/RTL 工作流。
+
+如果强制保留区本身超过总预算，Builder 明确报错。其他未入选项记录类别、ID、Token、分数和原因，不静默丢弃。Runtime 仍保留最后一道输入安全阀。
+
+## 9. Context Manifest
+
+Manifest 描述实际发送给模型的上下文，包括：
+
+- 实际消息、Memory、Document Chunk ID；
+- 摘要角色、覆盖范围、来源消息 ID、版本和生成模式；
+- Memory 与 Chunk 的检索分数和选择原因；
+- 所有超预算或零相关候选的排除原因；
+- System/Run/Output 预留、各区实际 Token、未用额度和最终估算；
+- `prompt_hash` 与 `context_version`。
+
+`GET /api/v1/runs/{run_id}/contexts` 可用于复现一次 Run 当时看到的证据范围。
+
+## 10. Multi-Agent 隔离
+
+- Design / Verification 的消息原文和摘要按角色隔离；
+- 已批准项目事实和正式文档通过 `project_shared` 跨角色共享；
+- 私有 Memory 必须带 `owner_agent_role`；
+- Delegate 始终保留 `history: []`，只注入与 instruction 相关的共享 active Memory；
+- Expert 建议只作为 Observation 或 proposed Memory，不能直接覆盖正式事实；
+- 主 Agent 始终保留控制权，不发生 Handoff。
+
+## 11. 当前边界
+
+- 关键词/本地语义检索仍基于 SQLite 与确定性特征，没有引入外部向量数据库；
+- 文档历史版本可审计，但显式恢复某个 superseded 版本尚无独立 API；
+- 多用户部署仍需在当前角色模型之前增加真实身份认证与项目 ACL；
+- 摘要模型可进一步独立配置或异步批处理，但当前复用主 Provider，只有消息移出窗口时才调用。

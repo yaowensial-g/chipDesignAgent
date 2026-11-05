@@ -66,6 +66,7 @@ from app.services.session_service import session_service
 from app.services.delegation_service import delegation_service
 from app.services.document_service import document_service
 from app.services.memory_service import memory_service
+from app.services.memory_extractor_service import memory_extractor_service
 from app.services.context_builder_service import context_builder_service
 from app.tools.registry import tool_registry
 
@@ -258,7 +259,10 @@ async def get_context_manifest(context_id: str) -> ContextManifestView:
 @router.post("/memories", response_model=MemoryView, status_code=status.HTTP_201_CREATED)
 async def create_memory(request: MemoryCreateRequest) -> MemoryView:
     """显式形成候选/正式记忆；普通 Agent 回复不会自动成为长期事实。"""
-    return memory_service.create(request)
+    try:
+        return memory_service.create(request)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/memories", response_model=list[MemoryView])
@@ -276,6 +280,8 @@ async def promote_memory(memory_id: str, request: MemoryPromoteRequest) -> Memor
         return memory_service.promote(memory_id, request)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Memory not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/runs/{run_id}/delegations", response_model=list[DelegationResult])
@@ -304,7 +310,7 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             "cancel": "取消当前任务",
         }.get(request.action, request.action)
         agent_role = existing.primary_agent.value if existing.primary_agent else None
-        session_service.add_message(
+        decision_message = session_service.add_message(
             existing.session_id,
             "user",
             user_text,
@@ -313,6 +319,23 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             run_id=run_id,
             metadata={"action": request.action, "evidence_reference": request.evidence_reference},
         )
+        if request.action in {"approve", "accept_assumption", "provide_resolution"}:
+            memory_extractor_service.extract_from_message(
+                message_id=decision_message.message_id,
+                project_id=existing.project_id,
+                module_name=existing.module_name,
+                agent_role=agent_role or "design",
+                content=user_text,
+            )
+        if updated.status.value == "completed":
+            memory_extractor_service.extract_from_event(
+                source_type="run",
+                source_id=run_id,
+                project_id=existing.project_id,
+                module_name=existing.module_name,
+                agent_role=agent_role,
+                content=str(updated.result),
+            )
         assistant_text = (
             str(updated.pending_user_request.get("message"))
             if updated.pending_user_request and updated.pending_user_request.get("message")

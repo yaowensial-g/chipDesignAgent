@@ -62,6 +62,10 @@ Verification Agent
 - 专家不能再次 Delegate，避免递归和失控成本；
 - 委派失败或超时不会让专家接管会话，而是作为 Observation 返回主 Agent。
 
+专家上下文继续固定为 `history: []`。`DelegationService` 只按委派 instruction 检索
+`project_shared + active + 来源有效` 的长期记忆，角色私有摘要和 Memory 不会复制给 Expert。
+专家结论可以触发 proposed Memory 提取，但不能直接成为 active fact/decision。
+
 ### 2.3 两阶段动态 Tool 选择
 
 Tool 选择分为两阶段：
@@ -183,7 +187,8 @@ selector_max_output_tokens = 1000
 - `CHIP_AGENT_SELECTOR_MAX_TOOLS`
 - `CHIP_AGENT_SELECTOR_MAX_OUTPUT_TOKENS`
 
-没有启用真实模型时，`DeterministicRuntime` 提供可测试的关键词回退。它用于离线验证控制流，不代表真实语义能力。
+正式环境没有启用真实模型时会明确报错，不返回模拟设计结果。`DeterministicRuntime` 仅在
+`CHIP_AGENT_RUNTIME_MODE=test|mock|deterministic` 下用于离线验证控制流，不代表真实语义能力。
 
 ## 7. 代码落点
 
@@ -192,6 +197,10 @@ selector_max_output_tokens = 1000
 | `app/services/session_service.py` | 会话角色持久化和主 Agent 解析 |
 | `app/services/tool_selector_service.py` | 权限优先、Metadata-only 的候选 Tool 选择 |
 | `app/services/delegation_service.py` | 专家任务约束、执行、超时和持久化 |
+| `app/services/conversation_summary_service.py` | 按主 Agent 角色隔离的结构化增量摘要 |
+| `app/services/memory_extractor_service.py` | 高价值事件触发、幂等的 proposed Memory 提取 |
+| `app/services/memory_service.py` | 记忆权限、来源、生命周期、冲突和两阶段检索 |
+| `app/services/context_builder_service.py` | 统一 Token 预算与实际入模 Context Manifest |
 | `app/services/orchestrator_service.py` | 确定性控制平面和 Planner–Executor Loop |
 | `app/tools/registry.py` | Tool 权限、启停、分类和 Metadata 视图 |
 | `app/tools/orchestration.py` | 两个主 Agent 的 Tool 能力声明 |

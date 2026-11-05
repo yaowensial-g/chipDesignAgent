@@ -8,8 +8,9 @@
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +51,18 @@ class Database:
         with self._lock, self.connect() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [dict(row) for row in rows]
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """提供跨多条关联写操作的原子事务，同时复用现有进程锁和 WAL。"""
+        with self._lock, self.connect() as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield connection
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def _initialize(self) -> None:
         """幂等创建当前 Schema，并为旧数据库补充新增列。
@@ -202,6 +215,23 @@ class Database:
             updated_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES conversations(session_id)
         );
+        -- v2 摘要按角色隔离。旧表保留用于审计，但不再直接注入模型上下文；无法
+        -- 可靠判断角色的旧摘要会由各角色从原始消息安全重建。
+        CREATE TABLE IF NOT EXISTS conversation_role_summaries (
+            session_id TEXT NOT NULL,
+            agent_role TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            summary_text TEXT NOT NULL DEFAULT '',
+            covered_from_sequence INTEGER NOT NULL DEFAULT 0,
+            covered_until_sequence INTEGER NOT NULL DEFAULT 0,
+            source_message_ids_json TEXT NOT NULL DEFAULT '[]',
+            summary_version INTEGER NOT NULL DEFAULT 1,
+            generation_mode TEXT NOT NULL DEFAULT 'deterministic_extract',
+            last_error TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(session_id, agent_role),
+            FOREIGN KEY(session_id) REFERENCES conversations(session_id)
+        );
         -- 原始文档、版本和检索分块分表保存。新版本不会覆盖旧版本，旧版本仅被标记
         -- superseded，便于追踪“某条结论当时依据的是哪版 AS”。
         CREATE TABLE IF NOT EXISTS documents (
@@ -272,6 +302,20 @@ class Database:
             FOREIGN KEY(from_memory_id) REFERENCES memories(memory_id),
             FOREIGN KEY(to_memory_id) REFERENCES memories(memory_id)
         );
+        CREATE TABLE IF NOT EXISTS memory_extraction_events (
+            extraction_key TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            module_name TEXT,
+            agent_role TEXT,
+            status TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         -- Context Manifest 记录每次模型调用实际选中了哪些消息、记忆和文档分块。
         -- 它是调试“模型为什么没看到某条规格”的关键审计对象。
         CREATE TABLE IF NOT EXISTS context_manifests (
@@ -326,8 +370,12 @@ class Database:
             ON document_chunks(document_id, status, ordinal);
         CREATE INDEX IF NOT EXISTS idx_memories_scope
             ON memories(project_id, module_name, status, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_role_summaries_lookup
+            ON conversation_role_summaries(session_id, agent_role, covered_until_sequence);
         CREATE INDEX IF NOT EXISTS idx_memory_sources_source
             ON memory_sources(source_type, source_id);
+        CREATE INDEX IF NOT EXISTS idx_memory_extractions_source
+            ON memory_extraction_events(source_type, source_id, status);
         CREATE INDEX IF NOT EXISTS idx_context_run
             ON context_manifests(run_id, created_at);
         """
@@ -364,6 +412,61 @@ class Database:
                     connection.execute(
                         f"ALTER TABLE conversations ADD COLUMN {column} {declaration}"
                     )
+
+            memory_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(memories)")
+            }
+            memory_migrations = {
+                "memory_key": "TEXT",
+                "importance": "INTEGER NOT NULL DEFAULT 5",
+                "visibility": "TEXT NOT NULL DEFAULT 'project_shared'",
+                "owner_agent_role": "TEXT",
+                "review_reason": "TEXT",
+                "extraction_key": "TEXT",
+            }
+            for column, declaration in memory_migrations.items():
+                if column not in memory_columns:
+                    connection.execute(
+                        f"ALTER TABLE memories ADD COLUMN {column} {declaration}"
+                    )
+
+            source_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(memory_sources)")
+            }
+            source_migrations = {
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+                "invalidated_at": "TEXT",
+                "invalidation_reason": "TEXT",
+            }
+            for column, declaration in source_migrations.items():
+                if column not in source_columns:
+                    connection.execute(
+                        f"ALTER TABLE memory_sources ADD COLUMN {column} {declaration}"
+                    )
+
+            manifest_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(context_manifests)")
+            }
+            manifest_migrations = {
+                "summary_json": "TEXT NOT NULL DEFAULT '{}'",
+                "excluded_json": "TEXT NOT NULL DEFAULT '[]'",
+                "prompt_hash": "TEXT",
+                "context_version": "INTEGER NOT NULL DEFAULT 2",
+            }
+            for column, declaration in manifest_migrations.items():
+                if column not in manifest_columns:
+                    connection.execute(
+                        f"ALTER TABLE context_manifests ADD COLUMN {column} {declaration}"
+                    )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(project_id, module_name, memory_key, status)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(project_id, visibility, owner_agent_role, status)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_extraction_key ON memories(extraction_key) WHERE extraction_key IS NOT NULL"
+            )
             connection.commit()
 
     @staticmethod

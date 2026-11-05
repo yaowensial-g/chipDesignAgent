@@ -118,8 +118,8 @@ async def attach_request_id(request, call_next):
 | 数据类别 | 典型内容 | 是否直接修改 | 生命周期 | 主要存储 |
 |---|---|---:|---|---|
 | 当前请求 | 本轮用户消息、项目、模块、工作角色 | 用户输入 | 单次调用 | `ChatRequest`，同时写入消息表 |
-| 短期记忆 | 近期对话原文、较早对话摘要、Active Run | 系统维护 | 会话级 | `conversation_messages`、`conversation_summaries`、`conversations.active_run_id` |
-| 长期记忆 | 已确认项目事实、架构决策、有效假设 | 必须通过显式形成或提升 | 项目/模块级 | `memories`、`memory_sources` |
+| 短期记忆 | 近期对话原文、按角色增量摘要、Active Run | 系统维护 | 会话/角色级 | `conversation_messages`、`conversation_role_summaries`、`conversations.active_run_id` |
+| 长期记忆 | 已确认项目事实、架构决策、有效假设 | 高价值事件可形成 proposed；active 必须有权威来源 | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
 | 原始证据 | FS、AS、ICD、问题单、工具日志、Artifact | 原件不可由 Agent 随意改写 | 长期、版本化 | `document_versions`、`document_chunks`、Artifact、Raw Logs |
 
 这里最重要的边界是：**聊天里出现过一句话，不等于它已经成为长期事实；Agent
@@ -170,7 +170,7 @@ context = self.contexts.build(
 
 - [`app/services/orchestrator_service.py`](../app/services/orchestrator_service.py#L79)：解析会话、保存消息、调用 ContextBuilder；
 - [`app/services/session_service.py`](../app/services/session_service.py#L128)：生成 `message_id` 和会话内递增 `sequence`；
-- [`app/storage/database.py`](../app/storage/database.py#L164)：`conversations`、`conversation_messages` 和 `conversation_summaries` 表定义。
+- [`app/storage/database.py`](../app/storage/database.py)：会话消息、角色摘要、长期记忆和 Manifest 的兼容迁移。
 
 之所以“先保存、后构建”，有三个原因：
 
@@ -182,7 +182,7 @@ context = self.contexts.build(
 #### 2.2.4 第 3～4 步：短期记忆由“摘要 + 近期原文”组成
 
 ContextBuilder 不会把整个会话历史直接塞给模型。它先按 `session_id` 和 `agent_role`
-读取最多 24 条近期消息，再把窗口之前的内容形成确定性摘要：
+读取最多 24 条近期消息，再由独立的 `ConversationSummaryService` 处理窗口之前的内容：
 
 ```python
 recent = self.sessions.recent_messages(
@@ -191,23 +191,19 @@ recent = self.sessions.recent_messages(
     exclude_message_id=current_message_id,
     limit=24,
 )
-self._refresh_summary(session_id, recent)
-summary = self.sessions.get_summary(session_id)
+self.summaries.refresh(session_id, agent_role, recent)
+summary = self.sessions.get_summary(session_id, agent_role)
 ```
 
-这里有两种互补表示：
-
-- **较早摘要**：记录“第几条消息、谁说了什么”的压缩文本，最多约 3,000 Token；
-- **近期原文**：从最新消息向前选择，最多约 8,000 Token，之后恢复为正常时间顺序。
-
-摘要不是用模型自由改写，而是由 `_refresh_summary()` 对原消息做确定性抽取：每条保留
-`sequence`、角色和前 240 个字符。原始消息不会因为形成摘要而被删除。
-`covered_until_sequence` 表示摘要覆盖到哪一条消息，避免同一内容同时以摘要和原文进入 Prompt。
+摘要包含目标、阶段、已确认要求、重要决策、完成项、待办、开放问题和真实来源消息 ID。
+真实模型可用时只处理新增批次并复用旧摘要；模型失败不推进覆盖游标。离线回退保存待语义处理的
+完整原文，并明确标记没有完成语义概括。摘要不再通过截掉末尾控制长度；放不进预算时整体排除并记录原因。
+旧 `conversation_summaries` 不删除，但因无法可靠判断角色而不会直接注入，新摘要从原始消息安全重建。
 
 角色过滤同样发生在这里。Design 和 Verification 可以共享项目资料，但一个角色的私有聊天
 不会自动注入另一个角色的上下文。对应实现见
-[`ContextBuilderService.build()`](../app/services/context_builder_service.py#L56) 和
-[`ContextBuilderService._refresh_summary()`](../app/services/context_builder_service.py#L220)。
+[`ContextBuilderService.build()`](../app/services/context_builder_service.py) 和
+[`ConversationSummaryService`](../app/services/conversation_summary_service.py)。
 
 #### 2.2.5 文档写入路径：FS/AS/ICD 如何变成可检索证据
 
@@ -239,37 +235,36 @@ flowchart LR
 兼容旧前端时，`ChatRequest.documents` 中携带的正文也会在 ContextBuilder 开头自动入库；
 入库完成后，后续请求只需发送项目、模块和问题，不需要反复把整篇文档从浏览器传给模型。
 
-#### 2.2.6 第 5 步：长期记忆为什么不会自动形成
+#### 2.2.6 第 5 步：长期记忆如何受控形成
 
 `MemoryService` 把长期记忆设计成显式状态对象，而不是把聊天记录整体向量化。典型状态流是：
 
 ```mermaid
 stateDiagram-v2
     [*] --> proposed: Agent/用户提出候选事实
-    proposed --> active: 用户、问题单或正式文档确认
-    active --> stale: 来源文档被替代
+    proposed --> active: 用户、问题单、审批或正式文档确认
+    proposed --> needs_review: 与 active 稳定键冲突
+    needs_review --> active: 人工确认新约束
+    active --> stale: 全部有效来源被替代
+    active --> superseded: 更高权威新事实生效
     proposed --> rejected: 用户否决
     stale --> active: 重新评估并绑定有效来源
 ```
 
-`create()` 可以创建候选记忆并记录 `kind`、`confidence`、`authority` 和 `source_refs`；
-`promote()` 只有在补充用户、问题单或正式文档来源后，才把候选提升为 `active`。
-普通 Agent 回复不会自动调用这两个动作，因此不会悄悄污染项目事实。
+`MemoryExtractorService` 只在明确约束/确认、正式文档、完成 Run、审批和 Delegate 等高价值事件触发。
+复杂提取在真实模型可用时使用结构化输出；明确时钟约束可以确定性识别。所有自动结果只能进入
+`proposed`，与现有事实冲突时进入 `needs_review`。事件以真实来源 ID 幂等记录，失败不影响主请求并可重试。
+`promote()` 校验用户确认、正式文档、完成 Run 或应用 Patch 等真实来源后才允许进入 `active`。
 
-检索时只读取当前 `project_id/module_name` 下的 `active` 记忆，排序依据为：
-
-1. 查询与记忆内容的关键词交集比例；
-2. 记忆置信度；
-3. 最近更新时间。
-
-默认最多取 8 条。即使与查询没有明显关键词交集，也会保留少量高置信项目事实，避免模块时钟、
-复位极性等稳定约束因为问题措辞不同而完全丢失。
+检索分两阶段：先过滤项目、模块、角色可见性、active 状态和有效来源；再综合关键词、importance、
+confidence、authority 和作用域评分。普通记忆必须达到最低相关性，不会为了填满 limit 返回无关内容；
+importance ≥ 9 的少量 fact/decision 作为关键约束强制候选。相同 `memory_key` 的新事实正式生效时，
+旧事实原子变为 `superseded` 并建立替代关系。
 
 对应代码见：
 
-- [`MemoryService.create()`](../app/services/memory_service.py#L26)；
-- [`MemoryService.promote()`](../app/services/memory_service.py#L75)；
-- [`MemoryService.retrieve()`](../app/services/memory_service.py#L87)；
+- [`MemoryExtractorService`](../app/services/memory_extractor_service.py)；
+- [`MemoryService`](../app/services/memory_service.py)；
 - [`POST /memories` 与 promote API](../app/api/routes.py#L253)。
 
 #### 2.2.7 第 6 步：文档混合检索如何计算
@@ -290,8 +285,8 @@ stateDiagram-v2
 因此用户问“ready/valid 握手有什么要求”时，即使 AS 写的是“命令通道必须支持背压”，
 两段文本仍能通过 `handshake`、`backpressure` 等共同概念得到相似度，而不是只能依赖字面完全一致。
 
-检索先返回最多 14 个候选 Chunk，ContextBuilder 再按混合分数从高到低选择，文档证据预算上限约
-18,000 Token。每个送入模型的 `DocumentInput.content` 都带有：
+检索最多返回 50 个候选 Chunk，ContextBuilder 再按混合分数、当前请求证据身份和统一剩余预算选择。
+每个送入模型的 `DocumentInput.content` 都带有：
 
 ```text
 [RAG source: chunk=<chunk_id>; section=<section>; score=<score>]
@@ -311,15 +306,17 @@ Provider 的预算估算，不用于替代厂商账单。
 
 | 区域 | 选择策略 | 预算/数量 |
 |---|---|---:|
-| 较早会话摘要 | 确定性抽取后裁剪 | 约 3,000 Token |
-| 近期会话原文 | 从新到旧选择，再恢复顺序 | 约 8,000 Token |
-| 长期记忆 | active、作用域匹配、相关度排序 | 最多 8 条 |
-| 文档证据 | 混合分数排序的 active Chunk | 约 18,000 Token、最多 14 块 |
-| 当前问题 | 保留用户本轮原文 | 单独计数 |
+| System / Tool Schema | 预留 | 4,000 Token |
+| 当前请求与 Run | 强制保留；过大时明确报错 | 3,000 Token 起 |
+| 较早会话摘要 | 整体选择，不截掉末尾 | 参考 2,000 Token |
+| 近期会话原文 | 从新到旧选择，再恢复顺序 | 参考 6,000 Token |
+| 长期记忆 | active、权限/来源过滤、关键约束优先 | 参考 2,000 Token |
+| 文档证据 | 混合分数排序；复用前区未用额度 | 参考 12,000 Token |
+| 模型输出 | 按模型设置动态预留 | 至少 3,000 Token |
 
 `ContextBuilderService.token_budget` 默认为 32,000，写入 Manifest 作为本次调用的预算基线。
-代码通过各区域上限控制主要内容规模，并计算 `estimated_tokens`。其中长期记忆按条数控制而非单独
-硬裁剪，因此调整模型上下文窗口时，应同时检查总预算、记忆长度和 Provider 的输出预留空间。
+代码先扣除强制区和输出预留，再按优先级选择内容；文档区可使用前面未消耗的额度。关键记忆可借用
+普通记忆/文档额度。所有未入选候选都记录类别、ID、分数、Token 和原因，最终估算不得超过总预算。
 
 Token 实现见 [`app/services/token_service.py`](../app/services/token_service.py)，组装实现见
 [`app/services/context_builder_service.py`](../app/services/context_builder_service.py#L56)。
@@ -364,7 +361,10 @@ Intent Enricher、Tool Selector、主 Agent 和 Delegate 都从这个受控上�
 | `memory_ids` | 实际选中的长期记忆 |
 | `chunk_ids` | 实际送入模型的文档块 |
 | `observation_ids` | Tool Observation 的审计扩展位 |
-| `sections` | history、memory、documents、query 的条目数和 Token 数 |
+| `sections` | 预留与各区实际 Token、检索分数、选择原因和未用额度 |
+| `summary` | 摘要角色、覆盖范围、来源消息、版本和生成模式 |
+| `excluded` | 超预算或零相关候选的 ID、分数和排除原因 |
+| `prompt_hash` / `context_version` | 上下文快照校验与结构版本 |
 
 它回答的是“**这次模型到底看到了什么**”，而不是“数据库里有什么”。如果 Agent 漏掉某条接口要求，
 可以先通过 `GET /runs/{run_id}/contexts` 判断：
@@ -400,13 +400,15 @@ flowchart LR
     OldVersion --> OldChunks[旧 document_chunks = superseded]
     OldVersion --> Sources[查找引用旧 version/chunk 的 memory_sources]
     OldChunks --> Sources
-    Sources --> Stale[相关 memories = stale]
+    Sources --> Check{还有独立 active 来源?}
+    Check -- 否 --> Stale[相关 memories = stale]
+    Check -- 是 --> Keep[保持 active 并记录 review_reason]
     Stale --> Exclude[默认检索排除]
     New --> Active[新版 version/chunks = active]
 ```
 
-`DocumentService.ingest()` 在创建新版前收集旧 `version_id` 和 `chunk_id`，然后调用
-`MemoryService.invalidate_sources()`。失效只改变状态，不物理删除历史，因此仍然可以解释：
+`DocumentService.ingest()` 在同一个 SQLite 事务中更新版本、Chunk、来源状态和新版本数据，然后调用
+`MemoryService.invalidate_sources()` 做来源级治理。失效不物理删除历史，因此仍然可以解释：
 “这条 DS 结论当时依据哪版 AS，后来为什么失效。”
 
 只有重新评估结论、绑定新版文档或正式问题单来源并再次提升后，记忆才重新成为 `active`。
@@ -1199,8 +1201,8 @@ DS 正常运行使用 LangGraph `MemorySaver`，同时写应用快照。服务�
 
 | 领域 | 表 |
 |---|---|
-| 会话 | `conversations`、`conversation_messages`、`conversation_summaries` |
-| 上下文知识 | `documents`、`document_versions`、`document_chunks`、`memories`、`memory_sources`、`context_manifests` |
+| 会话 | `conversations`、`conversation_messages`、`conversation_role_summaries`（旧摘要表保留） |
+| 上下文知识 | `documents`、`document_versions`、`document_chunks`、`memories`、`memory_sources`、`memory_relations`、`memory_extraction_events`、`context_manifests` |
 | 控制面 | `runs`、`run_events`、`delegation_tasks` |
 | DS | `task_snapshots` |
 | 工程资产 | `workspaces`、`artifacts`、`patches` |

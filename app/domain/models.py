@@ -241,8 +241,15 @@ class TokenUsageView(BaseModel):
 
 class ConversationSummaryView(BaseModel):
     session_id: str
-    summary: str
+    agent_role: str
+    summary_json: dict[str, Any] = Field(default_factory=dict)
+    summary_text: str = ""
+    covered_from_sequence: int = 0
     covered_until_sequence: int
+    source_message_ids: list[str] = Field(default_factory=list)
+    summary_version: int = 1
+    generation_mode: str = "deterministic_extract"
+    last_error: str | None = None
     updated_at: str
 
 
@@ -304,11 +311,19 @@ class MemoryCreateRequest(BaseModel):
     project_id: str = Field(min_length=1)
     module_name: str | None = None
     scope: str = "module"
+    memory_key: str | None = Field(default=None, max_length=240)
     kind: Literal["fact", "decision", "assumption", "inference", "question", "preference", "experience"]
     content: str = Field(min_length=1)
     confidence: int = Field(default=5, ge=1, le=10)
+    importance: int = Field(default=5, ge=1, le=10)
     authority: str = "agent"
+    visibility: Literal["project_shared", "role_private"] = "project_shared"
+    owner_agent_role: str | None = None
+    review_reason: str | None = None
+    extraction_key: str | None = None
     source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    # 外部创建只能从 proposed/active 进入；stale/superseded/rejected/needs_review
+    # 由确定性生命周期规则产生，不能由任意请求直接指定。
     status: Literal["proposed", "active"] = "proposed"
 
     @model_validator(mode="after")
@@ -320,6 +335,8 @@ class MemoryCreateRequest(BaseModel):
         ]
         if self.status == "active" and self.kind in {"fact", "decision"} and not traceable_sources:
             raise ValueError("active fact/decision requires at least one source")
+        if self.visibility == "role_private" and not self.owner_agent_role:
+            raise ValueError("role_private memory requires owner_agent_role")
         return self
 
 
@@ -342,12 +359,20 @@ class MemoryView(BaseModel):
     project_id: str
     module_name: str | None = None
     scope: str
+    memory_key: str | None = None
     kind: str
     content: str
     confidence: int
+    importance: int = 5
     authority: str
+    visibility: str = "project_shared"
+    owner_agent_role: str | None = None
     status: str
+    review_reason: str | None = None
+    extraction_key: str | None = None
     source_refs: list[dict[str, Any]] = Field(default_factory=list)
+    retrieval_score: float | None = None
+    selection_reason: str | None = None
     created_at: str
     updated_at: str
 
@@ -364,6 +389,10 @@ class ContextManifestView(BaseModel):
     chunk_ids: list[str] = Field(default_factory=list)
     observation_ids: list[str] = Field(default_factory=list)
     sections: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    excluded: list[dict[str, Any]] = Field(default_factory=list)
+    prompt_hash: str | None = None
+    context_version: int = 2
     created_at: str
 
 

@@ -85,92 +85,105 @@ class DocumentService:
         self.memories = memories
 
     def ingest(self, request: DocumentIngestRequest) -> StoredDocumentView:
-        """幂等入库文档；新内容产生新版本并使旧版本及其推论失效。"""
+        """原子地写入新版本、分块并执行来源级记忆失效。"""
         content_hash = hashlib.sha256(request.content.encode("utf-8")).hexdigest()
-        document = self.db.fetch_one(
-            """SELECT * FROM documents
-            WHERE project_id = ? AND module_name = ? AND kind = ? AND name = ?""",
-            (request.project_id, request.module_name, request.kind.value, request.name),
-        )
-        if document is None:
-            document_id = str(uuid4())
-            self.db.execute(
-                """INSERT INTO documents
-                (document_id, project_id, module_name, kind, name, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    document_id,
-                    request.project_id,
-                    request.module_name,
-                    request.kind.value,
-                    request.name,
-                    utc_now(),
-                ),
-            )
-        else:
-            document_id = document["document_id"]
-
-        existing = self.db.fetch_one(
-            """SELECT version_id FROM document_versions
-            WHERE document_id = ? AND version = ? AND content_hash = ?""",
-            (document_id, request.version, content_hash),
-        )
-        if existing:
-            return self.get_version(existing["version_id"])  # type: ignore[return-value]
-
-        previous = self.db.fetch_all(
-            "SELECT version_id FROM document_versions WHERE document_id = ? AND status = 'active'",
-            (document_id,),
-        )
-        previous_ids = [row["version_id"] for row in previous]
-        previous_chunk_rows = self.db.fetch_all(
-            """SELECT chunk_id FROM document_chunks
-            WHERE version_id IN (SELECT version_id FROM document_versions
-                                 WHERE document_id = ? AND status = 'active')""",
-            (document_id,),
-        )
-        for previous_id in previous_ids:
-            self.db.execute(
-                "UPDATE document_versions SET status = 'superseded' WHERE version_id = ?",
-                (previous_id,),
-            )
-            self.db.execute(
-                "UPDATE document_chunks SET status = 'superseded' WHERE version_id = ?",
-                (previous_id,),
-            )
-        self.memories.invalidate_sources(
-            previous_ids + [row["chunk_id"] for row in previous_chunk_rows]
-        )
-
-        version_id = str(uuid4())
+        chunks = self._chunk(request.content)
         now = utc_now()
-        self.db.execute(
-            """INSERT INTO document_versions
-            (version_id, document_id, version, content_hash, content, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'active', ?)""",
-            (version_id, document_id, request.version, content_hash, request.content, now),
-        )
-        for ordinal, (section, content) in enumerate(self._chunk(request.content), start=1):
-            terms = _terms(content)
-            self.db.execute(
-                """INSERT INTO document_chunks
-                (chunk_id, document_id, version_id, section, ordinal, content, token_count,
-                 terms_json, embedding_json, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
-                (
-                    str(uuid4()),
-                    document_id,
-                    version_id,
-                    section,
-                    ordinal,
-                    content,
-                    self.tokens.count(content),
-                    self.db.dumps(terms),
-                    self.db.dumps(_feature_vector(terms)),
-                    now,
-                ),
+        version_id = str(uuid4())
+        with self.db.transaction() as connection:
+            document = connection.execute(
+                """SELECT * FROM documents
+                WHERE project_id = ? AND module_name = ? AND kind = ? AND name = ?""",
+                (request.project_id, request.module_name, request.kind.value, request.name),
+            ).fetchone()
+            if document is None:
+                document_id = str(uuid4())
+                connection.execute(
+                    """INSERT INTO documents
+                    (document_id, project_id, module_name, kind, name, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        document_id, request.project_id, request.module_name,
+                        request.kind.value, request.name, now,
+                    ),
+                )
+            else:
+                document_id = document["document_id"]
+
+            existing = connection.execute(
+                """SELECT version_id FROM document_versions
+                WHERE document_id = ? AND version = ? AND content_hash = ?""",
+                (document_id, request.version, content_hash),
+            ).fetchone()
+            if existing:
+                version_id = existing["version_id"]
+            else:
+                previous_ids = [
+                    row["version_id"]
+                    for row in connection.execute(
+                        "SELECT version_id FROM document_versions WHERE document_id = ? AND status = 'active'",
+                        (document_id,),
+                    ).fetchall()
+                ]
+                previous_chunk_ids = [
+                    row["chunk_id"]
+                    for row in connection.execute(
+                        """SELECT chunk_id FROM document_chunks
+                        WHERE version_id IN (SELECT version_id FROM document_versions
+                        WHERE document_id = ? AND status = 'active')""",
+                        (document_id,),
+                    ).fetchall()
+                ]
+                connection.execute(
+                    "UPDATE document_versions SET status = 'superseded' WHERE document_id = ? AND status = 'active'",
+                    (document_id,),
+                )
+                connection.execute(
+                    """UPDATE document_chunks SET status = 'superseded'
+                    WHERE document_id = ? AND status = 'active'""",
+                    (document_id,),
+                )
+                self.memories.invalidate_sources(
+                    previous_ids + previous_chunk_ids,
+                    connection=connection,
+                    reason=f"document_version_replaced_by:{version_id}",
+                )
+                connection.execute(
+                    """INSERT INTO document_versions
+                    (version_id, document_id, version, content_hash, content, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+                    (version_id, document_id, request.version, content_hash, request.content, now),
+                )
+                for ordinal, (section, content) in enumerate(chunks, start=1):
+                    terms = _terms(content)
+                    connection.execute(
+                        """INSERT INTO document_chunks
+                        (chunk_id, document_id, version_id, section, ordinal, content, token_count,
+                         terms_json, embedding_json, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+                        (
+                            str(uuid4()), document_id, version_id, section, ordinal,
+                            content, self.tokens.count(content), self.db.dumps(terms),
+                            self.db.dumps(_feature_vector(terms)), now,
+                        ),
+                    )
+        stored = self.get_version(version_id)
+        if stored is None:
+            raise RuntimeError("document version transaction committed without a readable version")
+        # 延迟导入避免 DocumentService/MemoryExtractor 的模块初始化环；提取失败只会
+        # 写入审计事件，不影响已原子提交的文档版本。
+        if self.db is database:
+            from app.services.memory_extractor_service import memory_extractor_service
+
+            memory_extractor_service.extract_from_event(
+                source_type="document_version",
+                source_id=version_id,
+                project_id=request.project_id,
+                module_name=request.module_name,
+                agent_role=None,
+                content=request.content[:20_000],
             )
-        return self.get_version(version_id)  # type: ignore[return-value]
+        return stored
 
     def get_version(self, version_id: str) -> StoredDocumentView | None:
         row = self.db.fetch_one(

@@ -11,6 +11,7 @@ Session 解析角色 → Intent → Tool 权限过滤 → 轻量 Selector → �
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +24,10 @@ from app.services.session_service import SessionService, session_service
 from app.services.context_builder_service import (
     ContextBuilderService,
     context_builder_service,
+)
+from app.services.memory_extractor_service import (
+    MemoryExtractorService,
+    memory_extractor_service,
 )
 from app.services.tool_selector_service import ToolSelectorService, tool_selector_service
 from app.services.token_usage_service import token_usage_tracker
@@ -49,6 +54,7 @@ class OrchestratorService:
         selector: ToolSelectorService = tool_selector_service,
         delegations: DelegationService = delegation_service,
         contexts: ContextBuilderService = context_builder_service,
+        memory_extractor: MemoryExtractorService = memory_extractor_service,
     ) -> None:
         self.runs = runs
         self.registry = registry
@@ -56,6 +62,7 @@ class OrchestratorService:
         self.selector = selector
         self.delegations = delegations
         self.contexts = contexts
+        self.memory_extractor = memory_extractor
         register_orchestration_tools()
 
     async def handle(self, request: ChatRequest) -> ChatResponse:
@@ -66,6 +73,16 @@ class OrchestratorService:
         finally:
             # 即使业务层抛错也必须恢复 ContextVar，防止后续请求继承本轮累计值。
             usage = token_usage_tracker.finish(usage_token)
+
+        if response.run and response.run.status.value == "completed":
+            self.memory_extractor.extract_from_event(
+                source_type="run",
+                source_id=response.run.run_id,
+                project_id=response.run.project_id,
+                module_name=response.run.module_name,
+                agent_role=response.run.primary_agent.value if response.run.primary_agent else None,
+                content=json.dumps(response.run.result, ensure_ascii=False),
+            )
 
         run_id = response.run.run_id if response.run else None
         conversation = self.sessions.record_token_usage(
@@ -117,6 +134,15 @@ class OrchestratorService:
             "user",
             request.message,
             agent_role=primary_agent.value,
+        )
+        # 仅高价值约束/确认语句触发；普通聊天不会额外调用提取模型。失败被记录，
+        # 不会阻断主 Agent 当前请求。
+        self.memory_extractor.extract_from_message(
+            message_id=user_message.message_id,
+            project_id=request.project_id,
+            module_name=request.module_name,
+            agent_role=primary_agent.value,
+            content=request.message,
         )
         context = self.contexts.build(
             session_id,

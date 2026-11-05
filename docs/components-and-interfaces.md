@@ -10,6 +10,10 @@
 | API Router | HTTP | JSON/结构化错误 | 无 |
 | ConversationService | 消息、历史、文档和工程上下文 | 普通回答或统一 Run | 间接 |
 | SessionService | session、项目、用户工作角色 | Design/Verification 主 Agent | SQLite |
+| ConversationSummaryService | 当前角色可见的旧消息、已有摘要 | 增量结构化摘要与覆盖游标 | SQLite |
+| MemoryExtractorService | 高价值消息、文档、审批、Run、Delegate | proposed Memory 候选与提取审计 | SQLite |
+| MemoryService | 项目/角色/查询/来源 | 生命周期治理与两阶段检索结果 | SQLite |
+| ContextBuilderService | L0-L3 候选、统一预算 | 实际模型快照与 Manifest | SQLite |
 | OrchestratorService | 消息、主 Agent、候选 Tool | TaskIntent、Tool Call、Observation、Run | SQLite（经 RunService） |
 | ToolSelectorService | 已授权 Tool Metadata、Intent | 有限 Tool Shortlist 和选择轨迹 | Run result |
 | DelegationService | 专家任务、裁剪上下文 | 结构化专家结果 | SQLite |

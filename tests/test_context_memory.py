@@ -53,6 +53,9 @@ def test_chat_is_persisted_and_context_manifest_is_auditable() -> None:
     assert len(manifests) == 1
     assert manifests[0]["token_budget"] > 0
     assert "documents" in manifests[0]["sections"]
+    assert manifests[0]["context_version"] == 2
+    assert manifests[0]["prompt_hash"]
+    assert isinstance(manifests[0]["excluded"], list)
 
 
 def test_hybrid_retrieval_matches_cross_language_engineering_concept() -> None:

@@ -86,11 +86,12 @@ sequenceDiagram
 保存本轮用户消息
 → 首次文档幂等入库、分块、索引
 → 读取当前角色的近期消息
-→ 较早消息形成可追踪抽取摘要
-→ 检索 active 长期记忆
+→ ConversationSummaryService 按角色增量处理窗口前消息
+→ 高价值事件按需形成 proposed Memory（普通聊天不额外调用模型）
+→ 过滤权限/状态/来源后，两阶段检索 active 长期记忆
 → 对 active 文档分块执行混合 RAG
-→ 按区段 Token 预算组装 effective_request
-→ 保存 Context Manifest
+→ 统一 Token 预算组装 effective_request，未选内容记录原因
+→ 保存含摘要范围、分数、排除项和 Prompt Hash 的 Context Manifest
 → Intent / Selector / Primary Agent / Delegate 复用同一快照
 ```
 

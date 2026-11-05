@@ -19,6 +19,11 @@ from app.domain.models import (
     DelegationResult,
 )
 from app.services.workspace_service import utc_now
+from app.services.memory_service import MemoryService, memory_service
+from app.services.memory_extractor_service import (
+    MemoryExtractorService,
+    memory_extractor_service,
+)
 from app.storage.database import Database, database
 
 
@@ -40,8 +45,15 @@ ALLOWED_EXPERTS = {
 class DelegationService:
     """在主 Agent 保留控制权的前提下执行有边界的专家任务。"""
 
-    def __init__(self, db: Database = database) -> None:
+    def __init__(
+        self,
+        db: Database = database,
+        memories: MemoryService = memory_service,
+        memory_extractor: MemoryExtractorService = memory_extractor_service,
+    ) -> None:
         self.db = db
+        self.memories = memories
+        self.memory_extractor = memory_extractor
 
     async def delegate(
         self,
@@ -142,6 +154,15 @@ class DelegationService:
                     task_id,
                 ),
             )
+            # 专家建议只能形成 proposed 候选，不能直接修改 active 项目事实。
+            self.memory_extractor.extract_from_event(
+                source_type="delegation",
+                source_id=task_id,
+                project_id=request_payload["project_id"],
+                module_name=request_payload.get("module_name"),
+                agent_role=to_agent.value,
+                content=conclusion,
+            )
         except TimeoutError:
             self._fail(task_id, DelegationStatus.TIMED_OUT, "Expert delegation timed out")
         except Exception as exc:
@@ -180,11 +201,19 @@ class DelegationService:
         )
         return [self.get(row["task_id"]) for row in rows]
 
-    @staticmethod
     def _scoped_context(
+        self,
         request_payload: dict[str, Any], delegation: DelegationRequest
     ) -> dict[str, Any]:
         """构造专家最小上下文，避免无边界复制主 Agent 私有历史。"""
+        shared_memories = self.memories.retrieve(
+            request_payload["project_id"],
+            request_payload["module_name"],
+            delegation.instruction,
+            limit=6,
+            agent_role=delegation.to_agent.value,
+            shared_only=True,
+        )
         return {
             "project_id": request_payload["project_id"],
             "module_name": request_payload["module_name"],
@@ -192,6 +221,17 @@ class DelegationService:
             "instruction": delegation.instruction,
             "documents": request_payload.get("documents", []),
             "history": [],
+            "_memory_context": [
+                {
+                    "memory_id": item.memory_id,
+                    "memory_key": item.memory_key,
+                    "kind": item.kind,
+                    "content": item.content,
+                    "authority": item.authority,
+                    "sources": item.source_refs,
+                }
+                for item in shared_memories
+            ],
             "workspace_id": request_payload.get("workspace_id"),
             "delegation": delegation.model_dump(mode="json"),
         }
