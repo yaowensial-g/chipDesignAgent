@@ -18,7 +18,7 @@
 | 层级 | 内容 | 主要存储 | 是否直接视为正式事实 |
 |---|---|---|---|
 | L0 当前执行状态 | 当前请求、Run、Observation、审批状态 | `runs`、`run_events` | 否，属于执行现场 |
-| L1 短期上下文 | 近期原文、角色摘要 | `conversation_messages`、`conversation_role_summaries` | 否，摘要是派生数据 |
+| L1 短期上下文 | 最近 5 轮完整原文、较早 30 轮独立摘要 | `conversation_messages`、`conversation_turn_summaries` | 否，摘要是派生数据 |
 | L2 长期记忆 | 项目事实、决策、假设、经验 | `memories`、`memory_sources`、`memory_relations` | 只有满足生命周期与来源规则的 active 项才可作为事实使用 |
 | L3 原始证据 | FS/AS/ICD、RTL、Artifact、日志 | `document_versions`、`document_chunks`、Workspace | 是证据，但仍需考虑版本和状态 |
 
@@ -30,13 +30,13 @@
 |---|---|---|
 | 请求编排 | [`orchestrator_service.py`](../app/services/orchestrator_service.py) | `OrchestratorService._handle()` |
 | 上下文选择和预算 | [`context_builder_service.py`](../app/services/context_builder_service.py) | `ContextBuilderService.build()`、`save_manifest()` |
-| 会话消息与角色可见性 | [`session_service.py`](../app/services/session_service.py) | `recent_messages()`、`visible_messages_between()`、`upsert_summary()` |
-| 增量摘要 | [`conversation_summary_service.py`](../app/services/conversation_summary_service.py) | `refresh()`、`_summarize()` |
+| 会话消息、轮次与角色可见性 | [`session_service.py`](../app/services/session_service.py) | `add_message()`、`completed_turns()`、`get_turn()` |
+| 独立轮次摘要 | [`conversation_summary_service.py`](../app/services/conversation_summary_service.py) | `enqueue_turn()`、`summarize_turn()`、`get_recent_turn_summaries()`、`retry_failed_summaries()` |
 | 长期记忆治理 | [`memory_service.py`](../app/services/memory_service.py) | `create()`、`promote()`、`retrieve()`、`invalidate_sources()` |
 | 自动候选提取 | [`memory_extractor_service.py`](../app/services/memory_extractor_service.py) | `extract_from_message()`、`extract_from_event()` |
 | 文档版本与检索 | [`document_service.py`](../app/services/document_service.py) | `ingest()`、`retrieve()` |
 | Delegate 上下文隔离 | [`delegation_service.py`](../app/services/delegation_service.py) | `_scoped_context()` |
-| 数据模型 | [`models.py`](../app/domain/models.py) | `ConversationSummaryView`、`MemoryView`、`ContextManifestView` |
+| 数据模型 | [`models.py`](../app/domain/models.py) | `ConversationTurnSummaryView`、`MemoryView`、`ContextManifestView` |
 | SQLite Schema 和迁移 | [`database.py`](../app/storage/database.py) | `Database._initialize()`、`transaction()` |
 | HTTP 查询和治理接口 | [`routes.py`](../app/api/routes.py) | `/memories`、`/contexts`、`/runs/{id}/contexts` |
 | 专项回归测试 | [`test_context_memory_v2.py`](../tests/test_context_memory_v2.py) | 长对话、角色隔离、冲突、换版、失败和迁移场景 |
@@ -64,9 +64,8 @@ sequenceDiagram
     E->>DB: 可选写 proposed/needs_review + extraction event
     O->>C: build(session, role, current_message_id)
     C->>D: 入库本轮携带的文档
-    C->>S: 最近 24 条可见消息，不含当前消息
-    C->>Q: refresh role summary
-    Q->>S: 增量读取和更新摘要
+    C->>S: 读取完整轮次，不含当前消息
+    C->>Q: 读取较早轮次 completed 摘要
     C->>M: 检索 active Memory
     C->>D: 检索 active Document Chunk
     C-->>O: effective_request + selection metadata
@@ -74,7 +73,10 @@ sequenceDiagram
     O->>C: save_manifest(run_id)
     O->>R: 发送实际上下文
     R-->>O: Agent/Tool 结果
-    O->>S: 保存 Assistant 消息
+    O->>S: 保存最终 Assistant 消息并绑定 turn_id
+    O-->>Q: 非阻塞 enqueue_turn
+    Q->>S: 后台只读取本轮 User + Assistant
+    Q->>DB: 幂等保存独立摘要
     O->>E: completed Run 可触发候选提取
 ```
 
@@ -87,6 +89,7 @@ sequenceDiagram
 `conversation_messages` 是会话正文的事实源。关键字段包括：
 
 - `sequence`：会话内单调递增的稳定游标；
+- `turn_id`：同一轮 User Request 与最终 Assistant Response 的稳定关联；
 - `role`：`user`、`assistant` 或 `system`；
 - `agent_role`：消息所属的 Design、Verification 等工作角色；
 - `message_type`：普通聊天、Run 决策等消息分类；
@@ -95,19 +98,19 @@ sequenceDiagram
 
 `SessionService.add_message()` 在 `Database.transaction()` 中同时分配 sequence、插入消息并更新会话标题、预览和计数，避免出现“消息写入成功但会话计数没有更新”的半完成状态。
 
-`conversation_role_summaries` 的主键是 `(session_id, agent_role)`。主要字段为：
+`conversation_turn_summaries` 每行只描述一轮完整问答，`turn_id` 唯一。主要字段为：
 
 | 字段 | 含义 |
 |---|---|
-| `summary_json` | 结构化摘要，供后续增量合并和校验 |
-| `summary_text` | 面向 Prompt 的可读渲染结果 |
-| `covered_from_sequence` / `covered_until_sequence` | 摘要覆盖区间；上下文选择实际依赖 `covered_until_sequence` |
-| `source_message_ids_json` | 摘要所依据的消息 ID |
-| `summary_version` | 每次 upsert 自动递增 |
-| `generation_mode` | `model_structured`、`deterministic_extract`、`visibility_gap` 或 `failed` |
-| `last_error` | 最近一次摘要失败原因；成功更新后清空 |
+| `id` / `turn_id` | 摘要 ID 与唯一轮次键；重复执行不会新增记录 |
+| `session_id` / `agent_role` / `sequence` | 会话、角色隔离和原始排序依据 |
+| `user_message_id` / `assistant_message_id` | 两条真实来源消息，支持追溯 |
+| `summary_json` / `token_count` | 独立结构化摘要及实际估算 Token |
+| `status` | `pending`、`processing`、`completed` 或 `failed` |
+| `attempts` / `last_error` | 后台重试次数与最近错误 |
+| `generation_mode` | `model_structured` 或测试模式的 `deterministic_turn` |
 
-旧的 `conversation_summaries` 表仍保留用于审计和兼容迁移，但新代码不会把无法判断角色的旧摘要直接放入 Prompt。
+旧的 `conversation_summaries` 和 `conversation_role_summaries` 表仍保留用于审计和兼容迁移，但新 ContextBuilder 不再读取或更新它们。
 
 ### 4.2 长期记忆
 
@@ -138,8 +141,8 @@ sequenceDiagram
 
 `context_manifests` 保存一次模型调用实际选中的证据集合，而不是仅保存配置。主要内容包括：
 
-- 消息、Memory、Document Chunk ID；
-- 摘要角色、覆盖范围、版本和生成模式；
+- 消息、原始 turn、独立摘要、Memory、Document Chunk ID；
+- `raw_turn_ids`、`turn_summary_ids` 和各区实际 Token；
 - 各区 Token 估算、检索分数和选择原因；
 - 所有被排除候选及排除原因；
 - `prompt_hash` 和 `context_version`。
@@ -152,47 +155,51 @@ sequenceDiagram
 agent_role IS NULL OR agent_role = :current_agent_role
 ```
 
-`SessionService.recent_messages()` 和 `visible_messages_between()` 使用同一规则。`agent_role IS NULL` 表示可被所有角色看到的公共消息；带角色的消息只对该角色可见。
+`SessionService.completed_turns()` 使用同一规则。`agent_role IS NULL` 表示可被所有角色看到的公共消息；带角色的消息只对该角色可见。
 
 这条规则同时约束：
 
-- 最近消息窗口；
-- 待摘要消息；
-- 摘要的来源消息集合。
+- 最近 5 个完整原文轮次；
+- 较早 30 个摘要或回退轮次；
+- 后台摘要读取的两条来源消息。
 
-因此，Verification 的摘要不会因为 sequence 位于 Design 消息之后就读取到 Design 私有正文。中间如果只有其他角色不可见的消息，摘要服务会以 `visibility_gap` 模式跨过 sequence 空洞，但不会复制正文。
+因此，Verification 的摘要不会因为 sequence 位于 Design 消息之后就读取到 Design 私有正文。
 
-## 6. 增量会话摘要
+## 6. 独立轮次摘要
 
-### 6.1 触发和窗口
+### 6.1 轮次识别与窗口
 
 `SummaryPolicy` 当前默认值为：
 
 ```python
-recent_window = 24
-batch_messages = 10
-trigger_tokens = 4_000
+recent_turns = 5
+history_turns = 30
+target_min_tokens = 150
+target_max_tokens = 250
+hard_max_tokens = 500
+summary_budget = 6_000
+max_workers = 2
+max_pending_tasks = 32
 ```
 
-`ContextBuilderService` 读取最近 24 条可见消息。摘要服务首先把“第 24 条之前”的消息设为基础 cutoff，然后从新到旧统计这 24 条消息。如果保留原文将超过约 4,000 Token，cutoff 会继续向新消息方向移动，让最旧的一部分提前进入摘要。
+一轮完整对话是一条 User Request 和对应的一条最终 Assistant Response。新写入消息共享 `turn_id`；兼容旧库时，`completed_turns()` 按 sequence 将一条旧 User 与其后的第一条旧 Assistant 配对。没有最终 Assistant 的当前请求、System 消息以及非消息形式的 Tool 调用不会构成完整轮次。
 
-需要注意：当前 `ContextBuilderService` 的 `limit=24` 与 `SummaryPolicy.recent_window=24` 是两个代码位置。若要调整窗口，应同步修改或把它们进一步收敛为单一配置源。
+ContextBuilder 保留最近 5 个完整轮次原文，并从它们之前取最近 30 个完整轮次。窗口以轮次而不是消息条数滑动，因此最近原文最多是 10 条消息。
 
-### 6.2 批量增量算法
+### 6.2 生成时机和有界队列
 
-摘要不是每次重算全部历史，而是按 `covered_until_sequence` 继续：
+摘要不在 `ContextBuilder.build()` 中生成。普通编排和 Run Resume 都执行：
 
 ```text
-读取 role summary 的 covered_until
-→ 查询 (covered_until, cutoff] 内当前角色可见消息
-→ 每次最多取 10 条
-→ 将“已有结构化摘要 + 新批次原文”合并
-→ 校验来源和确认状态
-→ 持久化成功后才推进 covered_until
-→ 循环直到追上 cutoff
+保存 User Request（生成 turn_id）
+→ Agent / Tool 执行
+→ 保存最终 Assistant Response（复用 turn_id）
+→ enqueue_turn 非阻塞投递
+→ Worker 重新读取本轮两条消息
+→ 生成并 Upsert 独立摘要
 ```
 
-这种设计使 140 条消息和 10,000 条消息的单次增量成本都受批量大小约束，也避免重复处理已经覆盖的消息。
+线程池最多 2 个 Worker，并用 32 个 Semaphore 槽位限制待处理任务。队列满时记录保持 pending，不无限创建线程。`turn_id` 的数据库唯一约束和进程内 scheduled 集合防止重复记录与重复排队；`retry_failed_summaries()` 可重新投递 pending/failed 任务。摘要异常不会覆盖已经持久化的 Assistant 消息，也不会让正常请求失败。
 
 ### 6.3 结构化摘要内容
 
@@ -200,60 +207,50 @@ trigger_tokens = 4_000
 
 ```json
 {
-  "current_goal": "",
-  "current_stage": "",
-  "confirmed_requirements": [],
-  "important_decisions": [],
-  "completed_work": [],
-  "pending_tasks": [],
+  "topic": "",
+  "module": "",
+  "user_intent": "",
+  "key_information": [],
+  "decisions": [],
+  "constraints": [],
+  "assumptions": [],
+  "inferences": [],
   "open_questions": [],
-  "source_message_ids": []
+  "keywords": []
 }
 ```
 
-其中 `confirmed_requirements` 和 `important_decisions` 的每一项都应包含 `content`、`source_message_ids` 和 `confirmation_status`。
+`decisions` 和 `constraints` 的每一项包含 `content`、`source_message_ids` 和 `confirmation_status`。允许状态为 `user_confirmed`、`assistant_suggestion`、`unconfirmed` 或 `historical`。
 
-模型输出不会被直接信任。`_validate_model_summary()` 会：
+模型输出不会被直接信任。`_validate()` 会：
 
-1. 只保留现有摘要或本批次中真实存在的 source ID；
-2. 只有来源集合中存在用户消息时才允许 `user_confirmed`；
+1. source ID 只能是本轮 User 或 Assistant 消息；
+2. 只有来源包含本轮 User 消息时才允许 `user_confirmed`；
 3. 将未知确认状态降为 `unconfirmed`；
-4. 限制单项长度，避免异常输出无限放大摘要；
-5. 保存每条源消息的 SHA-256 内容摘要，便于发现来源变化；
-6. 对来源 ID 去重并保持首次出现顺序。
+4. 不读取旧摘要，也不把 Assistant 建议自动提升为用户决策；
+5. 对来源 ID 去重并保持首次出现顺序。
 
-### 6.4 何时调用 LLM
+### 6.4 长度和失败处理
 
-只有同时满足以下条件时，摘要才调用主模型 Provider：
+生产模式复用主模型 Provider。Prompt 要求 150–250 Token；首次结果超过 500 Token 时发起一次结构化压缩，压缩后仍超限则任务标为 failed，不保存超长 completed 摘要。测试/Mock 模式使用短小、可追溯的 `deterministic_turn`，但同样只依据本轮两条消息。
 
-- 有消息需要移出近期原文窗口或因 Token 阈值提前压缩；
-- 运行模式不是 `test/mock/deterministic`；
-- 主模型配置 `ready`。
+`conversation_turn_summaries.status` 的含义：
 
-因此普通短会话不会额外产生摘要调用。当前摘要复用主模型端点，没有独立的摘要模型配置。
+- `pending`：已登记，等待 Worker；
+- `processing`：Worker 已领取；
+- `completed`：结构化摘要已通过长度与来源校验；
+- `failed`：模型、解析、压缩或持久化前校验失败，可重试。
 
-### 6.5 无模型和模型失败不是同一条路径
+### 6.5 摘要进入 Prompt 和原文回退
 
-无模型或测试模式使用 `deterministic_extract`。它会完整保存待处理消息的 ID、sequence、角色和原文，并写入：
-
-```text
-确定性回退仅保存待语义处理的原文，没有宣称完成语义总结。
-```
-
-它是可追溯存档，不冒充语义摘要。
-
-如果已配置的模型在调用中抛错，服务会记录 `last_error`，但不会推进 `covered_until_sequence`。下一次构建从同一批消息重试。`ContextBuilderService` 会把窗口外、尚未覆盖的可见原文作为强制候选补回本轮上下文；如果这些原文本身已经超过剩余总预算，系统明确报错，而不是静默丢失。
-
-### 6.6 摘要进入 Prompt 的规则
-
-摘要以一个完整的 Assistant 历史消息加入：
+ContextBuilder 只注入 completed 摘要，并以原始 sequence 排序：
 
 ```text
-[较早会话摘要 role=design; 覆盖消息 1-116; mode=model_structured]
-...
+[独立轮次摘要 turn_id=<id>; sequence=<n>; role=design]
+{...结构化 JSON...}
 ```
 
-当前实现不会截断摘要尾部。摘要整体放不进剩余预算时，整个摘要被排除，并在 Manifest 中记录 `category=summary` 和原因。原始消息仍在数据库中，但不保证所有历史都能同时进入单次有限 Prompt。
+若对应轮次没有 completed 摘要，则该轮 User 和 Assistant 原文一起回退。摘要与其来源原文不会同时注入。摘要、回退原文和最近原文都作为完整单元参与预算；放不下时整轮排除，并在 Manifest 的 `excluded` 中记录原因。
 
 ## 7. 长期记忆如何形成
 
@@ -500,13 +497,13 @@ score = lexical × 0.55
 |---|---:|---|
 | System + Tool Schema | 4,000 | 固定预留 |
 | 当前请求与 Run | 3,000 | 至少预留 3,000；请求更长时按请求估算增加 |
-| 近期消息 | 6,000 | 普通近期消息硬参考上限；未摘要原文可扩张到剩余预算 |
-| 摘要 | 2,000 | 当前字段是规划参考值；代码实际按“能否整体放入剩余预算”判断 |
+| 最近 5 轮原文 | 6,000 | User/Assistant 以完整轮次原子选择 |
+| 较早 30 轮 | 6,000 | completed 摘要；未完成时使用完整原文回退 |
 | 长期记忆 | 2,000 | 普通 Memory 上限；关键约束可借用剩余预算 |
 | 文档 | 12,000 | 当前字段是规划参考值；代码实际使用最后的全部剩余预算 |
 | 输出预留 | 3,000 | 至少 3,000；默认配置会参考模型 `max_output_tokens`，最高按 8,000 预留 |
 
-`summary` 和 `documents` 配置项目前不是独立硬切片，这是理解现有代码时容易忽略的细节。它们保留了未来做动态配额或严格分区的扩展点。
+`recent_messages` 和 `summary` 分别作为最近原文轮次和较早摘要/回退轮次的目标上限；所有区段仍受统一总预算约束。`documents` 最后使用剩余额度。
 
 固定区计算为：
 
@@ -525,27 +522,27 @@ fixed = system_and_tools
 Builder 严格按下面顺序消费预算：
 
 1. 入库本轮随请求携带的文档；
-2. 读取最近 24 条当前角色可见消息；
-3. 刷新增量摘要；
+2. 识别当前角色全部完整问答轮次，当前 User 不进入历史；
+3. 划分最近 5 轮原文和更早的最近 30 轮；
 4. 预留 System、当前请求和输出空间；
-5. 整体选择历史摘要；
-6. 强制选择摘要失败后仍未覆盖的窗口外原文；
-7. 从新到旧选择普通近期消息，再恢复时间顺序；
+5. 从新到旧按整轮选择最近原文；
+6. 对更早轮次选择 completed 独立摘要，缺失时选择完整原文回退；
+7. 将已选单元恢复为原始 sequence 顺序；
 8. 检索并选择长期记忆；
 9. 检索并选择文档 Chunk；
 10. 生成 `effective_request`、Manifest 数据和 hash。
 
-这个顺序体现了当前优先级：**当前请求和输出安全 > 未覆盖原文 > 近期对话 > 关键 Memory > 相关文档。** 摘要位于近期原文之前选择，但它必须整体放入；放不下时会进入排除记录。
+这个顺序体现了当前优先级：**当前请求和输出安全 > 最近完整轮次 > 较早摘要/完整回退 > 关键 Memory > 相关文档。**
 
-### 11.4 近期消息选择
+### 11.4 完整轮次选择
 
-普通近期消息从最新向最旧扫描，优先保留最靠近当前请求的内容，选完后再恢复时间正序。每个因预算不足被跳过的消息都会写入：
+最近轮次和较早轮次都从最新向最旧扫描，优先保留靠近当前请求的内容，选完后再恢复时间正序。User/Assistant 的 Token 成本相加后一次判断，绝不拆分。排除记录示例：
 
 ```json
 {
-  "category": "recent_message",
-  "id": "<message_id>",
-  "reason": "近期消息区预算不足",
+  "category": "raw_turn",
+  "id": "<turn_id>",
+  "reason": "近期完整问答区预算不足；整轮排除",
   "tokens": 123
 }
 ```
@@ -580,14 +577,14 @@ Builder 请求最多 50 个 Chunk。零分 Chunk 默认排除，但本轮刚上�
 
 `effective_request` 会替换两部分：
 
-- `history`：摘要消息 + 近期原文；
+- `history`：较早独立摘要或完整回退轮次 + 最近 5 轮完整原文；
 - `documents`：选择后的 RAG Chunk。
 
 当前问题仍保留在 `message`。Orchestrator 另外加入两个内部字段：
 
 ```text
 _memory_context
-_context_manifest = {message_ids, memory_ids, chunk_ids}
+_context_manifest = {message_ids, turn_summary_ids, raw_turn_ids, memory_ids, chunk_ids}
 ```
 
 这些下划线字段属于模型运行时上下文，不污染公共 `ChatRequest` API 契约。
@@ -602,13 +599,13 @@ Builder 完成后，Orchestrator 先创建 Run，再调用 `save_manifest(sessio
 
 `sections` 记录：
 
-- history、summary、memory、documents 的条目数和 Token；
+- history、summary、raw_conversation、memory、documents 的条目数和 Token；
 - Memory/Chunk 分数与选择原因；
 - query Token；
 - System、当前请求、输出的预留；
 - 未使用 Token。
 
-`excluded` 记录摘要过大、消息区不足、Memory 区不足、文档零相关或文档区不足等情况。排除不是错误，但它使“模型为什么没看到某条信息”可以被定位。
+`excluded` 记录完整原文轮次、轮次摘要、回退轮次、Memory 或文档因预算/相关性被排除的原因。排除不是错误，但它使“模型为什么没看到某条信息”可以被定位。
 
 ### 12.3 prompt_hash 的准确含义
 
@@ -616,9 +613,9 @@ Builder 完成后，Orchestrator 先创建 Run，再调用 `save_manifest(sessio
 
 - 当前 `request.message`；
 - 被选中的 message ID；
+- `turn_summary_ids` 与 `raw_turn_ids`；
 - Memory ID；
 - Chunk ID；
-- summary version。
 
 它是上下文选择快照标识，**不是最终序列化 Prompt 全文的哈希**。例如 System Prompt 文案变化不会必然改变该值。如果未来需要严格重放，应额外保存 Prompt 模板版本、模型配置和最终序列化正文哈希。
 
@@ -744,14 +741,13 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 
 `Database._initialize()` 使用 `CREATE TABLE IF NOT EXISTS` 和 `PRAGMA table_info` + 条件 `ALTER TABLE ADD COLUMN` 做增量迁移。重复启动不会重复添加字段，旧数据不会被删除。
 
-当前 v2 迁移包括：
+本轮轮次摘要迁移包括：
 
-- 新建 `conversation_role_summaries`；
-- 新建 `memory_extraction_events`；
-- 为 `memories` 增加 key、importance、visibility、owner、review reason、extraction key；
-- 为 `memory_sources` 增加状态和失效信息；
-- 为 `context_manifests` 增加 summary、excluded、hash 和 context version；
-- 增加作用域、可见性、来源和幂等索引。
+- 为 `conversation_messages` 增加可空 `turn_id`，不改写旧正文；
+- 新建 `conversation_turn_summaries`，并对 `turn_id` 建唯一约束；
+- 为 `context_manifests` 增加 `turn_summary_ids_json` 和 `raw_turn_ids_json`；
+- 新 Manifest 写入 `context_version=3`；
+- 保留 `conversation_summaries`、`conversation_role_summaries` 及其中历史数据。
 
 `Database.transaction()` 使用进程内可重入锁和 SQLite `BEGIN IMMEDIATE`。当前需要原子性的关键操作包括：
 
@@ -764,11 +760,11 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 
 ## 17. 测试如何证明这些行为
 
-[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖二十二个关键场景：
+[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖二十五个关键场景：
 
 | 测试 | 验证内容 |
 |---|---|
-| `test_long_conversation_is_incremental_lossless_and_budgeted` | 140 条消息、增量游标、幂等、原文持久化和总预算 |
+| `test_context_uses_five_raw_turns_and_thirty_independent_summaries` | 40 轮识别、最近 5 轮原文、较早 30 轮独立摘要和当前消息排除 |
 | `test_role_summaries_are_isolated_but_shared_fact_is_visible` | Design/Verification 摘要隔离与共享 active 事实 |
 | `test_constraint_extraction_promotion_and_cross_session_retrieval` | 模型候选入库、消息来源、调用幂等、promote 和跨会话检索 |
 | `test_message_model_handles_non_keyword_and_multiple_constraints` | 无关键词 FIFO 约束进入模型，以及单消息多候选 |
@@ -787,7 +783,10 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 | `test_conflicting_confirmed_constraint_supersedes_old_fact` | needs_review、原子替代和默认只返回新事实 |
 | `test_document_upgrade_invalidates_only_affected_source_and_is_atomic` | 来源级失效、独立来源保活和事务回滚 |
 | `test_delegate_receives_shared_memory_but_not_private_history` | Delegate 无历史、只接收共享 Memory |
-| `test_summary_failure_does_not_advance_cursor` | Provider 失败不推进游标，窗口外原文补回 |
+| `test_failed_or_missing_turn_summaries_fall_back_to_complete_raw_turns` | failed/未生成摘要回退完整原文，不丢信息或拆半轮 |
+| `test_turn_summary_is_idempotent_and_background_queue_uses_worker` | turn_id Upsert 幂等和后台 Worker 投递 |
+| `test_turn_summary_hard_limit_uses_compression_before_save` | 超过 500 Token 先压缩再保存 |
+| `test_turn_budget_never_splits_user_and_assistant_and_manifest_traces_turns` | 预算原子选择和 Manifest 轮次追溯 |
 | `test_memory_extraction_failure_is_audited_and_retry_is_idempotent` | 提取失败审计、重试和候选幂等 |
 | `test_schema_migration_is_repeatable_and_legacy_summary_is_not_trusted` | 增量迁移可重复、旧混合摘要不进入新上下文 |
 
@@ -806,10 +805,10 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 依次检查：
 
 1. 消息的 `agent_role` 是否与当前角色一致；
-2. 消息 sequence 是否已经被摘要覆盖；
-3. 对应 role summary 是否存在 `last_error`；
-4. Manifest 的 `message_ids` 和 `summary.covered_until_sequence`；
-5. `excluded` 是否记录近期消息或摘要预算不足。
+2. User 和最终 Assistant 是否具有相同 turn_id，或能否按旧消息 sequence 配对；
+3. 对应 turn summary 是否为 completed，failed 时查看 `last_error`；
+4. Manifest 的 `message_ids`、`raw_turn_ids` 和 `turn_summary_ids`；
+5. `excluded` 是否记录 raw_turn、raw_turn_fallback 或 turn_summary 预算不足。
 
 ### 18.2 模型没有看到某条 Memory
 
@@ -838,14 +837,14 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 两类报错需要区分：
 
 - 固定区超过总预算：当前请求过大，或 System/输出预留配置不合理；
-- 摘要失败后的未覆盖原文超过剩余预算：先恢复摘要 Provider、重试摘要，或提高预算，不能通过静默截断解决。
+- 完整原文轮次或摘要单元超过对应预算：检查 `excluded`，恢复摘要 Provider、重试失败摘要或提高预算；系统不会拆散半轮。
 
 ## 19. 当前边界与后续演进
 
 当前实现有意保留以下边界：
 
 1. Memory 和文档语义检索仍是 SQLite + 确定性本地特征，不是外部向量数据库；
-2. 摘要同步复用主 Provider，尚未支持独立低成本摘要模型或后台批处理；
+2. 摘要后台复用主 Provider，尚未支持独立低成本摘要模型配置或跨轮批处理；
 3. `ContextBudgetConfig.summary/documents` 目前是参考额度，不是独立硬上限；
 4. `prompt_hash` 不是最终 Prompt 全文哈希；
 5. `external` 来源为兼容入口，无法由本地数据库验证其真实性；

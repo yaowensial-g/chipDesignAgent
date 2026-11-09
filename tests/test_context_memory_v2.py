@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -37,48 +38,35 @@ def _conversation(sessions: SessionService, session_id: str, role=UserRole.DESIG
     return sessions.resolve(session_id, "project", role, "uart")
 
 
-def test_long_conversation_is_incremental_lossless_and_budgeted(services) -> None:
+def _turn(sessions: SessionService, session_id: str, index: int, role: str = "design"):
+    user = sessions.add_message(
+        session_id, "user", f"user-{index}", agent_role=role
+    )
+    assistant = sessions.add_message(
+        session_id, "assistant", f"assistant-{index}", agent_role=role,
+        turn_id=user.turn_id,
+    )
+    return user, assistant
+
+
+def test_context_uses_five_raw_turns_and_thirty_independent_summaries(services) -> None:
     db, sessions, memories, documents, summaries, tokens = services
     _conversation(sessions, "long")
-    for index in range(140):
-        sessions.add_message(
-            "long",
-            "user" if index % 2 == 0 else "assistant",
-            f"message-{index} " + ("constraint-data " * 8),
-            agent_role="design",
-        )
+    turns = [_turn(sessions, "long", index) for index in range(40)]
+    completed = sessions.completed_turns("long", agent_role="design")
+    assert len(completed) == 40
+    for turn in completed:
+        summary = summaries.summarize_turn(turn.turn_id, "design")
+        assert summary.status == "completed"
+        assert summary.user_message_id == turn.user.message_id
+        assert summary.assistant_message_id == turn.assistant.message_id
     current = sessions.add_message("long", "user", "current request", agent_role="design")
-    recent = sessions.recent_messages(
-        "long", agent_role="design", exclude_message_id=current.message_id, limit=24
-    )
-    summaries.refresh("long", "design", recent)
-    first = sessions.get_summary("long", "design")
-    assert first is not None
-    assert first.covered_until_sequence == recent[0].sequence - 1
-    assert len(first.source_message_ids) == len(set(first.source_message_ids))
-    assert first.generation_mode == "deterministic_extract"
-    assert first.summary_json["unprocessed_semantic_messages"][-1]["message_id"] == first.source_message_ids[-1]
-
-    summaries.refresh("long", "design", recent)
-    repeated = sessions.get_summary("long", "design")
-    assert repeated.covered_until_sequence == first.covered_until_sequence
-    assert repeated.source_message_ids == first.source_message_ids
     assert db.fetch_one(
         "SELECT COUNT(*) AS count FROM conversation_messages WHERE session_id = ?", ("long",)
-    )["count"] == 141
+    )["count"] == 81
 
     builder = ContextBuilderService(
         db, sessions, documents, memories, summaries, tokens,
-        budget_config=ContextBudgetConfig(
-            total=4_000,
-            system_and_tools=400,
-            current_request_and_run=300,
-            recent_messages=900,
-            summary=500,
-            long_term_memory=300,
-            documents=1_200,
-            output_reserve=400,
-        ),
     )
     result = builder.build(
         "long",
@@ -86,33 +74,38 @@ def test_long_conversation_is_incremental_lossless_and_budgeted(services) -> Non
         "design",
         current.message_id,
     )
-    assert result.estimated_tokens <= 4_000
-    assert result.excluded
+    assert result.raw_turn_ids == [turn[0].turn_id for turn in turns[-5:]]
+    assert len(result.message_ids) == 10
+    assert len(result.turn_summary_ids) == 30
+    assert result.summary["turn_ids"] == [
+        turn[0].turn_id for turn in turns[5:35]
+    ]
+    assert current.message_id not in result.message_ids
+    assert result.estimated_tokens <= 32_000
 
 
 def test_role_summaries_are_isolated_but_shared_fact_is_visible(services) -> None:
     _, sessions, memories, _, summaries, _ = services
     _conversation(sessions, "roles")
-    design_ids = []
-    for index in range(35):
-        design_ids.append(sessions.add_message(
-            "roles", "user", f"DESIGN-SECRET-{index}", agent_role="design"
-        ).message_id)
-    design_recent = sessions.recent_messages("roles", agent_role="design", limit=24)
-    summaries.refresh("roles", "design", design_recent)
+    design_turns = [_turn(sessions, "roles", index, "design") for index in range(6)]
+    for turn in sessions.completed_turns("roles", agent_role="design"):
+        summaries.summarize_turn(turn.turn_id, "design")
 
     sessions.set_role("roles", UserRole.VERIFICATION_ENGINEER)
-    verification_ids = []
-    for index in range(35):
-        verification_ids.append(sessions.add_message(
-            "roles", "user", f"VERIFY-PRIVATE-{index}", agent_role="verification"
-        ).message_id)
-    verification_recent = sessions.recent_messages("roles", agent_role="verification", limit=24)
-    summaries.refresh("roles", "verification", verification_recent)
-    verification_summary = sessions.get_summary("roles", "verification")
-    assert verification_summary is not None
-    assert set(verification_summary.source_message_ids) <= set(verification_ids)
-    assert "DESIGN-SECRET" not in verification_summary.summary_text
+    verification_turns = [
+        _turn(sessions, "roles", index, "verification") for index in range(6)
+    ]
+    for turn in sessions.completed_turns("roles", agent_role="verification"):
+        summaries.summarize_turn(turn.turn_id, "verification")
+    verification_summaries = summaries.get_recent_turn_summaries(
+        "roles", "verification", limit=30
+    )
+    assert {item.turn_id for item in verification_summaries} == {
+        turn[0].turn_id for turn in verification_turns
+    }
+    assert not ({turn[0].turn_id for turn in design_turns} & {
+        item.turn_id for item in verification_summaries
+    })
 
     memories.create(MemoryCreateRequest(
         project_id="project", module_name="uart", memory_key="uart.clock_frequency",
@@ -639,18 +632,20 @@ def test_delegate_receives_shared_memory_but_not_private_history(services) -> No
     assert [item["memory_key"] for item in scoped["_memory_context"]] == ["uart.clock_frequency"]
 
 
-def test_summary_failure_does_not_advance_cursor(services, monkeypatch) -> None:
+def test_failed_or_missing_turn_summaries_fall_back_to_complete_raw_turns(
+    services, monkeypatch
+) -> None:
     db, sessions, memories, documents, summaries, tokens = services
     _conversation(sessions, "failure")
-    for index in range(30):
-        sessions.add_message("failure", "user", f"message-{index}", agent_role="design")
-    recent = sessions.recent_messages("failure", agent_role="design", limit=24)
-
-    monkeypatch.setattr(summaries, "_summarize", lambda *args: (_ for _ in ()).throw(RuntimeError("model down")))
-    summaries.refresh("failure", "design", recent)
-    summary = sessions.get_summary("failure", "design")
-    assert summary.covered_until_sequence == 0
-    assert "model down" in summary.last_error
+    turns = [_turn(sessions, "failure", index) for index in range(10)]
+    first = sessions.completed_turns("failure", agent_role="design")[0]
+    monkeypatch.setattr(
+        summaries, "_generate",
+        lambda turn: (_ for _ in ()).throw(RuntimeError("model down")),
+    )
+    failed = summaries.summarize_turn(first.turn_id, "design")
+    assert failed.status == "failed"
+    assert "model down" in (failed.last_error or "")
 
     current = sessions.add_message(
         "failure", "user", "current", agent_role="design"
@@ -662,8 +657,108 @@ def test_summary_failure_does_not_advance_cursor(services, monkeypatch) -> None:
         "design",
         current.message_id,
     )
-    # 摘要失败时，窗口外尚未覆盖的原文仍作为强制候选进入本轮上下文。
-    assert len(result.message_ids) == 30
+    # 较早五轮包含 failed 和尚未生成两种状态，全部回退为完整 User+Assistant。
+    assert result.turn_summary_ids == []
+    assert result.raw_turn_ids == [turn[0].turn_id for turn in turns]
+    assert len(result.message_ids) == 20
+    assert len(result.message_ids) % 2 == 0
+    retried = []
+    monkeypatch.setattr(
+        summaries, "enqueue_turn",
+        lambda turn_id, session_id, agent_role: retried.append(turn_id) or True,
+    )
+    assert summaries.retry_failed_summaries(session_id="failure") == 1
+    assert retried == [first.turn_id]
+
+
+def test_turn_summary_is_idempotent_and_background_queue_uses_worker(services, monkeypatch) -> None:
+    db, sessions, _, _, summaries, _ = services
+    _conversation(sessions, "summary-idempotent")
+    user, _ = _turn(sessions, "summary-idempotent", 1)
+    first = summaries.summarize_turn(user.turn_id, "design")
+    second = summaries.summarize_turn(user.turn_id, "design")
+    assert first.id == second.id
+    assert second.attempts == 1
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM conversation_turn_summaries WHERE turn_id = ?",
+        (user.turn_id,),
+    )["count"] == 1
+    turn = sessions.get_turn(user.turn_id, agent_role="design")
+    validated = summaries._validate({
+        "decisions": [{
+            "content": "Assistant 建议采用两级流水",
+            "source_message_ids": [turn.assistant.message_id],
+            "confirmation_status": "user_confirmed",
+        }],
+    }, turn)
+    assert validated["decisions"][0]["confirmation_status"] == "unconfirmed"
+
+    other_user, _ = _turn(sessions, "summary-idempotent", 2)
+    worker_finished = threading.Event()
+    worker_names = []
+
+    def worker(turn_id, agent_role=None):
+        worker_names.append(threading.current_thread().name)
+        worker_finished.set()
+        return summaries.get_turn_summary(turn_id)
+
+    monkeypatch.setattr(summaries, "summarize_turn", worker)
+    assert summaries.enqueue_turn(other_user.turn_id, "summary-idempotent", "design")
+    assert worker_finished.wait(2)
+    assert worker_names[0].startswith("chipflow-summary")
+
+
+def test_turn_summary_hard_limit_uses_compression_before_save(services, monkeypatch) -> None:
+    _, sessions, _, _, summaries, _ = services
+    _conversation(sessions, "summary-limit")
+    user, _ = _turn(sessions, "summary-limit", 1)
+    oversized = {
+        "topic": "oversized summary token " * 2_000, "module": "", "user_intent": "",
+        "key_information": [], "decisions": [], "constraints": [],
+        "assumptions": [], "inferences": [], "open_questions": [], "keywords": [],
+    }
+    compact = {
+        "topic": "短摘要", "module": "uart", "user_intent": "检查接口",
+        "key_information": [], "decisions": [], "constraints": [],
+        "assumptions": [], "inferences": [], "open_questions": [], "keywords": [],
+    }
+    monkeypatch.setattr(summaries, "_generate", lambda turn: (oversized, "stub"))
+    monkeypatch.setattr(summaries, "_compress", lambda turn, summary: compact)
+    result = summaries.summarize_turn(user.turn_id, "design")
+    assert result.status == "completed"
+    assert result.token_count <= 500
+    assert result.summary_json["topic"] == "短摘要"
+
+
+def test_turn_budget_never_splits_user_and_assistant_and_manifest_traces_turns(services) -> None:
+    db, sessions, memories, documents, summaries, tokens = services
+    _conversation(sessions, "turn-budget")
+    turns = [_turn(sessions, "turn-budget", index) for index in range(7)]
+    for turn in sessions.completed_turns("turn-budget", agent_role="design")[:2]:
+        summaries.summarize_turn(turn.turn_id, "design")
+    current = sessions.add_message("turn-budget", "user", "current", agent_role="design")
+    builder = ContextBuilderService(
+        db, sessions, documents, memories, summaries, tokens,
+        budget_config=ContextBudgetConfig(
+            total=2_000, system_and_tools=200, current_request_and_run=200,
+            recent_messages=40, summary=80, long_term_memory=100,
+            documents=500, output_reserve=200,
+        ),
+    )
+    result = builder.build(
+        "turn-budget",
+        ChatRequest(project_id="project", module_name="uart", message="current"),
+        "design",
+        current.message_id,
+    )
+    assert len(result.message_ids) % 2 == 0
+    selected = set(result.message_ids)
+    for user, assistant in turns:
+        assert (user.message_id in selected) == (assistant.message_id in selected)
+    manifest = builder.save_manifest("turn-budget", "audit-run", "design", result)
+    assert manifest.turn_summary_ids == result.turn_summary_ids
+    assert manifest.raw_turn_ids == result.raw_turn_ids
+    assert manifest.sections["raw_conversation"]["tokens"] >= 0
 
 
 def test_memory_extraction_failure_is_audited_and_retry_is_idempotent(services, monkeypatch) -> None:
@@ -755,3 +850,13 @@ def test_schema_migration_is_repeatable_and_legacy_summary_is_not_trusted(tmp_pa
         row["name"] for row in db.fetch_all("PRAGMA table_info(memories)")
     }
     assert {"memory_key", "importance", "visibility", "review_reason"} <= columns
+    assert "turn_id" in {
+        row["name"] for row in db.fetch_all("PRAGMA table_info(conversation_messages)")
+    }
+    assert {"turn_summary_ids_json", "raw_turn_ids_json"} <= {
+        row["name"] for row in db.fetch_all("PRAGMA table_info(context_manifests)")
+    }
+    assert db.fetch_one(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("conversation_turn_summaries",),
+    ) is not None

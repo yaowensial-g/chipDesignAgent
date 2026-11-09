@@ -197,7 +197,7 @@ selector_max_output_tokens = 1000
 | `app/services/session_service.py` | 会话角色持久化和主 Agent 解析 |
 | `app/services/tool_selector_service.py` | 权限优先、Metadata-only 的候选 Tool 选择 |
 | `app/services/delegation_service.py` | 专家任务约束、执行、超时和持久化 |
-| `app/services/conversation_summary_service.py` | 按主 Agent 角色隔离的结构化增量摘要 |
+| `app/services/conversation_summary_service.py` | 按完整问答轮次和主 Agent 角色隔离的后台独立摘要 |
 | `app/services/memory_extractor_service.py` | 全消息模型判断、有限角色上下文、幂等的 proposed Memory 提取 |
 | `app/services/memory_service.py` | 记忆权限、来源、生命周期、冲突和两阶段检索 |
 | `app/services/context_builder_service.py` | 统一 Token 预算与实际入模 Context Manifest |

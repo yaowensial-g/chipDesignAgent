@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from app.domain.enums import AgentRole, UserRole
 from uuid import uuid4
 
@@ -29,6 +31,18 @@ PRIMARY_AGENT_BY_USER_ROLE = {
     UserRole.DESIGN_ENGINEER: AgentRole.DESIGN,
     UserRole.VERIFICATION_ENGINEER: AgentRole.VERIFICATION,
 }
+
+
+@dataclass(frozen=True)
+class ConversationTurn:
+    """ContextBuilder 使用的原子问答单元，任何预算筛选都不能拆开它。"""
+
+    turn_id: str
+    session_id: str
+    agent_role: str
+    sequence: int
+    user: ConversationMessageView
+    assistant: ConversationMessageView
 
 
 class SessionService:
@@ -137,11 +151,30 @@ class SessionService:
         run_id: str | None = None,
         delegation_task_id: str | None = None,
         metadata: dict | None = None,
+        turn_id: str | None = None,
     ) -> ConversationMessageView:
         """追加完整消息，并同步会话列表所需的标题、预览和计数。"""
         if self.get(session_id) is None:
             raise KeyError(session_id)
         message_id = str(uuid4())
+        if role == "user":
+            turn_id = turn_id or str(uuid4())
+        elif role == "assistant" and not turn_id:
+            # 兼容尚未显式传递 turn_id 的内部调用。正式编排路径会直接传入，
+            # 此查询只兜底关联当前会话最近一条尚未完成的新式 User 消息。
+            pending = self.db.fetch_one(
+                """SELECT user.turn_id FROM conversation_messages AS user
+                WHERE user.session_id = ? AND user.role = 'user' AND user.turn_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM conversation_messages AS assistant
+                    WHERE assistant.session_id = user.session_id
+                      AND assistant.role = 'assistant'
+                      AND assistant.turn_id = user.turn_id
+                  )
+                ORDER BY user.sequence DESC LIMIT 1""",
+                (session_id,),
+            )
+            turn_id = pending["turn_id"] if pending else str(uuid4())
         now = utc_now()
         preview = " ".join(content.strip().split())[:120]
         with self.db.transaction() as connection:
@@ -156,13 +189,13 @@ class SessionService:
             # sequence 与会话索引在同一事务内更新，避免正文已写入但计数未更新。
             connection.execute(
                 """INSERT INTO conversation_messages
-                (message_id, session_id, sequence, role, agent_role, content, message_type,
+                (message_id, session_id, sequence, turn_id, role, agent_role, content, message_type,
                  run_id, delegation_task_id, metadata_json, created_at)
                 VALUES (?, ?,
                     COALESCE((SELECT MAX(sequence) + 1 FROM conversation_messages WHERE session_id = ?), 1),
-                    ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    message_id, session_id, session_id, role, agent_role, content,
+                    message_id, session_id, session_id, turn_id, role, agent_role, content,
                     message_type, run_id, delegation_task_id,
                     self.db.dumps(metadata or {}), now,
                 ),
@@ -174,6 +207,82 @@ class SessionService:
                 (title, preview, now, session_id),
             )
         return self.get_message(message_id)  # type: ignore[return-value]
+
+    def completed_turns(
+        self,
+        session_id: str,
+        *,
+        agent_role: str,
+        exclude_message_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[ConversationTurn]:
+        """按时间正序返回完整问答；新 turn_id 与旧消息顺序配对同时兼容。"""
+        parameters: list[object] = [session_id, agent_role]
+        exclude = ""
+        if exclude_message_id:
+            exclude = " AND message_id <> ?"
+            parameters.append(exclude_message_id)
+        rows = self.db.fetch_all(
+            f"""SELECT * FROM conversation_messages
+            WHERE session_id = ? AND (agent_role IS NULL OR agent_role = ?){exclude}
+              AND role IN ('user', 'assistant')
+            ORDER BY sequence""",
+            tuple(parameters),
+        )
+        messages = [self._message_from_row(row) for row in rows]
+        explicit_users: dict[str, ConversationMessageView] = {}
+        completed: list[ConversationTurn] = []
+        legacy_user: ConversationMessageView | None = None
+
+        for message in messages:
+            if message.turn_id:
+                if message.role == "user":
+                    explicit_users[message.turn_id] = message
+                    continue
+                user = explicit_users.pop(message.turn_id, None)
+                if user is not None:
+                    completed.append(ConversationTurn(
+                        turn_id=message.turn_id,
+                        session_id=session_id,
+                        agent_role=user.agent_role or message.agent_role or agent_role,
+                        sequence=user.sequence,
+                        user=user,
+                        assistant=message,
+                    ))
+                continue
+
+            # 旧库没有 turn_id：一条 User 与其后第一条最终 Assistant 构成一轮。
+            if message.role == "user":
+                legacy_user = message
+            elif legacy_user is not None:
+                completed.append(ConversationTurn(
+                    turn_id=f"legacy:{legacy_user.message_id}:{message.message_id}",
+                    session_id=session_id,
+                    agent_role=legacy_user.agent_role or message.agent_role or agent_role,
+                    sequence=legacy_user.sequence,
+                    user=legacy_user,
+                    assistant=message,
+                ))
+                legacy_user = None
+
+        completed.sort(key=lambda turn: turn.sequence)
+        return completed[-limit:] if limit else completed
+
+    def get_turn(self, turn_id: str, *, agent_role: str) -> ConversationTurn | None:
+        """按稳定轮次 ID 读取完整问答，供后台摘要任务在独立线程中重新取数。"""
+        row = self.db.fetch_one(
+            "SELECT session_id FROM conversation_messages WHERE turn_id = ? LIMIT 1",
+            (turn_id,),
+        )
+        if not row:
+            return None
+        return next(
+            (
+                turn for turn in self.completed_turns(row["session_id"], agent_role=agent_role)
+                if turn.turn_id == turn_id
+            ),
+            None,
+        )
 
     def record_token_usage(
         self,

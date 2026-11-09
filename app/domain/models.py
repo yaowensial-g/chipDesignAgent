@@ -213,6 +213,7 @@ class ConversationMessageView(BaseModel):
     message_id: str
     session_id: str
     sequence: int
+    turn_id: str | None = None
     role: Literal["user", "assistant", "system"]
     agent_role: str | None = None
     content: str
@@ -250,6 +251,26 @@ class ConversationSummaryView(BaseModel):
     summary_version: int = 1
     generation_mode: str = "deterministic_extract"
     last_error: str | None = None
+    updated_at: str
+
+
+class ConversationTurnSummaryView(BaseModel):
+    """一轮完整 User/Assistant 对话的独立摘要及后台处理状态。"""
+
+    id: str
+    turn_id: str
+    session_id: str
+    agent_role: str
+    sequence: int
+    user_message_id: str
+    assistant_message_id: str
+    summary_json: dict[str, Any] = Field(default_factory=dict)
+    token_count: int = 0
+    status: Literal["pending", "processing", "completed", "failed"]
+    attempts: int = 0
+    generation_mode: str = "model_structured"
+    last_error: str | None = None
+    created_at: str
     updated_at: str
 
 
@@ -388,6 +409,8 @@ class ContextManifestView(BaseModel):
     memory_ids: list[str] = Field(default_factory=list)
     chunk_ids: list[str] = Field(default_factory=list)
     observation_ids: list[str] = Field(default_factory=list)
+    turn_summary_ids: list[str] = Field(default_factory=list)
+    raw_turn_ids: list[str] = Field(default_factory=list)
     sections: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     excluded: list[dict[str, Any]] = Field(default_factory=list)

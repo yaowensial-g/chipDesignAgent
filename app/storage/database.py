@@ -196,6 +196,7 @@ class Database:
             message_id TEXT PRIMARY KEY,
             session_id TEXT NOT NULL,
             sequence INTEGER NOT NULL,
+            turn_id TEXT,
             role TEXT NOT NULL,
             agent_role TEXT,
             content TEXT NOT NULL,
@@ -231,6 +232,28 @@ class Database:
             updated_at TEXT NOT NULL,
             PRIMARY KEY(session_id, agent_role),
             FOREIGN KEY(session_id) REFERENCES conversations(session_id)
+        );
+        -- 新摘要按完整问答轮次独立保存。旧的 conversation_role_summaries 暂时保留，
+        -- 但 ContextBuilder 不再读取或同步更新它。
+        CREATE TABLE IF NOT EXISTS conversation_turn_summaries (
+            id TEXT PRIMARY KEY,
+            turn_id TEXT NOT NULL UNIQUE,
+            session_id TEXT NOT NULL,
+            agent_role TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            user_message_id TEXT NOT NULL,
+            assistant_message_id TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            token_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            generation_mode TEXT NOT NULL DEFAULT 'model_structured',
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES conversations(session_id),
+            FOREIGN KEY(user_message_id) REFERENCES conversation_messages(message_id),
+            FOREIGN KEY(assistant_message_id) REFERENCES conversation_messages(message_id)
         );
         -- 原始文档、版本和检索分块分表保存。新版本不会覆盖旧版本，旧版本仅被标记
         -- superseded，便于追踪“某条结论当时依据的是哪版 AS”。
@@ -329,6 +352,8 @@ class Database:
             memory_ids_json TEXT NOT NULL,
             chunk_ids_json TEXT NOT NULL,
             observation_ids_json TEXT NOT NULL,
+            turn_summary_ids_json TEXT NOT NULL DEFAULT '[]',
+            raw_turn_ids_json TEXT NOT NULL DEFAULT '[]',
             sections_json TEXT NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES conversations(session_id)
@@ -372,6 +397,8 @@ class Database:
             ON memories(project_id, module_name, status, updated_at);
         CREATE INDEX IF NOT EXISTS idx_role_summaries_lookup
             ON conversation_role_summaries(session_id, agent_role, covered_until_sequence);
+        CREATE INDEX IF NOT EXISTS idx_turn_summaries_lookup
+            ON conversation_turn_summaries(session_id, agent_role, status, sequence);
         CREATE INDEX IF NOT EXISTS idx_memory_sources_source
             ON memory_sources(source_type, source_id);
         CREATE INDEX IF NOT EXISTS idx_memory_extractions_source
@@ -413,6 +440,12 @@ class Database:
                         f"ALTER TABLE conversations ADD COLUMN {column} {declaration}"
                     )
 
+            message_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(conversation_messages)")
+            }
+            if "turn_id" not in message_columns:
+                connection.execute("ALTER TABLE conversation_messages ADD COLUMN turn_id TEXT")
+
             memory_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(memories)")
             }
@@ -452,6 +485,8 @@ class Database:
                 "excluded_json": "TEXT NOT NULL DEFAULT '[]'",
                 "prompt_hash": "TEXT",
                 "context_version": "INTEGER NOT NULL DEFAULT 2",
+                "turn_summary_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "raw_turn_ids_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for column, declaration in manifest_migrations.items():
                 if column not in manifest_columns:
@@ -466,6 +501,9 @@ class Database:
             )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_extraction_key ON memories(extraction_key) WHERE extraction_key IS NOT NULL"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_turn ON conversation_messages(session_id, turn_id, sequence)"
             )
             connection.commit()
 

@@ -34,6 +34,8 @@ class ContextBuildResult:
 
     effective_request: ChatRequest
     message_ids: list[str]
+    turn_summary_ids: list[str]
+    raw_turn_ids: list[str]
     memory_ids: list[str]
     chunk_ids: list[str]
     memory_context: list[dict]
@@ -50,7 +52,7 @@ class ContextBudgetConfig:
     system_and_tools: int = 4_000
     current_request_and_run: int = 3_000
     recent_messages: int = 6_000
-    summary: int = 2_000
+    summary: int = 6_000
     long_term_memory: int = 2_000
     documents: int = 12_000
     output_reserve: int = 3_000
@@ -100,31 +102,25 @@ class ContextBuilderService:
                 )
             )
 
-        recent = self.sessions.recent_messages(
+        # 对话历史以完整问答轮次为原子单位。当前 User 尚无最终 Assistant，天然不会
+        # 出现在 completed_turns 中；exclude_message_id 再提供一道防重复保护。
+        completed_turns = self.sessions.completed_turns(
             session_id,
             agent_role=agent_role,
             exclude_message_id=current_message_id,
-            limit=24,
         )
-        window_cutoff = recent[0].sequence - 1 if recent else 0
-        self.summaries.refresh(session_id, agent_role, recent)
-        summary = self.sessions.get_summary(session_id, agent_role)
-        covered_until = summary.covered_until_sequence if summary else 0
-        uncovered_messages = (
-            self.sessions.visible_messages_between(
-                session_id,
-                agent_role=agent_role,
-                after_sequence=covered_until,
-                through_sequence=window_cutoff,
-            )
-            if window_cutoff > covered_until
-            else []
+        recent_turns = completed_turns[-self.summaries.policy.recent_turns:]
+        older_turns = completed_turns[:-self.summaries.policy.recent_turns][
+            -self.summaries.policy.history_turns:
+        ]
+        oldest_recent_sequence = recent_turns[0].sequence if recent_turns else None
+        completed_summaries = self.summaries.get_recent_turn_summaries(
+            session_id,
+            agent_role,
+            before_sequence=oldest_recent_sequence,
+            limit=self.summaries.policy.history_turns,
         )
-        if summary:
-            recent = [
-                message for message in recent
-                if message.sequence > summary.covered_until_sequence
-            ]
+        summaries_by_turn = {item.turn_id: item for item in completed_summaries}
 
         query_tokens = self.tokens.count(request.message)
         configured_output = model_settings_service.effective().max_output_tokens
@@ -146,64 +142,87 @@ class ContextBuilderService:
         excluded: list[dict[str, object]] = []
 
         history: list[ChatHistoryMessage] = []
-        history_tokens = 0
-        if summary:
-            summary_text = (
-                f"[较早会话摘要 role={agent_role}; 覆盖消息 "
-                f"{summary.covered_from_sequence}-{summary.covered_until_sequence}; "
-                f"mode={summary.generation_mode}]\n{summary.summary_text}"
-            )
-            summary_cost = self.tokens.count(summary_text)
-            if summary_cost <= remaining:
-                history.append(ChatHistoryMessage(role="assistant", content=summary_text))
-                history_tokens += summary_cost
-                remaining -= summary_cost
-            else:
-                excluded.append({
-                    "category": "summary",
-                    "id": f"{session_id}:{agent_role}",
-                    "reason": "结构化摘要整体超过剩余预算；未进行末尾截断",
-                    "tokens": summary_cost,
-                })
-        # 近期消息从新到旧按预算选择，再恢复时间顺序。这样最接近当前问题的内容优先。
-        uncovered_tokens = sum(self.tokens.count(item.content) for item in uncovered_messages)
-        if uncovered_tokens > remaining:
-            raise ValueError(
-                "会话摘要尚未成功更新，未覆盖原文超过剩余上下文预算；"
-                "已保留摘要游标，请重试或提高上下文预算"
-            )
-        selected_recent = list(uncovered_messages)
-        selected_normal = []
-        recent_used = uncovered_tokens
-        recent_cap = min(
-            max(self.budget.recent_messages, uncovered_tokens), remaining
-        )
-        for message in reversed(recent):
-            cost = self.tokens.count(message.content)
+        selected_messages = []
+        selected_raw_turns = []
+        selected_summary_rows = []
+
+        # 最近轮次优先占用约 6000 Token，User/Assistant 两条消息要么同时入选，
+        # 要么整轮排除，绝不会留下半轮上下文。
+        recent_cap = min(self.budget.recent_messages, remaining)
+        recent_used = 0
+        for turn in reversed(recent_turns):
+            cost = self.tokens.count(turn.user.content) + self.tokens.count(turn.assistant.content)
             if recent_used + cost > recent_cap:
                 excluded.append({
-                    "category": "recent_message",
-                    "id": message.message_id,
-                    "reason": "近期消息区预算不足",
+                    "category": "raw_turn",
+                    "id": turn.turn_id,
+                    "reason": "近期完整问答区预算不足；整轮排除",
                     "tokens": cost,
                 })
                 continue
-            selected_normal.append(message)
+            selected_raw_turns.append(turn)
             recent_used += cost
-        selected_normal.reverse()
-        selected_recent.extend(selected_normal)
-        history_tokens += recent_used
+        selected_raw_turns.reverse()
         remaining -= recent_used
-        history.extend(
-            ChatHistoryMessage(
-                role="user" if message.role == "user" else "assistant",
-                content=message.content,
-            )
-            for message in selected_recent
-            if message.role in {"user", "assistant"}
-        )
+
+        # 最近 5 轮之前只看最近 30 个完整轮次。已完成摘要优先使用；pending、
+        # processing、failed 或尚未排队的轮次回退到原始问答，避免异步延迟丢信息。
+        older_units = []
+        for turn in older_turns:
+            summary_row = summaries_by_turn.get(turn.turn_id)
+            if summary_row:
+                text = (
+                    f"[独立轮次摘要 turn_id={turn.turn_id}; sequence={turn.sequence}; "
+                    f"role={agent_role}]\n"
+                    + json.dumps(summary_row.summary_json, ensure_ascii=False)
+                )
+                older_units.append((turn, summary_row, text, self.tokens.count(text)))
+            else:
+                cost = self.tokens.count(turn.user.content) + self.tokens.count(turn.assistant.content)
+                older_units.append((turn, None, None, cost))
+
+        older_cap = min(self.budget.summary, remaining)
+        older_used = 0
+        selected_older = []
+        for unit in reversed(older_units):
+            turn, summary_row, _, cost = unit
+            if older_used + cost > older_cap:
+                excluded.append({
+                    "category": "turn_summary" if summary_row else "raw_turn_fallback",
+                    "id": summary_row.id if summary_row else turn.turn_id,
+                    "reason": "较早轮次区预算不足；摘要或完整回退轮次整体排除",
+                    "tokens": cost,
+                })
+                continue
+            selected_older.append(unit)
+            older_used += cost
+        selected_older.reverse()
+        remaining -= older_used
+
+        for turn, summary_row, text, _ in selected_older:
+            if summary_row:
+                selected_summary_rows.append(summary_row)
+                history.append(ChatHistoryMessage(role="assistant", content=text))
+            else:
+                selected_messages.extend((turn.user, turn.assistant))
+                history.extend((
+                    ChatHistoryMessage(role="user", content=turn.user.content),
+                    ChatHistoryMessage(role="assistant", content=turn.assistant.content),
+                ))
+        for turn in selected_raw_turns:
+            selected_messages.extend((turn.user, turn.assistant))
+            history.extend((
+                ChatHistoryMessage(role="user", content=turn.user.content),
+                ChatHistoryMessage(role="assistant", content=turn.assistant.content),
+            ))
+
+        history_tokens = recent_used + older_used
+        summary_tokens = sum(unit[3] for unit in selected_older if unit[1] is not None)
+        raw_turn_ids = [unit[0].turn_id for unit in selected_older if unit[1] is None]
+        raw_turn_ids.extend(turn.turn_id for turn in selected_raw_turns)
+        turn_summary_ids = [item.id for item in selected_summary_rows]
         # 新会话迁移期若后端还没有历史，则使用旧客户端携带的历史作为一次性回退。
-        if not selected_recent and request.history:
+        if not history and request.history:
             for item in reversed(request.history[-12:]):
                 cost = self.tokens.count(item.content)
                 if cost <= remaining:
@@ -306,13 +325,22 @@ class ContextBuilderService:
             raise RuntimeError("ContextBuilder produced an over-budget context")
         effective = request.model_copy(update={"history": history, "documents": documents})
         sections = {
-            "history": {"items": len(history), "tokens": history_tokens},
+            "history": {
+                "items": len(history),
+                "tokens": history_tokens,
+                "raw_turns": len(raw_turn_ids),
+                "turn_summaries": len(turn_summary_ids),
+            },
             "summary": {
-                "included": bool(summary and not any(item["category"] == "summary" for item in excluded)),
-                "tokens": self.tokens.count(summary.summary_text) if summary else 0,
-                "covered_from_sequence": summary.covered_from_sequence if summary else 0,
-                "covered_until_sequence": summary.covered_until_sequence if summary else 0,
-                "generation_mode": summary.generation_mode if summary else None,
+                "items": len(selected_summary_rows),
+                "tokens": summary_tokens,
+                "turn_summary_ids": turn_summary_ids,
+            },
+            "raw_conversation": {
+                "turns": len(raw_turn_ids),
+                "messages": len(selected_messages),
+                "tokens": history_tokens - summary_tokens,
+                "turn_ids": raw_turn_ids,
             },
             "memory": {
                 "items": len(selected_memories),
@@ -350,14 +378,17 @@ class ContextBuilderService:
         }
         prompt_hash = hashlib.sha256(json.dumps({
             "message": request.message,
-            "message_ids": [message.message_id for message in selected_recent],
+            "message_ids": [message.message_id for message in selected_messages],
+            "turn_summary_ids": turn_summary_ids,
+            "raw_turn_ids": raw_turn_ids,
             "memory_ids": [memory.memory_id for memory in selected_memories],
             "chunk_ids": [chunk.chunk_id for chunk in selected_chunks],
-            "summary_version": summary.summary_version if summary else 0,
         }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         return ContextBuildResult(
             effective_request=effective,
-            message_ids=[message.message_id for message in selected_recent],
+            message_ids=[message.message_id for message in selected_messages],
+            turn_summary_ids=turn_summary_ids,
+            raw_turn_ids=raw_turn_ids,
             memory_ids=[memory.memory_id for memory in selected_memories],
             chunk_ids=[chunk.chunk_id for chunk in selected_chunks],
             memory_context=memory_context,
@@ -365,11 +396,9 @@ class ContextBuilderService:
             sections=sections,
             summary={
                 "agent_role": agent_role,
-                "covered_from_sequence": summary.covered_from_sequence if summary else 0,
-                "covered_until_sequence": summary.covered_until_sequence if summary else 0,
-                "source_message_ids": summary.source_message_ids if summary else [],
-                "summary_version": summary.summary_version if summary else 0,
-                "generation_mode": summary.generation_mode if summary else None,
+                "turn_summary_ids": turn_summary_ids,
+                "turn_ids": [item.turn_id for item in selected_summary_rows],
+                "raw_turn_ids": raw_turn_ids,
             },
             excluded=excluded,
             prompt_hash=prompt_hash,
@@ -388,9 +417,10 @@ class ContextBuilderService:
             """INSERT INTO context_manifests
             (context_id, session_id, run_id, agent_role, token_budget, estimated_tokens,
              message_ids_json, memory_ids_json, chunk_ids_json, observation_ids_json,
-             sections_json, summary_json, excluded_json, prompt_hash, context_version,
+             turn_summary_ids_json, raw_turn_ids_json, sections_json, summary_json,
+             excluded_json, prompt_hash, context_version,
              created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, 2, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, 3, ?)""",
             (
                 context_id,
                 session_id,
@@ -401,6 +431,8 @@ class ContextBuilderService:
                 self.db.dumps(result.message_ids),
                 self.db.dumps(result.memory_ids),
                 self.db.dumps(result.chunk_ids),
+                self.db.dumps(result.turn_summary_ids),
+                self.db.dumps(result.raw_turn_ids),
                 self.db.dumps(result.sections),
                 self.db.dumps(result.summary),
                 self.db.dumps(result.excluded),
@@ -426,7 +458,7 @@ class ContextBuilderService:
         payload = dict(row)
         for field in (
             "message_ids", "memory_ids", "chunk_ids", "observation_ids",
-            "sections", "summary", "excluded",
+            "turn_summary_ids", "raw_turn_ids", "sections", "summary", "excluded",
         ):
             default = {} if field in {"sections", "summary"} else []
             payload[field] = self.db.loads(payload.pop(f"{field}_json"), default)

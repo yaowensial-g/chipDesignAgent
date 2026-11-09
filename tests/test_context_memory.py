@@ -44,6 +44,7 @@ def test_chat_is_persisted_and_context_manifest_is_auditable() -> None:
         f"/api/v1/conversations/{payload['session_id']}/messages"
     ).json()["items"]
     assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[0]["turn_id"] == messages[1]["turn_id"]
     assert "ready/valid" in messages[0]["content"]
     assert messages[1]["metadata"]["token_usage"]["total_tokens"] == 0
 
@@ -53,7 +54,9 @@ def test_chat_is_persisted_and_context_manifest_is_auditable() -> None:
     assert len(manifests) == 1
     assert manifests[0]["token_budget"] > 0
     assert "documents" in manifests[0]["sections"]
-    assert manifests[0]["context_version"] == 2
+    assert manifests[0]["context_version"] == 3
+    assert manifests[0]["turn_summary_ids"] == []
+    assert manifests[0]["raw_turn_ids"] == []
     assert manifests[0]["prompt_hash"]
     assert isinstance(manifests[0]["excluded"], list)
 

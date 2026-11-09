@@ -157,6 +157,8 @@ class OrchestratorService:
         request_payload["_memory_context"] = context.memory_context
         request_payload["_context_manifest"] = {
             "message_ids": context.message_ids,
+            "turn_summary_ids": context.turn_summary_ids,
+            "raw_turn_ids": context.raw_turn_ids,
             "memory_ids": context.memory_ids,
             "chunk_ids": context.chunk_ids,
             "sections": context.sections,
@@ -302,6 +304,10 @@ class OrchestratorService:
                     response.assistant_message,
                     agent_role=primary_agent.value,
                     run_id=run_id,
+                    turn_id=user_message.turn_id,
+                )
+                self._enqueue_turn_summary(
+                    user_message.turn_id, session_id, primary_agent.value
                 )
                 return response
 
@@ -333,8 +339,23 @@ class OrchestratorService:
             response.assistant_message,
             agent_role=primary_agent.value,
             run_id=run_id,
+            turn_id=user_message.turn_id,
         )
+        self._enqueue_turn_summary(user_message.turn_id, session_id, primary_agent.value)
         return response
+
+    def _enqueue_turn_summary(
+        self, turn_id: str | None, session_id: str, agent_role: str
+    ) -> None:
+        """最终答复落库后的尽力投递；摘要基础设施故障不能反向导致对话失败。"""
+        if not turn_id:
+            return
+        try:
+            self.contexts.summaries.enqueue_turn(turn_id, session_id, agent_role)
+        except Exception:
+            # enqueue_turn 已通过状态表记录正常生成失败；这里仅隔离极端的队列/DB
+            # 投递异常，用户响应仍以已经持久化的 Assistant 消息为准。
+            return
 
     async def _execute(
         self,

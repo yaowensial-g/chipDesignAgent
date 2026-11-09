@@ -118,7 +118,7 @@ async def attach_request_id(request, call_next):
 | 数据类别 | 典型内容 | 是否直接修改 | 生命周期 | 主要存储 |
 |---|---|---:|---|---|
 | 当前请求 | 本轮用户消息、项目、模块、工作角色 | 用户输入 | 单次调用 | `ChatRequest`，同时写入消息表 |
-| 短期记忆 | 近期对话原文、按角色增量摘要、Active Run | 系统维护 | 会话/角色级 | `conversation_messages`、`conversation_role_summaries`、`conversations.active_run_id` |
+| 短期记忆 | 最近 5 轮完整原文、较早 30 轮独立摘要、Active Run | 系统维护 | 会话/角色级 | `conversation_messages`、`conversation_turn_summaries`、`conversations.active_run_id` |
 | 长期记忆 | 已确认项目事实、架构决策、有效假设 | 新消息经模型判断、正式事件可形成 proposed；active 必须有权威来源 | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
 | 原始证据 | FS、AS、ICD、问题单、工具日志、Artifact | 原件不可由 Agent 随意改写 | 长期、版本化 | `document_versions`、`document_chunks`、Artifact、Raw Logs |
 
@@ -140,7 +140,8 @@ flowchart TB
     G --> H[8. Intent Enricher / Tool Selector / 主 Agent]
     G --> I[9. 保存 Context Manifest]
     H --> J[10. Tool Observation / 最终回复]
-    J --> K[11. 保存 Assistant 消息和 RunEvent]
+    J --> K[11. 保存最终 Assistant 消息和 RunEvent]
+    K --> L[12. 后台生成独立 turn summary]
 ```
 
 这条链路的控制入口位于
@@ -181,24 +182,22 @@ context = self.contexts.build(
 
 #### 2.2.4 第 3～4 步：短期记忆由“摘要 + 近期原文”组成
 
-ContextBuilder 不会把整个会话历史直接塞给模型。它先按 `session_id` 和 `agent_role`
-读取最多 24 条近期消息，再由独立的 `ConversationSummaryService` 处理窗口之前的内容：
+ContextBuilder 不会把整个会话历史直接塞给模型。它按 `session_id`、`agent_role` 和 `turn_id`
+识别完整问答，保留最近 5 轮原文，并在它们之前读取最近 30 轮 completed 独立摘要：
 
 ```python
-recent = self.sessions.recent_messages(
-    session_id,
-    agent_role=agent_role,
+turns = self.sessions.completed_turns(
+    session_id, agent_role=agent_role,
     exclude_message_id=current_message_id,
-    limit=24,
 )
-self.summaries.refresh(session_id, agent_role, recent)
-summary = self.sessions.get_summary(session_id, agent_role)
+recent_turns = turns[-5:]
+older_turns = turns[:-5][-30:]
+summaries = self.summaries.get_recent_turn_summaries(...)
 ```
 
-摘要包含目标、阶段、已确认要求、重要决策、完成项、待办、开放问题和真实来源消息 ID。
-真实模型可用时只处理新增批次并复用旧摘要；模型失败不推进覆盖游标。离线回退保存待语义处理的
-完整原文，并明确标记没有完成语义概括。摘要不再通过截掉末尾控制长度；放不进预算时整体排除并记录原因。
-旧 `conversation_summaries` 不删除，但因无法可靠判断角色而不会直接注入，新摘要从原始消息安全重建。
+最终 Assistant Response 落库后，通过有界线程池后台生成本轮独立 JSON 摘要；ContextBuilder 不调用模型。
+摘要只读取本轮 User 和 Assistant，不与旧摘要合并。pending、processing、failed 或缺失摘要均回退为该轮
+完整原文；预算选择以整轮为单位。超过 500 Token 的摘要先压缩，仍超限则失败。旧摘要表保留但不再注入。
 
 角色过滤同样发生在这里。Design 和 Verification 可以共享项目资料，但一个角色的私有聊天
 不会自动注入另一个角色的上下文。对应实现见
@@ -1205,7 +1204,7 @@ DS 正常运行使用 LangGraph `MemorySaver`，同时写应用快照。服务�
 
 | 领域 | 表 |
 |---|---|
-| 会话 | `conversations`、`conversation_messages`、`conversation_role_summaries`（旧摘要表保留） |
+| 会话 | `conversations`、`conversation_messages`、`conversation_turn_summaries`（两张旧摘要表保留） |
 | 上下文知识 | `documents`、`document_versions`、`document_chunks`、`memories`、`memory_sources`、`memory_relations`、`memory_extraction_events`、`context_manifests` |
 | 控制面 | `runs`、`run_events`、`delegation_tasks` |
 | DS | `task_snapshots` |

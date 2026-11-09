@@ -68,6 +68,7 @@ from app.services.document_service import document_service
 from app.services.memory_service import memory_service
 from app.services.memory_extractor_service import memory_extractor_service
 from app.services.context_builder_service import context_builder_service
+from app.services.conversation_summary_service import conversation_summary_service
 from app.tools.registry import tool_registry
 
 
@@ -352,7 +353,19 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             agent_role=agent_role,
             message_type="run_status",
             run_id=run_id,
+            turn_id=decision_message.turn_id,
         )
+        # Run Resume 与普通聊天遵循同一轮次摘要机制。投递异常不能覆盖已经成功的
+        # Run 状态和已持久化消息，失败任务可由 SummaryService 后续重试。
+        if decision_message.turn_id:
+            try:
+                conversation_summary_service.enqueue_turn(
+                    decision_message.turn_id,
+                    existing.session_id,
+                    agent_role or "design",
+                )
+            except Exception:
+                pass
         return updated
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Run not found") from exc

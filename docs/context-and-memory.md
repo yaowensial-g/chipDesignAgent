@@ -9,7 +9,7 @@
 | 层 | 内容 | 生命周期 | 主要存储 |
 |---|---|---|---|
 | L0 当前执行状态 | 当前请求、Run、Observation、审批与执行进度 | 单次 Run | `runs`、`run_events` |
-| L1 短期记忆 | 近期原文、按角色摘要、目标与待办 | Session | `conversation_messages`、`conversation_role_summaries` |
+| L1 短期记忆 | 最近 5 轮完整原文、较早 30 轮独立摘要 | Session | `conversation_messages`、`conversation_turn_summaries` |
 | L2 长期记忆 | 项目事实、设计约束、正式决策、工程经验 | Project / Module | `memories`、`memory_sources`、`memory_relations` |
 | L3 原始证据 | 规格、RTL、Artifact、Tool 日志及版本 | 长期版本化保存 | `document_versions`、`document_chunks`、Workspace |
 
@@ -26,9 +26,11 @@ flowchart TD
     X -- 是 --> V[结构校验 + 真实来源校验]
     V --> M[proposed / needs_review Memory]
     M --> C
-    P --> S[ConversationSummaryService]
-    S --> R[按 session + agent_role 增量摘要]
-    R --> C
+    P --> C
+    P --> A[最终 Assistant Response 持久化]
+    A --> S[有界后台摘要队列]
+    S --> R[按 turn_id 生成独立摘要]
+    R -. 下轮读取 completed .-> C
     D[版本化文档 / Chunk] --> C
     C --> F[确定性过滤与两阶段检索]
     F --> B[统一 Token 预算选择]
@@ -38,24 +40,15 @@ flowchart TD
 
 ## 3. 会话摘要
 
-`ConversationSummaryService` 从 `ContextBuilderService` 中独立出来。摘要键是
-`session_id + agent_role`，Design 和 Verification 使用各自可见的历史。可见性规则与
-`SessionService.recent_messages()` 完全一致：只读取 `agent_role IS NULL` 或当前角色的消息。
+一轮由一条 User Request 和对应的最终 Assistant Response 组成。新消息通过同一个 `turn_id` 关联；旧数据库中没有 `turn_id` 的消息按稳定 sequence 使用“User + 后续第一条 Assistant”兼容配对。工具调用和工具结果不作为独立消息轮次。
 
-更新过程：
+`ContextBuilderService` 只读已持久化结果：最近 5 个完整轮次以最多 10 条原文注入，更早部分只考察最近 30 个完整轮次。每个较早轮次若有 `completed` 摘要则注入独立 JSON；若摘要仍为 pending、processing、failed 或尚未创建，则整轮回退为 User/Assistant 原文。摘要和原文不会重复注入，预算筛选也不会拆散半轮。
 
-1. 永久保留最近 24 条可见消息原文；
-2. 计算即将移出窗口且尚未覆盖的消息范围；
-3. 当近期原文超过约 4,000 Token 时也提前移动最旧部分；窗口、批量和阈值由 `SummaryPolicy` 配置；
-4. 每批最多处理 10 条，复用已有结构化摘要；
-5. 真实模型可用时，通过 Provider 的结构化 JSON 输出合并目标、阶段、要求、决策、完成项、待办和问题；
-6. 对 `confirmed_requirements` 和 `important_decisions` 校验真实消息 ID。没有用户消息来源时，模型不能将条目标为 `user_confirmed`；
-7. 保存覆盖起止序号、全部来源消息 ID、内容 Hash、版本、生成模式和失败原因；
-8. 只有一批成功持久化后才推进 `covered_until_sequence`。
+摘要生成发生在最终 Assistant 消息持久化之后。普通聊天和 Run Resume 都调用 `ConversationSummaryService.enqueue_turn()`，由最多 2 个 Worker、最多 32 个待处理槽位的有界线程池执行。任务以 `turn_id` 唯一 Upsert，状态为 pending、processing、completed 或 failed，并保留尝试次数和错误；`retry_failed_summaries()` 可重新投递失败或排队任务。生成失败不会改变已经成功的用户响应。
 
-模型不可用时使用 `deterministic_extract`：它保存待处理消息的完整原文和来源，并明确写入“尚未完成语义摘要”。它不会用字符截断冒充语义总结。摘要整体放不进上下文时会被排除并写入 Manifest，不会裁掉摘要末尾后继续声称覆盖成功。
+每轮摘要只把该轮的两条消息发送给模型，不读取旧摘要，也不做增量合并。结构化字段包括 topic、module、user_intent、key_information、decisions、constraints、assumptions、inferences、open_questions 和 keywords。目标长度 150–250 Token，超过 500 Token 时重新压缩；压缩后仍超限则标记 failed，不保存超长 completed 摘要。用户确认与 Assistant 建议通过来源消息 ID 和 confirmation_status 区分。
 
-旧 `conversation_summaries` 表保留，不删除。由于历史记录无法可靠判断角色，新代码不会直接注入旧混合摘要，而是从永久保存的原始消息按角色重建 `conversation_role_summaries`。
+旧 `conversation_summaries` 和 `conversation_role_summaries` 均保留用于兼容和审计，但 ContextBuilder 不再读取或刷新它们。
 
 ## 4. 自动长期记忆提取
 
@@ -135,13 +128,13 @@ stateDiagram-v2
 |---|---:|
 | System / Tool Schema | 4,000 |
 | 当前请求与 Run | 3,000 |
-| 近期消息 | 6,000 |
-| 历史摘要 | 2,000 |
+| 最近 5 轮完整原文 | 6,000 |
+| 较早 30 轮摘要/原文回退 | 6,000 |
 | 长期记忆 | 2,000 |
 | RAG 文档 | 12,000 |
 | 输出安全预留 | 3,000（至少） |
 
-当前请求和安全预留先占用预算；摘要整体选择；近期消息从新到旧；长期记忆优先关键约束；文档最后使用本区额度以及前面未用额度。本轮刚提交的文档即使查询相关性为零，也作为当前请求证据保留候选，避免破坏 DS/RTL 工作流。
+当前请求和安全预留先占用预算；最近完整轮次优先，较早摘要或回退原文随后按整轮选择；长期记忆优先关键约束；文档最后使用剩余额度。本轮刚提交的文档即使查询相关性为零，也作为当前请求证据保留候选，避免破坏 DS/RTL 工作流。
 
 如果强制保留区本身超过总预算，Builder 明确报错。其他未入选项记录类别、ID、Token、分数和原因，不静默丢弃。Runtime 仍保留最后一道输入安全阀。
 
@@ -149,8 +142,8 @@ stateDiagram-v2
 
 Manifest 描述实际发送给模型的上下文，包括：
 
-- 实际消息、Memory、Document Chunk ID；
-- 摘要角色、覆盖范围、来源消息 ID、版本和生成模式；
+- 实际消息、原始 `turn_id`、独立 `turn_summary_id`、Memory 和 Document Chunk ID；
+- 摘要轮次、原文回退轮次及各自实际 Token；
 - Memory 与 Chunk 的检索分数和选择原因；
 - 所有超预算或零相关候选的排除原因；
 - System/Run/Output 预留、各区实际 Token、未用额度和最终估算；
