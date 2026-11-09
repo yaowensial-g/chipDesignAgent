@@ -14,7 +14,12 @@ from typing import Any
 from app.config.model_settings import model_settings_service
 from app.domain.models import MemoryCreateRequest, MemoryView
 from app.models.factory import provider_factory
-from app.services.memory_service import MemoryService, memory_service
+from app.services.memory_service import (
+    MemoryService,
+    memory_service,
+    normalize_memory_content,
+    normalize_memory_key,
+)
 from app.services.session_service import SessionService
 from app.services.token_service import TokenCounter, token_counter
 from app.services.workspace_service import utc_now
@@ -178,6 +183,8 @@ class MemoryExtractorService:
         result = provider_factory.get(settings.main_endpoint()).generate_json(
             """你是芯片设计项目的长期记忆提取器。source_type=conversation_message 时，只判断 current_content 中用户明确新增、确认或修订，且会影响后续工作的事实、工程约束、技术决策、稳定偏好或可复用经验；其他 source_type 则提取该正式文档或已完成工程事件明确给出的同类信息。典型内容包括时钟频率、复位方式、接口协议、数据位宽、FIFO 深度、背压行为和已经确认的验证结论。一条内容可以生成多个彼此独立的候选，每个候选使用稳定、可复用的 memory_key；若 current_content 是对旧约束的修订，优先复用 related_active_memories 中相同语义的 memory_key。
 
+候选必须先在语义上去重：同一个工程属性、同一个事实只输出一条；不同措辞、同义表达和重复描述不能生成多条候选；同一属性使用统一的小写点分 memory_key，例如 uart.fifo_depth。当前内容明确修改某个属性时只输出修改后的有效结论，不同时输出旧值和新值。不同工程属性必须分别保存，不能因为来自同一句话或内容相似而合并；无法确定两条内容是否属于同一事实时不要擅自合并。
+
 recent_visible_messages 和 related_active_memories 只能用于理解“第二种”“改成 32”等指代、识别修订，不能单独作为新候选依据；每个候选都必须能在 current_content 中找到依据。仅有提问、闲聊、讨论中的建议、未确认设想或没有新增信息时，返回 {"memories":[]}。疑问句如“UART 时钟为 50 MHz 可以吗？”不是确认事实。temporary_assumption_approval=true 表示用户只允许按临时假设继续，此时不得输出 fact 或 decision，确需保留时只能输出 assumption。
 
 返回 JSON 对象：{"memories":[{"memory_key":"稳定键","kind":"fact|decision|experience|preference|assumption|inference","content":"简洁且自包含的内容","confidence":1-10,"importance":1-10}]}。不要输出项目、模块、角色、状态、authority 或 source；这些字段由后端赋值。""",
@@ -286,6 +293,15 @@ recent_visible_messages 和 related_active_memories 只能用于理解“第二�
         force_assumption: bool = False,
     ) -> list[MemoryView]:
         """校验模型候选并补齐所有后端可信字段。"""
+        # 临时假设先统一降级再去重，避免 fact/assumption 两种标签在降级后变成重复项。
+        prepared_candidates = []
+        for candidate in candidates:
+            prepared = dict(candidate)
+            if force_assumption and str(prepared.get("kind")) in {"fact", "decision"}:
+                prepared["kind"] = "assumption"
+            prepared_candidates.append(prepared)
+        candidates = self._deduplicate_candidates(prepared_candidates)
+
         created = []
         allowed_kinds = {
             "fact",
@@ -295,7 +311,7 @@ recent_visible_messages 和 related_active_memories 只能用于理解“第二�
             "preference",
             "experience",
         }
-        for index, candidate in enumerate(candidates):
+        for candidate in candidates:
             memory_key = str(candidate.get("memory_key", "")).strip()
             content = str(candidate.get("content", "")).strip()
             kind = str(candidate.get("kind", "inference"))
@@ -303,15 +319,17 @@ recent_visible_messages 和 related_active_memories 只能用于理解“第二�
                 continue
             if not content or kind not in allowed_kinds:
                 continue
-            # “按临时假设继续”只是执行授权，不是对假设真实性的确认。这里再做一道
-            # 确定性防线，即使模型错误返回 fact/decision，也只能以 assumption 候选保存。
-            if force_assumption and kind in {"fact", "decision"}:
-                kind = "assumption"
+            # 候选标识只依赖事件和规范化事实，不依赖模型返回顺序。
+            dedup_signature = (
+                f"{extraction_key}:{kind}:"
+                f"{normalize_memory_key(memory_key)}:"
+                f"{normalize_memory_content(content)}"
+            )
             item_key = hashlib.sha256(
-                f"{extraction_key}:{index}:{memory_key}:{content}".encode("utf-8")
+                dedup_signature.encode("utf-8")
             ).hexdigest()
             created.append(
-                self.memories.create(
+                self.memories.create_or_merge_candidate(
                     MemoryCreateRequest(
                         project_id=project_id,
                         module_name=module_name,
@@ -345,7 +363,54 @@ recent_visible_messages 和 related_active_memories 只能用于理解“第二�
                     )
                 )
             )
-        return created
+        # 后续候选可能把前一条同 key 候选推进 needs_review；统一从数据库刷新，确保
+        # 返回状态与本批次事务最终结果一致，并防止合并到同一 Memory 时重复返回 ID。
+        memory_ids = list(dict.fromkeys(item.memory_id for item in created))
+        return [
+            memory
+            for memory_id in memory_ids
+            if (memory := self.memories.get(memory_id))
+        ]
+
+    @staticmethod
+    def _deduplicate_candidates(
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """在单次模型结果中执行保守的精确去重。
+
+        同 key 的不同取值会保留给 MemoryService 标记冲突；不同 kind 或不同工程属性
+        也不会合并。完全重复项保留首次正文，但吸收更高 confidence/importance。
+        """
+        unique: list[dict[str, Any]] = []
+        by_signature: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+        def score(candidate: dict[str, Any], field: str) -> int:
+            try:
+                return max(1, min(10, int(candidate.get(field, 5))))
+            except (TypeError, ValueError):
+                return 5
+
+        for raw_candidate in candidates:
+            candidate = dict(raw_candidate)
+            signature = (
+                normalize_memory_key(str(candidate.get("memory_key", ""))),
+                str(candidate.get("kind", "inference")),
+                normalize_memory_content(str(candidate.get("content", ""))),
+            )
+            existing = by_signature.get(signature)
+            if existing is None:
+                candidate["confidence"] = score(candidate, "confidence")
+                candidate["importance"] = score(candidate, "importance")
+                by_signature[signature] = candidate
+                unique.append(candidate)
+                continue
+            existing["confidence"] = max(
+                score(existing, "confidence"), score(candidate, "confidence")
+            )
+            existing["importance"] = max(
+                score(existing, "importance"), score(candidate, "importance")
+            )
+        return unique
 
     def _completed(self, extraction_key: str) -> bool:
         """completed 事件可直接复用结果；failed 事件允许下一次调用重试。"""

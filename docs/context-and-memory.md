@@ -65,12 +65,16 @@ flowchart TD
 
 正式文档版本、完成 Run 和 Delegate 结论继续复用同一个 `_model_candidates()`，但不携带会话前文。每个事件写入 `memory_extraction_events`，以 `source_type:source_id` 幂等；完成消息在准备上下文和调用模型之前直接复用已有结果，失败保存原因和尝试次数，可安全重试。
 
+去重分为模型提示、单批候选和跨事件存储三层。Prompt 要求模型对同一工程属性只输出一个稳定的小写点分键；后端仍会对 `memory_key` 做 NFKC、大小写和 `-`/`_`/`.` 统一，对正文去除空白、标点及少量不改变事实的表述词。单批完全相同的候选只保留一条并吸收更高的置信度和重要性。不同消息、Run 或文档再次提取到同一候选时，`MemoryService` 复用原 Memory 并追加来源，不覆盖原正文、状态、authority 或评分。
+
+这是一种保守的确定性精确去重，不使用模糊相似度或额外模型调用。相同规范化键但内容不同的候选不会合并，而是进入 `needs_review`；不同工程属性、不同知识类型以及不同 `role_private` owner 也不会误合并。候选 `extraction_key` 由事件、类型、规范化键和规范化正文生成，不依赖模型返回顺序，因此失败重试时调换候选顺序也不会重复入库。
+
 模型只返回候选字段，不能直接更新数据库。Service 会检查：
 
 - `memory_key` 格式、类型、置信度和重要性；
 - 来源 ID 在消息、文档、Run、Delegate 或 Patch 表中真实存在；
 - Run、Delegate、Patch 等权威来源已经处于对应完成/应用状态；
-- `extraction_key` 未被处理过。
+- `extraction_key` 未被处理过，或规范化后的逻辑候选可安全合并来源。
 
 自动提取结果始终是 `proposed`，与现有 active 事实冲突时进入 `needs_review`。
 

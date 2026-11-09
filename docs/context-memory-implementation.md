@@ -279,7 +279,7 @@ trigger_tokens = 4_000
 
 Run 的 `accept_assumption` 同样走消息提取，但 Prompt 明确限制只能形成 assumption；入库前还有确定性防线，会把模型误报的 fact/decision 强制降级为 assumption。模型只负责候选字段，不能直接执行 SQL、激活记忆或替代旧事实。在模型不可用的受控运行模式下事件以空候选完成；模型调用或解析实际抛错时标为 failed 并保留错误。
 
-### 7.3 两层幂等
+### 7.3 去重与幂等
 
 第一层是事件幂等：
 
@@ -292,7 +292,18 @@ delegation:<task_id>
 
 完成事件再次执行时直接返回之前关联的 Memory。
 
-第二层是候选幂等。每个候选根据事件 key、候选序号、`memory_key` 和正文计算 SHA-256 `extraction_key`；数据库对非空 `extraction_key` 建唯一索引。即使事件重试过程中部分成功，也不会重复插入相同候选。
+第二层是单批确定性去重。模型 Prompt 先要求同一工程属性只输出一个稳定的小写点分 `memory_key`，但后端不信任模型一定做到：`MemoryExtractorService._deduplicate_candidates()` 会规范化 key 和正文，对完全相同的 `(key, kind, content)` 只保留第一条，并吸收重复项中更高的 confidence 和 importance。相同 key 的不同值、不同 kind 或不同工程属性会继续保留，避免把冲突和独立约束误合并。
+
+第三层是候选幂等。每个候选根据事件 key、kind、规范化 `memory_key` 和规范化正文计算 SHA-256 `extraction_key`，不再包含候选序号；数据库对非空 `extraction_key` 建唯一索引。即使失败重试时模型调换了候选顺序，也会命中原候选。
+
+第四层是跨事件逻辑去重。`MemoryService.create_or_merge_candidate()` 在写事务内查询相同项目、模块、scope、visibility（角色私有项还要求 owner 相同）的 `proposed`、`needs_review` 和 `active` Memory：
+
+- 规范化 key、kind 和规范化正文都相同：复用原 Memory ID，只追加经过来源校验的新 source；
+- 规范化 key 相同但正文不同：保留两条候选，并将新候选及已有 proposed 候选标为 `needs_review`，已有 active 不降级；
+- 正文相同但 kind 不同，或工程属性不同：不合并，也不凭内容相似判冲突；
+- 重复候选不会覆盖首次记录的正文、状态、authority、confidence 或 importance。
+
+key 规范化使用 Unicode NFKC、大小写折叠以及 `-`、`_`、`.` 分隔符统一；正文规范化消除空白、普通标点和少量安全的中文表述差异，同时保留否定词、数字、单位、小数点及数值正负号。首版刻意不引入模糊匹配、向量库、Schema 迁移或额外 LLM 调用。
 
 ### 7.4 自动候选永远不是 active
 
@@ -753,7 +764,7 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 
 ## 17. 测试如何证明这些行为
 
-[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖十四个关键场景：
+[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖二十二个关键场景：
 
 | 测试 | 验证内容 |
 |---|---|
@@ -765,6 +776,14 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 | `test_non_message_event_reuses_model_candidate_path` | 文档等非消息事件继续复用可选上下文的模型候选接口 |
 | `test_message_context_is_role_filtered_and_supports_reference_resolution` | 角色可见前文、当前消息排除、active Memory 和指代修订 |
 | `test_temporary_assumption_approval_cannot_become_fact` | 临时假设批准无法按 fact/decision 入库 |
+| `test_candidate_batch_exact_duplicates_create_one_memory` | 单批完全重复候选只入库一次，并保留更高评分 |
+| `test_candidate_batch_normalizes_memory_key_variants` | 点号、下划线、连字符等 key 变体可确定性去重 |
+| `test_candidate_batch_normalizes_safe_chinese_expression_variants` | 安全的中文表述差异不会产生重复 Memory |
+| `test_candidate_batch_keeps_different_engineering_attributes` | 不同工程属性不会因同句出现而误合并 |
+| `test_candidate_batch_conflicting_values_require_review` | 同 key 不同值保留并同时进入复核 |
+| `test_cross_event_duplicate_merges_sources_without_overwriting_memory` | 跨事件重复项复用 ID、追加来源且不覆盖既有字段 |
+| `test_failed_event_retry_is_order_independent` | 部分失败后调换候选顺序重试仍保持幂等 |
+| `test_cross_event_dedup_respects_role_private_owner` | role_private 候选按 owner 隔离，不跨角色合并 |
 | `test_conflicting_confirmed_constraint_supersedes_old_fact` | needs_review、原子替代和默认只返回新事实 |
 | `test_document_upgrade_invalidates_only_affected_source_and_is_atomic` | 来源级失效、独立来源保活和事务回滚 |
 | `test_delegate_receives_shared_memory_but_not_private_history` | Delegate 无历史、只接收共享 Memory |

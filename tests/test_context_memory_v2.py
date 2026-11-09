@@ -210,7 +210,10 @@ def test_message_model_handles_non_keyword_and_multiple_constraints(services, mo
         "uart.clock_frequency", "uart.fifo_depth", "uart.reset_polarity",
     }
     assert all(item.status == "proposed" for item in combined)
-    assert all(item.source_refs[0]["source_id"] == combined_message.message_id for item in combined)
+    assert all(
+        combined_message.message_id in {source["source_id"] for source in item.source_refs}
+        for item in combined
+    )
     assert len(calls) == 2
 
 
@@ -329,6 +332,209 @@ def test_temporary_assumption_approval_cannot_become_fact(services, monkeypatch)
     )
     assert created[0].kind == "assumption"
     assert created[0].status == "proposed"
+
+
+def test_candidate_batch_exact_duplicates_create_one_memory(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-exact")
+    message = sessions.add_message(
+        "dedup-exact", "user", "FIFO 深度为 32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [
+        {"memory_key": "uart.fifo_depth", "kind": "fact", "content": "FIFO 深度为 32", "confidence": 6, "importance": 7},
+        {"memory_key": "uart.fifo_depth", "kind": "fact", "content": "FIFO 深度为 32", "confidence": 9, "importance": 8},
+    ])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-exact",
+    )
+    assert len(created) == 1
+    assert created[0].confidence == 9
+    assert created[0].importance == 8
+    assert len(memories.list("project", "uart")) == 1
+
+
+def test_candidate_batch_normalizes_memory_key_variants(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-key")
+    message = sessions.add_message(
+        "dedup-key", "user", "FIFO 深度为 32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [
+        {"memory_key": "fifo.depth", "kind": "fact", "content": "FIFO 深度为32"},
+        {"memory_key": "fifo_depth", "kind": "fact", "content": "FIFO 深度为32"},
+        {"memory_key": "fifo-depth", "kind": "fact", "content": "FIFO 深度为32"},
+    ])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-key",
+    )
+    assert len(created) == 1
+    assert created[0].memory_key == "fifo.depth"
+
+
+def test_candidate_batch_normalizes_safe_chinese_expression_variants(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-content")
+    message = sessions.add_message(
+        "dedup-content", "user", "FIFO 深度是32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [
+        {"memory_key": "fifo.depth", "kind": "fact", "content": "FIFO 深度是32"},
+        {"memory_key": "fifo_depth", "kind": "fact", "content": "FIFO 的深度设置为32"},
+    ])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-content",
+    )
+    assert len(created) == 1
+
+
+def test_candidate_batch_keeps_different_engineering_attributes(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-attributes")
+    message = sessions.add_message(
+        "dedup-attributes", "user", "UART 时钟为50MHz，FIFO 深度为32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [
+        {"memory_key": "uart.clock_frequency", "kind": "fact", "content": "UART 时钟为50MHz"},
+        {"memory_key": "uart.fifo_depth", "kind": "fact", "content": "UART FIFO 深度为32"},
+    ])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-attributes",
+    )
+    assert {item.memory_key for item in created} == {
+        "uart.clock_frequency", "uart.fifo_depth",
+    }
+
+
+def test_candidate_batch_conflicting_values_require_review(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-conflict")
+    message = sessions.add_message(
+        "dedup-conflict", "user", "FIFO 深度可能是 32 或 64。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [
+        {"memory_key": "fifo.depth", "kind": "fact", "content": "FIFO 深度为32"},
+        {"memory_key": "fifo_depth", "kind": "fact", "content": "FIFO 深度为64"},
+    ])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-conflict",
+    )
+    assert len(created) == 2
+    assert {item.status for item in created} == {"needs_review"}
+    assert all("规范化 memory_key" in (item.review_reason or "") for item in created)
+
+
+def test_cross_event_duplicate_merges_sources_without_overwriting_memory(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-events")
+    message = sessions.add_message(
+        "dedup-events", "user", "UART 时钟为 50 MHz。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    candidate = [{
+        "memory_key": "uart.clock_frequency", "kind": "fact",
+        "content": "UART 时钟为 50 MHz", "confidence": 8, "importance": 9,
+    }]
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: candidate)
+    from_message = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-events",
+    )[0]
+    db.execute(
+        """INSERT INTO runs
+        (run_id, session_id, project_id, module_name, run_type, status, user_instruction,
+         route_reason, result_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'completed', ?, ?, '{}', ?, ?)""",
+        (
+            "run-dedup", "dedup-events", "project", "uart", "orchestration",
+            "确认 UART 时钟", "test", "2026-11-09T00:00:00Z", "2026-11-09T00:00:00Z",
+        ),
+    )
+    from_run = extractor.extract_from_event(
+        source_type="run", source_id="run-dedup", project_id="project",
+        module_name="uart", agent_role="design", content="UART 时钟为 50 MHz。",
+    )[0]
+    assert from_run.memory_id == from_message.memory_id
+    assert from_run.status == from_message.status == "proposed"
+    assert from_run.authority == from_message.authority == "user_event"
+    assert len(memories.list("project", "uart")) == 1
+    assert {(source["source_type"], source["source_id"]) for source in from_run.source_refs} == {
+        ("conversation_message", message.message_id), ("run", "run-dedup"),
+    }
+
+
+def test_failed_event_retry_is_order_independent(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "dedup-retry")
+    message = sessions.add_message(
+        "dedup-retry", "user", "UART 时钟为50MHz，FIFO 深度为32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    clock = {"memory_key": "uart.clock_frequency", "kind": "fact", "content": "UART 时钟为50MHz"}
+    fifo = {"memory_key": "uart.fifo_depth", "kind": "fact", "content": "UART FIFO 深度为32"}
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [clock, fifo])
+    original_create = memories.create_or_merge_candidate
+    calls = 0
+
+    def fail_second_candidate(request):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected partial failure")
+        return original_create(request)
+
+    monkeypatch.setattr(memories, "create_or_merge_candidate", fail_second_candidate)
+    assert extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-retry",
+    ) == []
+    first_clock = memories.list("project", "uart")[0]
+    assert first_clock.memory_key == "uart.clock_frequency"
+
+    monkeypatch.setattr(memories, "create_or_merge_candidate", original_create)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [fifo, clock])
+    retried = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="dedup-retry",
+    )
+    assert len(retried) == 2
+    assert len(memories.list("project", "uart")) == 2
+    assert next(item for item in retried if item.memory_key == "uart.clock_frequency").memory_id == first_clock.memory_id
+    assert all(item.extraction_key for item in retried)
+    event = db.fetch_one(
+        "SELECT status, attempts FROM memory_extraction_events WHERE extraction_key = ?",
+        (f"conversation_message:{message.message_id}",),
+    )
+    assert event["status"] == "completed"
+    assert event["attempts"] == 2
+
+
+def test_cross_event_dedup_respects_role_private_owner(services) -> None:
+    _, _, memories, _, _, _ = services
+    base = dict(
+        project_id="project", module_name="uart", scope="module",
+        memory_key="uart.private_plan", kind="decision", content="UART 采用两级流水",
+        visibility="role_private", status="proposed", authority="agent",
+    )
+    design = memories.create_or_merge_candidate(MemoryCreateRequest(
+        **base, owner_agent_role="design", extraction_key="private-design",
+        source_refs=[{"source_type": "external", "source_id": "DESIGN-NOTE"}],
+    ))
+    verification = memories.create_or_merge_candidate(MemoryCreateRequest(
+        **base, owner_agent_role="verification", extraction_key="private-verification",
+        source_refs=[{"source_type": "external", "source_id": "VERIFICATION-NOTE"}],
+    ))
+    assert design.memory_id != verification.memory_id
+    assert len(memories.list("project", "uart")) == 2
 
 
 def test_conflicting_confirmed_constraint_supersedes_old_fact(services) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import unicodedata
 from typing import Any
 from uuid import uuid4
 
@@ -13,6 +14,47 @@ from app.storage.database import Database, database
 
 
 PROMOTABLE_STATUSES = {"proposed", "needs_review", "stale"}
+
+
+def normalize_memory_key(key: str) -> str:
+    """生成只用于精确去重比较的 key；不改写数据库中的原始 memory_key。"""
+    normalized = unicodedata.normalize("NFKC", key).strip().casefold()
+    normalized = re.sub(r"[-_]+", ".", normalized)
+    normalized = re.sub(r"\.+", ".", normalized)
+    return normalized.strip(".")
+
+
+def normalize_memory_content(content: str) -> str:
+    """消除安全的表达差异，同时保留否定词、数字、单位和技术参数。"""
+    normalized = unicodedata.normalize("NFKC", content).casefold()
+    compact: list[str] = []
+    for index, character in enumerate(normalized):
+        if character.isspace():
+            continue
+        if unicodedata.category(character).startswith("P"):
+            previous = normalized[index - 1] if index > 0 else ""
+            following = normalized[index + 1] if index + 1 < len(normalized) else ""
+            # 小数点和数值正负号属于参数本身，不能与普通标点一起删除。
+            if character == "." and previous.isdigit() and following.isdigit():
+                compact.append(character)
+            elif character in {"+", "-"} and following.isdigit():
+                compact.append(character)
+            continue
+        compact.append(character)
+    normalized = "".join(compact)
+    # 只删除不改变事实极性的常见表述差异；“不/未/非/无/禁止/不得/不能/尚未”均保留。
+    for phrase in (
+        "设置为",
+        "配置为",
+        "确定为",
+        "修改为",
+        "改为",
+        "当前",
+        "是",
+        "的",
+    ):
+        normalized = normalized.replace(phrase, "")
+    return normalized
 
 
 def _terms(text: str) -> set[str]:
@@ -73,6 +115,125 @@ class MemoryService:
             self._add_sources(connection, memory_id, validated_sources)
             if status == "active":
                 self._supersede_conflicts(connection, memory_id, conflicts)
+        return self.get(memory_id)  # type: ignore[return-value]
+
+    def create_or_merge_candidate(self, request: MemoryCreateRequest) -> MemoryView:
+        """为自动提取候选执行跨事件精确去重，并把新来源合并到逻辑记忆。
+
+        比较只使用规范化 key/content，不做模糊相似度。数据库仍保留首次创建时的
+        原始正文、key、authority、状态和评分；后续重复事件只增加经过校验的来源。
+        """
+        if request.status != "proposed":
+            raise ValueError("automatic memory candidate must start as proposed")
+        validated_sources = self._validate_sources(request.source_refs)
+        normalized_key = normalize_memory_key(request.memory_key or "")
+        normalized_content = normalize_memory_content(request.content)
+        memory_id: str
+        now = utc_now()
+
+        with self.db.transaction() as connection:
+            # extraction_key 仍是单事件内的最后一道幂等防线，检查必须放在写事务中。
+            existing_by_extraction = None
+            if request.extraction_key:
+                existing_by_extraction = connection.execute(
+                    "SELECT * FROM memories WHERE extraction_key = ?",
+                    (request.extraction_key,),
+                ).fetchone()
+
+            if existing_by_extraction is not None:
+                # 让下面的统一重复分支追加来源并在事务提交后再读取完整 MemoryView。
+                rows = [existing_by_extraction]
+            else:
+                parameters: list[object] = [
+                    request.project_id,
+                    request.module_name,
+                    request.scope,
+                    request.visibility,
+                ]
+                owner_condition = ""
+                if request.visibility == "role_private":
+                    owner_condition = " AND owner_agent_role IS ?"
+                    parameters.append(request.owner_agent_role)
+                rows = connection.execute(
+                    f"""SELECT * FROM memories
+                    WHERE project_id = ? AND module_name IS ? AND scope = ?
+                      AND visibility = ?{owner_condition}
+                      AND status IN ('proposed', 'needs_review', 'active')
+                    ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'needs_review' THEN 1 ELSE 2 END,
+                             updated_at DESC""",
+                    tuple(parameters),
+                ).fetchall()
+
+            duplicate = None
+            conflicts = []
+            for row in rows:
+                if normalize_memory_key(row["memory_key"] or "") != normalized_key:
+                    continue
+                same_content = normalize_memory_content(row["content"]) == normalized_content
+                if row["kind"] == request.kind and same_content:
+                    duplicate = row
+                    break
+                # kind 不同但内容相同是不同知识类型，既不合并也不判冲突；相同属性
+                # 出现不同取值则沿用原有冲突语义，无论模型给两个值分配了什么 kind。
+                if not same_content:
+                    conflicts.append(row)
+
+            if duplicate is not None:
+                # 精确重复只合并来源；active 不降级，既有 authority/评分/正文也不覆盖。
+                memory_id = duplicate["memory_id"]
+                self._add_sources(connection, memory_id, validated_sources)
+            else:
+                memory_id = str(uuid4())
+                status = request.status
+                review_reason = request.review_reason
+                if conflicts:
+                    status = "needs_review"
+                    review_reason = review_reason or "与同一规范化 memory_key 的候选内容冲突"
+                    # 已有 active 事实保持不动；已有 proposed 候选同步进入复核，避免
+                    # 数据库出现多个相互矛盾但看起来都可直接提升的普通候选。
+                    conflict_ids = [
+                        row["memory_id"] for row in conflicts if row["status"] == "proposed"
+                    ]
+                    if conflict_ids:
+                        placeholders = ",".join("?" for _ in conflict_ids)
+                        connection.execute(
+                            f"""UPDATE memories SET status = 'needs_review',
+                            review_reason = COALESCE(review_reason, ?), updated_at = ?
+                            WHERE memory_id IN ({placeholders})""",
+                            (
+                                "与同一规范化 memory_key 的候选内容冲突",
+                                now,
+                                *conflict_ids,
+                            ),
+                        )
+                connection.execute(
+                    """INSERT INTO memories
+                    (memory_id, project_id, module_name, scope, memory_key, kind, content,
+                     confidence, importance, authority, visibility, owner_agent_role, status,
+                     review_reason, extraction_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        memory_id,
+                        request.project_id,
+                        request.module_name,
+                        request.scope,
+                        request.memory_key,
+                        request.kind,
+                        request.content,
+                        request.confidence,
+                        request.importance,
+                        request.authority,
+                        request.visibility,
+                        request.owner_agent_role,
+                        status,
+                        review_reason,
+                        request.extraction_key,
+                        now,
+                        now,
+                    ),
+                )
+                self._add_sources(connection, memory_id, validated_sources)
+
         return self.get(memory_id)  # type: ignore[return-value]
 
     def get(self, memory_id: str) -> MemoryView | None:
