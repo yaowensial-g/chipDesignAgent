@@ -126,7 +126,7 @@ def test_role_summaries_are_isolated_but_shared_fact_is_visible(services) -> Non
     assert [item.memory_key for item in shared] == ["uart.clock_frequency"]
 
 
-def test_constraint_extraction_promotion_and_cross_session_retrieval(services) -> None:
+def test_constraint_extraction_promotion_and_cross_session_retrieval(services, monkeypatch) -> None:
     db, sessions, memories, _, _, _ = services
     _conversation(sessions, "source")
     message = sessions.add_message(
@@ -135,17 +135,31 @@ def test_constraint_extraction_promotion_and_cross_session_retrieval(services) -
         agent_role="design",
     )
     extractor = MemoryExtractorService(db, memories)
+    model_calls = []
+
+    def extract_clock(content, **context):
+        model_calls.append((content, context))
+        return [{
+            "memory_key": "uart.clock_frequency", "kind": "fact",
+            "content": "UART 时钟为 100 MHz", "confidence": 9, "importance": 9,
+        }]
+
+    # 不再依赖时钟正则；stub 代表一次结构化模型判断。
+    monkeypatch.setattr(extractor, "_model_candidates", extract_clock)
     first = extractor.extract_from_message(
         message_id=message.message_id, project_id="project", module_name="uart",
-        agent_role="design", content=message.content,
+        agent_role="design", content=message.content, session_id="source",
     )
     second = extractor.extract_from_message(
         message_id=message.message_id, project_id="project", module_name="uart",
-        agent_role="design", content=message.content,
+        agent_role="design", content=message.content, session_id="source",
     )
     assert len(first) == 1
+    assert len(model_calls) == 1
     assert second[0].memory_id == first[0].memory_id
     assert first[0].status == "proposed"
+    assert first[0].source_refs[0]["source_type"] == "conversation_message"
+    assert first[0].source_refs[0]["source_id"] == message.message_id
 
     active = memories.promote(first[0].memory_id, MemoryPromoteRequest(
         authority="user_confirmed",
@@ -153,6 +167,168 @@ def test_constraint_extraction_promotion_and_cross_session_retrieval(services) -
     ))
     assert active.status == "active"
     assert memories.retrieve("project", "uart", "UART clock frequency")[0].memory_id == active.memory_id
+
+
+def test_message_model_handles_non_keyword_and_multiple_constraints(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "model-all")
+    extractor = MemoryExtractorService(db, memories, sessions)
+    calls = []
+
+    def model_stub(content, **context):
+        calls.append((content, context))
+        if content.startswith("FIFO"):
+            return [{
+                "memory_key": "uart.fifo_depth", "kind": "fact",
+                "content": "UART FIFO 深度为 32", "confidence": 9, "importance": 8,
+            }]
+        return [
+            {"memory_key": "uart.clock_frequency", "kind": "fact", "content": "UART 时钟为 50 MHz"},
+            {"memory_key": "uart.fifo_depth", "kind": "fact", "content": "UART FIFO 深度为 32"},
+            {"memory_key": "uart.reset_polarity", "kind": "fact", "content": "UART 复位低有效"},
+        ]
+
+    monkeypatch.setattr(extractor, "_model_candidates", model_stub)
+    fifo_message = sessions.add_message(
+        "model-all", "user", "FIFO 深度设为 32，满的时候拉低 ready。", agent_role="design"
+    )
+    fifo = extractor.extract_from_message(
+        message_id=fifo_message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=fifo_message.content, session_id="model-all",
+    )
+    assert [item.memory_key for item in fifo] == ["uart.fifo_depth"]
+
+    combined_message = sessions.add_message(
+        "model-all", "user", "UART 时钟为 50 MHz，FIFO 深度设为 32，复位低有效。",
+        agent_role="design",
+    )
+    combined = extractor.extract_from_message(
+        message_id=combined_message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=combined_message.content, session_id="model-all",
+    )
+    assert {item.memory_key for item in combined} == {
+        "uart.clock_frequency", "uart.fifo_depth", "uart.reset_polarity",
+    }
+    assert all(item.status == "proposed" for item in combined)
+    assert all(item.source_refs[0]["source_id"] == combined_message.message_id for item in combined)
+    assert len(calls) == 2
+
+
+def test_question_reaches_model_but_empty_result_writes_no_memory(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "question")
+    message = sessions.add_message(
+        "question", "user", "UART 时钟为 50 MHz 可以吗？", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    calls = []
+    monkeypatch.setattr(
+        extractor,
+        "_model_candidates",
+        lambda content, **context: calls.append((content, context)) or [],
+    )
+    assert extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="question",
+    ) == []
+    assert len(calls) == 1
+    event = db.fetch_one(
+        "SELECT status, memory_ids_json FROM memory_extraction_events WHERE extraction_key = ?",
+        (f"conversation_message:{message.message_id}",),
+    )
+    assert event["status"] == "completed"
+    assert db.loads(event["memory_ids_json"], []) == []
+    assert memories.list("project") == []
+
+
+def test_non_message_event_reuses_model_candidate_path(services, monkeypatch) -> None:
+    db, sessions, memories, documents, _, _ = services
+    version = documents.ingest(DocumentIngestRequest(
+        project_id="project", module_name="uart", kind=DocumentKind.AS,
+        name="UART AS", version="1.0", content="UART 数据位宽为 8 bit",
+    ))
+    extractor = MemoryExtractorService(db, memories, sessions)
+    captured = {}
+
+    def extract_document(content, **context):
+        captured.update(context)
+        return [{
+            "memory_key": "uart.data_width", "kind": "fact",
+            "content": "UART 数据位宽为 8 bit", "confidence": 9, "importance": 8,
+        }]
+
+    monkeypatch.setattr(extractor, "_model_candidates", extract_document)
+    created = extractor.extract_from_event(
+        source_type="document_version", source_id=version.version_id,
+        project_id="project", module_name="uart", agent_role=None,
+        content="UART 数据位宽为 8 bit",
+    )
+    assert captured["source_type"] == "document_version"
+    assert "recent_messages" not in captured
+    assert created[0].source_refs[0]["source_id"] == version.version_id
+    assert created[0].status == "proposed"
+
+
+def test_message_context_is_role_filtered_and_supports_reference_resolution(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "reference")
+    sessions.add_message(
+        "reference", "assistant", "方案一深度 16，方案二深度 64。", agent_role="design"
+    )
+    sessions.add_message(
+        "reference", "assistant", "VERIFY-PRIVATE: 使用深度 128。", agent_role="verification"
+    )
+    memories.create(MemoryCreateRequest(
+        project_id="project", module_name="uart", memory_key="uart.fifo_depth",
+        kind="fact", content="UART FIFO 当前深度为 16", status="active", importance=9,
+        authority="formal", source_refs=[{"source_type": "external", "source_id": "SPEC-FIFO"}],
+    ))
+    current = sessions.add_message(
+        "reference", "user", "那就用第二种，深度改成 32。", agent_role="design"
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    captured = {}
+
+    def resolve_reference(content, **context):
+        captured.update(context)
+        return [{
+            "memory_key": "uart.fifo_depth", "kind": "decision",
+            "content": "UART FIFO 深度改为 32", "confidence": 9, "importance": 9,
+        }]
+
+    monkeypatch.setattr(extractor, "_model_candidates", resolve_reference)
+    created = extractor.extract_from_message(
+        message_id=current.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=current.content, session_id="reference",
+    )
+    visible_text = "\n".join(item["content"] for item in captured["recent_messages"])
+    assert "方案一深度 16" in visible_text
+    assert "VERIFY-PRIVATE" not in visible_text
+    assert current.content not in visible_text
+    assert [item["memory_key"] for item in captured["active_memories"]] == ["uart.fifo_depth"]
+    assert created[0].memory_key == "uart.fifo_depth"
+    assert created[0].status == "needs_review"
+
+
+def test_temporary_assumption_approval_cannot_become_fact(services, monkeypatch) -> None:
+    db, sessions, memories, _, _, _ = services
+    _conversation(sessions, "assumption")
+    message = sessions.add_message(
+        "assumption", "user", "允许按临时假设继续", agent_role="design",
+        message_type="run_decision", metadata={"action": "accept_assumption"},
+    )
+    extractor = MemoryExtractorService(db, memories, sessions)
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [{
+        "memory_key": "uart.unverified_reset", "kind": "fact",
+        "content": "UART 暂按异步复位处理", "confidence": 4, "importance": 5,
+    }])
+    created = extractor.extract_from_message(
+        message_id=message.message_id, project_id="project", module_name="uart",
+        agent_role="design", content=message.content, session_id="assumption",
+        temporary_assumption=True,
+    )
+    assert created[0].kind == "assumption"
+    assert created[0].status == "proposed"
 
 
 def test_conflicting_confirmed_constraint_supersedes_old_fact(services) -> None:
@@ -292,7 +468,8 @@ def test_memory_extraction_failure_is_audited_and_retry_is_idempotent(services, 
     )
     extractor = MemoryExtractorService(db, memories)
     monkeypatch.setattr(
-        extractor, "_model_candidates", lambda content: (_ for _ in ()).throw(RuntimeError("provider down"))
+        extractor, "_model_candidates",
+        lambda content, **context: (_ for _ in ()).throw(RuntimeError("provider down")),
     )
     assert extractor.extract_from_message(
         message_id=message.message_id, project_id="project", module_name="uart",
@@ -305,7 +482,7 @@ def test_memory_extraction_failure_is_audited_and_retry_is_idempotent(services, 
     assert event["status"] == "failed"
     assert "provider down" in event["error"]
 
-    monkeypatch.setattr(extractor, "_model_candidates", lambda content: [{
+    monkeypatch.setattr(extractor, "_model_candidates", lambda content, **context: [{
         "memory_key": "uart.reset_policy", "kind": "decision",
         "content": "UART 使用异步复位", "confidence": 8, "importance": 8,
     }])

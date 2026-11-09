@@ -11,7 +11,7 @@
 | ConversationService | 消息、历史、文档和工程上下文 | 普通回答或统一 Run | 间接 |
 | SessionService | session、项目、用户工作角色 | Design/Verification 主 Agent | SQLite |
 | ConversationSummaryService | 当前角色可见的旧消息、已有摘要 | 增量结构化摘要与覆盖游标 | SQLite |
-| MemoryExtractorService | 高价值消息、文档、审批、Run、Delegate | proposed Memory 候选与提取审计 | SQLite |
+| MemoryExtractorService | 全部新消息的有限上下文判断，以及文档、Run、Delegate 事件 | proposed Memory 候选与提取审计 | SQLite |
 | MemoryService | 项目/角色/查询/来源 | 生命周期治理与两阶段检索结果 | SQLite |
 | ContextBuilderService | L0-L3 候选、统一预算 | 实际模型快照与 Manifest | SQLite |
 | OrchestratorService | 消息、主 Agent、候选 Tool | TaskIntent、Tool Call、Observation、Run | SQLite（经 RunService） |

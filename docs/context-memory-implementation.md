@@ -257,41 +257,27 @@ trigger_tokens = 4_000
 
 ## 7. 长期记忆如何形成
 
-### 7.1 普通聊天不会每轮调用提取模型
+### 7.1 每条新消息由模型一次性判断
 
-`MemoryExtractorService.extract_from_message()` 先用触发正则判断是否存在“确定为、确认、必须、约束、后续按照、shall、must、approved”等高价值表达。没有命中且没有明确时钟表达式时直接返回，不写提取事件，也不调用模型。
+`MemoryExtractorService.extract_from_message()` 不再用关键词或时钟正则预筛选。每条尚未完成提取审计的新消息都会进行一次结构化模型调用，由模型判断当前消息是否明确新增、确认或修订了值得跨会话保留的信息。纯提问、闲聊、讨论中的建议和未确认设想应返回空数组；空结果仍将审计事件标为 completed，表示该消息已经判断过。
 
 当前接入的事件包括：
 
 | 事件 | 调用位置 | 来源类型 |
 |---|---|---|
-| 高价值用户消息 | `OrchestratorService._handle()` | `conversation_message` |
-| Run 中的批准、接受假设、提供解决方案 | `routes.resume_run()` 先保存为用户决策消息 | `conversation_message` |
+| 所有新用户消息 | `OrchestratorService._handle()` | `conversation_message` |
+| 所有 Run 决策消息 | `routes.resume_run()` 先保存为用户决策消息 | `conversation_message` |
 | 完成的 Run | `OrchestratorService.handle()` 或恢复接口 | `run` |
 | 新文档版本提交成功 | `DocumentService.ingest()` | `document_version` |
 | Delegate 成功结束 | `DelegationService.delegate()` | `delegation` |
 
-### 7.2 确定性规则和模型提取
+### 7.2 有限上下文和结构化模型提取
 
-明确的时钟约束采用确定性规则。例如：
+消息调用会提供当前消息、项目、模块、角色，以及最多 6 条当前角色可见前文和最多 6 条相关 active Memory。前文总预算约 1,200 Token，单条前文最多 320 Token，单条旧记忆最多 240 Token。当前消息通过 `exclude_message_id` 从前文中排除，避免正文重复。
 
-```text
-UART clock = 100 MHz
-```
+前文和旧记忆只用于理解指代、识别修订并复用稳定 `memory_key`，不能单独成为候选依据。例如“那就用第二种，深度改成 32”可以结合前文确定讨论对象，但候选值 32 必须来自当前消息。模型可以为“UART 时钟为 50 MHz，FIFO 深度设为 32，复位低有效”返回三个独立候选；“UART 时钟为 50 MHz 可以吗？”应返回空候选。
 
-会形成候选：
-
-```json
-{
-  "memory_key": "uart.clock_frequency",
-  "kind": "fact",
-  "content": "UART 系统时钟为 100 MHz",
-  "confidence": 9,
-  "importance": 9
-}
-```
-
-其他复杂高价值事件才会调用结构化模型。模型只负责返回候选字段，不能直接执行 SQL、激活记忆或替代旧事实。在模型不可用的正式事件上，当前实现会把事件标记为 `completed` 且 Memory 列表为空，表示“已检查但没有生成候选”；模型实际抛错时则标为 `failed` 并保留错误。
+Run 的 `accept_assumption` 同样走消息提取，但 Prompt 明确限制只能形成 assumption；入库前还有确定性防线，会把模型误报的 fact/decision 强制降级为 assumption。模型只负责候选字段，不能直接执行 SQL、激活记忆或替代旧事实。在模型不可用的受控运行模式下事件以空候选完成；模型调用或解析实际抛错时标为 failed 并保留错误。
 
 ### 7.3 两层幂等
 
@@ -670,8 +656,8 @@ UART clock = 100 MHz，后续设计按照这个约束执行。
 执行过程：
 
 1. 消息写入 `conversation_messages`；
-2. 触发高价值提取；
-3. 确定性规则生成 `uart.clock_frequency`；
+2. 在消息 ID 幂等检查通过后调用一次结构化提取模型；
+3. 模型判断当前消息已确认时钟约束并生成 `uart.clock_frequency` 候选；
 4. 写入 proposed Memory，来源是该消息；
 5. 同一消息重试通过 extraction event 返回原 Memory；
 6. 用户/工作流用 `user_confirmation` 来源调用 promote；
@@ -767,13 +753,18 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 
 ## 17. 测试如何证明这些行为
 
-[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖九个关键场景：
+[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖十四个关键场景：
 
 | 测试 | 验证内容 |
 |---|---|
 | `test_long_conversation_is_incremental_lossless_and_budgeted` | 140 条消息、增量游标、幂等、原文持久化和总预算 |
 | `test_role_summaries_are_isolated_but_shared_fact_is_visible` | Design/Verification 摘要隔离与共享 active 事实 |
-| `test_constraint_extraction_promotion_and_cross_session_retrieval` | 时钟提取、事件幂等、promote、跨会话检索 |
+| `test_constraint_extraction_promotion_and_cross_session_retrieval` | 模型候选入库、消息来源、调用幂等、promote 和跨会话检索 |
+| `test_message_model_handles_non_keyword_and_multiple_constraints` | 无关键词 FIFO 约束进入模型，以及单消息多候选 |
+| `test_question_reaches_model_but_empty_result_writes_no_memory` | 疑问消息经过判断但空结果不写 Memory |
+| `test_non_message_event_reuses_model_candidate_path` | 文档等非消息事件继续复用可选上下文的模型候选接口 |
+| `test_message_context_is_role_filtered_and_supports_reference_resolution` | 角色可见前文、当前消息排除、active Memory 和指代修订 |
+| `test_temporary_assumption_approval_cannot_become_fact` | 临时假设批准无法按 fact/decision 入库 |
 | `test_conflicting_confirmed_constraint_supersedes_old_fact` | needs_review、原子替代和默认只返回新事实 |
 | `test_document_upgrade_invalidates_only_affected_source_and_is_atomic` | 来源级失效、独立来源保活和事务回滚 |
 | `test_delegate_receives_shared_memory_but_not_private_history` | Delegate 无历史、只接收共享 Memory |

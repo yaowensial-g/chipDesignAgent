@@ -87,7 +87,7 @@ sequenceDiagram
 → 首次文档幂等入库、分块、索引
 → 读取当前角色的近期消息
 → ConversationSummaryService 按角色增量处理窗口前消息
-→ 高价值事件按需形成 proposed Memory（普通聊天不额外调用模型）
+→ 每条新消息由模型一次判断是否形成 proposed Memory（前文按角色过滤且有长度上限）
 → 过滤权限/状态/来源后，两阶段检索 active 长期记忆
 → 对 active 文档分块执行混合 RAG
 → 统一 Token 预算组装 effective_request，未选内容记录原因

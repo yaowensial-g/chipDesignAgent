@@ -119,7 +119,7 @@ async def attach_request_id(request, call_next):
 |---|---|---:|---|---|
 | 当前请求 | 本轮用户消息、项目、模块、工作角色 | 用户输入 | 单次调用 | `ChatRequest`，同时写入消息表 |
 | 短期记忆 | 近期对话原文、按角色增量摘要、Active Run | 系统维护 | 会话/角色级 | `conversation_messages`、`conversation_role_summaries`、`conversations.active_run_id` |
-| 长期记忆 | 已确认项目事实、架构决策、有效假设 | 高价值事件可形成 proposed；active 必须有权威来源 | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
+| 长期记忆 | 已确认项目事实、架构决策、有效假设 | 新消息经模型判断、正式事件可形成 proposed；active 必须有权威来源 | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
 | 原始证据 | FS、AS、ICD、问题单、工具日志、Artifact | 原件不可由 Agent 随意改写 | 长期、版本化 | `document_versions`、`document_chunks`、Artifact、Raw Logs |
 
 这里最重要的边界是：**聊天里出现过一句话，不等于它已经成为长期事实；Agent
@@ -251,9 +251,10 @@ stateDiagram-v2
     stale --> active: 重新评估并绑定有效来源
 ```
 
-`MemoryExtractorService` 只在明确约束/确认、正式文档、完成 Run、审批和 Delegate 等高价值事件触发。
-复杂提取在真实模型可用时使用结构化输出；明确时钟约束可以确定性识别。所有自动结果只能进入
-`proposed`，与现有事实冲突时进入 `needs_review`。事件以真实来源 ID 幂等记录，失败不影响主请求并可重试。
+`MemoryExtractorService` 对每条新用户消息执行一次结构化判断，不再用关键词或时钟正则预筛选；
+少量角色可见前文和相关 active Memory 只用于消解指代、识别修订和复用稳定键。正式文档、完成 Run
+和 Delegate 等工程事件继续复用同一候选接口。所有自动结果只能进入 `proposed`，与现有事实冲突时
+进入 `needs_review`。事件以真实来源 ID 幂等记录，失败不影响主请求并可重试。
 `promote()` 校验用户确认、正式文档、完成 Run 或应用 Patch 等真实来源后才允许进入 `active`。
 
 检索分两阶段：先过滤项目、模块、角色可见性、active 状态和有效来源；再综合关键词、importance、

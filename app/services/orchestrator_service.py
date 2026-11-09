@@ -135,14 +135,15 @@ class OrchestratorService:
             request.message,
             agent_role=primary_agent.value,
         )
-        # 仅高价值约束/确认语句触发；普通聊天不会额外调用提取模型。失败被记录，
-        # 不会阻断主 Agent 当前请求。
+        # 每条新消息都由提取模型一次性判断是否值得长期保存。Service 只携带当前
+        # 角色可见的少量前文和相关 active Memory；失败会写审计但不阻断主请求。
         self.memory_extractor.extract_from_message(
             message_id=user_message.message_id,
             project_id=request.project_id,
             module_name=request.module_name,
             agent_role=primary_agent.value,
             content=request.message,
+            session_id=session_id,
         )
         context = self.contexts.build(
             session_id,

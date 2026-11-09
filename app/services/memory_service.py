@@ -31,6 +31,8 @@ class MemoryService:
         self.db = db
 
     def create(self, request: MemoryCreateRequest) -> MemoryView:
+        # 自动提取使用稳定 extraction_key；事件重试即使越过上层幂等检查，
+        # 也只会返回首次创建的候选，不会重复写入来源和冲突记录。
         if request.extraction_key:
             existing = self.db.fetch_one(
                 "SELECT memory_id FROM memories WHERE extraction_key = ?",
@@ -47,6 +49,8 @@ class MemoryService:
         conflicts = self._active_conflicts(
             request.project_id, request.module_name, request.memory_key, request.content
         )
+        # 模型只能提交候选。相同语义键已有不同 active 结论时必须进入复核，
+        # 不能用“最新生成”作为覆盖正式工程事实的依据。
         if conflicts and status != "active":
             status = "needs_review"
             review_reason = review_reason or "与同一 memory_key 的 active 记忆内容冲突"
@@ -126,6 +130,7 @@ class MemoryService:
         shared_only: bool = False,
     ) -> list[MemoryView]:
         """先做权限/生命周期/来源过滤，再按相关性和重要性排序。"""
+        # 第一阶段完全由 SQL 和后端角色规则过滤，模型无法请求越权或失效记忆。
         conditions = [
             "m.project_id = ?", "(m.module_name IS NULL OR m.module_name = ?)",
             "m.status = 'active'",
@@ -149,6 +154,8 @@ class MemoryService:
         )
         query_terms = _terms(query)
         ranked: list[MemoryView] = []
+        # 第二阶段只负责相关性排序；importance>=9 的事实/决策作为关键约束，
+        # 即使用户当前措辞没有复述完整术语，也可以保留为少量强制候选。
         for row in rows:
             item = self._view(row)
             item_terms = _terms(item.content + " " + (item.memory_key or ""))

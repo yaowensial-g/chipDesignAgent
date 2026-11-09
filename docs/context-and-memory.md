@@ -20,10 +20,10 @@ LLM 生成的摘要、推断和专家建议不是正式事实。原始消息和�
 ```mermaid
 flowchart TD
     U[用户消息 / 工程事件] --> P[保存真实消息或事件]
-    P --> X{高价值触发?}
+    P --> E[MemoryExtractorService 一次结构化判断]
+    E --> X{产生候选?}
     X -- 否 --> C[ContextBuilder]
-    X -- 是 --> E[MemoryExtractorService]
-    E --> V[结构校验 + 真实来源校验]
+    X -- 是 --> V[结构校验 + 真实来源校验]
     V --> M[proposed / needs_review Memory]
     M --> C
     P --> S[ConversationSummaryService]
@@ -59,15 +59,11 @@ flowchart TD
 
 ## 4. 自动长期记忆提取
 
-`MemoryExtractorService` 不是每轮聊天都运行。只有以下事件进入提取流程：
+`MemoryExtractorService` 对每条新用户消息执行一次结构化模型判断，不再用关键词或时钟正则预筛选。模型判断当前消息是否明确新增、确认或修订了对后续工作有价值的事实、约束、决策、偏好或经验；纯提问、闲聊和未确认设想返回空候选。一条消息可以生成多个独立候选，因此自然语言描述的时钟、复位、接口、位宽、FIFO 深度和验证结论都走同一条路径。
 
-- 命中“确定、确认、必须、约束、后续按照”等高价值表达的用户消息；
-- 明确的时钟频率等可确定性识别的工程约束；
-- 正式文档版本入库；
-- Run 完成或审批恢复完成；
-- Delegate 完成并返回专家结论。
+消息提取会携带最多 6 条当前角色可见的近期消息以及最多 6 条相关 active Memory，并设置独立 Token 上限。前文和旧记忆只能用于消解“第二种”“改成 32”等指代、识别修订和复用已有 `memory_key`，候选必须在当前消息中有依据。Run 的“按临时假设继续”会由后端强制降级为 `assumption`，不能形成 fact/decision。
 
-明确的时钟约束可由确定性规则形成候选；其他复杂事件仅在真实模型可用时调用结构化提取。无模型时记录事件已检查或失败，不伪造候选。每个事件写入 `memory_extraction_events`，以 `source_type:source_id` 幂等；失败保存原因和尝试次数，可安全重试。
+正式文档版本、完成 Run 和 Delegate 结论继续复用同一个 `_model_candidates()`，但不携带会话前文。每个事件写入 `memory_extraction_events`，以 `source_type:source_id` 幂等；完成消息在准备上下文和调用模型之前直接复用已有结果，失败保存原因和尝试次数，可安全重试。
 
 模型只返回候选字段，不能直接更新数据库。Service 会检查：
 

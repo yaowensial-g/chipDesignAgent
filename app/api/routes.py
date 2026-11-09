@@ -319,14 +319,18 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             run_id=run_id,
             metadata={"action": request.action, "evidence_reference": request.evidence_reference},
         )
-        if request.action in {"approve", "accept_assumption", "provide_resolution"}:
-            memory_extractor_service.extract_from_message(
-                message_id=decision_message.message_id,
-                project_id=existing.project_id,
-                module_name=existing.module_name,
-                agent_role=agent_role or "design",
-                content=user_text,
-            )
+        # Run 决策和普通聊天走同一条消息提取链。拒绝、取消、纯提问等内容由模型
+        # 返回空候选；accept_assumption 只授权暂时继续，后端会强制按 assumption 保存，
+        # 即使模型误报也不能把临时假设写成 fact/decision。
+        memory_extractor_service.extract_from_message(
+            message_id=decision_message.message_id,
+            project_id=existing.project_id,
+            module_name=existing.module_name,
+            agent_role=agent_role or "design",
+            content=user_text,
+            session_id=existing.session_id,
+            temporary_assumption=request.action == "accept_assumption",
+        )
         if updated.status.value == "completed":
             memory_extractor_service.extract_from_event(
                 source_type="run",
