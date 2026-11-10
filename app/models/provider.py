@@ -114,6 +114,7 @@ class OpenAIModelProvider:
         *,
         operation: str = "结构化 Agent",
         expected_shape: str = "JSON 对象或数组",
+        repair_json: bool = True,
     ) -> dict[str, Any] | list[Any]:
         """请求结构化 JSON，并在首次解析失败后只做一次格式修复。
 
@@ -130,7 +131,7 @@ class OpenAIModelProvider:
         parsed = _parse_json_output(text)
         if parsed is not None and not isinstance(parsed, expected_type):
             parsed = None
-        if parsed is None:
+        if parsed is None and repair_json:
             # 第二次调用只负责修复括号、引号等格式，不允许补充或重写结论。
             repair_text = self.generate_text(
                 "你是 JSON 格式修复器。只修复格式，不新增、删除或改变原始结论。只返回合法 JSON，不要 Markdown 代码块或解释。",
@@ -140,6 +141,8 @@ class OpenAIModelProvider:
             if parsed is not None and not isinstance(parsed, expected_type):
                 parsed = None
         if parsed is None:
+            if not repair_json:
+                raise ModelInvocationError(f"{operation}没有返回有效 JSON")
             raise ModelInvocationError(
                 f"{operation}没有返回有效 JSON；自动提取和一次格式修复后仍无法解析"
             )

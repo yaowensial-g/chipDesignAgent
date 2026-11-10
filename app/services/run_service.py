@@ -532,6 +532,7 @@ class RunService:
             user_instruction=row["user_instruction"],
             route_reason=row["route_reason"],
             primary_agent=row.get("primary_agent"),
+            engine_version=row["engine_version"],
             legacy_task_id=row["legacy_task_id"],
             tool_run_id=row["tool_run_id"],
             patch_id=row["patch_id"],
@@ -556,7 +557,8 @@ class RunService:
         )
         sequence = int(row["sequence"] or 0) + 1
         self.db.execute(
-            "INSERT INTO run_events VALUES (?, ?, ?, ?, ?, ?, ?)",
+            """INSERT INTO run_events(event_id, run_id, sequence, event_type, message, agent_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (str(uuid4()), run_id, sequence, event_type, message, agent_id, utc_now()),
         )
 

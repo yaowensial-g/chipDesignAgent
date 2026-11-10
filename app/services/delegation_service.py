@@ -65,6 +65,9 @@ class DelegationService:
         instruction: str,
         request_payload: dict[str, Any],
         expected_output: str = "结构化专业分析与建议",
+        analyze: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        artifact_refs: tuple[DelegationArtifactRef, ...] = (),
+        orchestration_action_id: str | None = None,
     ) -> DelegationResult:
         """创建、执行并持久化一次专家委派。
 
@@ -76,19 +79,12 @@ class DelegationService:
             raise PermissionError(
                 f"{from_agent.value} cannot delegate to {to_agent.value}"
             )
-        # 次数统计读取持久化记录，而不是进程内计数；服务重启后限制仍然有效。
-        count = self.db.fetch_one(
-            "SELECT COUNT(*) AS count FROM delegation_tasks WHERE parent_run_id = ?",
-            (parent_run_id,),
-        )
-        if int(count["count"] or 0) >= MAX_DELEGATIONS_PER_RUN:
-            raise ValueError("Delegation limit reached for this Run")
-
         # 只保存文档名称和版本作为来源引用，不在 delegation_tasks 表中复制整篇文档。
-        artifacts = [
+        artifacts = list(artifact_refs)
+        artifacts.extend(
             DelegationArtifactRef(path=str(item.get("name", "document")), version=str(item.get("version", "")))
             for item in request_payload.get("documents", [])
-        ]
+        )
         delegation = DelegationRequest(
             parent_run_id=parent_run_id,
             from_agent=from_agent,
@@ -102,37 +98,36 @@ class DelegationService:
         )
         task_id = str(uuid4())
         now = utc_now()
-        self.db.execute(
-            """INSERT INTO delegation_tasks (
-            task_id, parent_run_id, from_agent, to_agent, task_type, instruction,
-            artifacts_json, constraints_json, expected_output, status, result_json,
-            error, requires_human_intervention, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, 0, ?, ?)""",
-            (
-                task_id,
-                parent_run_id,
-                from_agent.value,
-                to_agent.value,
-                delegation.task_type,
-                delegation.instruction,
-                self.db.dumps([item.model_dump(mode="json") for item in artifacts]),
-                self.db.dumps(delegation.constraints),
-                delegation.expected_output,
-                DelegationStatus.QUEUED.value,
-                now,
-                now,
-            ),
-        )
+        with self.db.transaction() as connection:
+            count = connection.execute(
+                "SELECT COUNT(*) FROM delegation_tasks WHERE parent_run_id = ?", (parent_run_id,),
+            ).fetchone()[0]
+            if count >= MAX_DELEGATIONS_PER_RUN:
+                raise ValueError("Delegation limit reached for this Run")
+            connection.execute(
+                """INSERT INTO delegation_tasks (
+                task_id, parent_run_id, from_agent, to_agent, task_type, instruction,
+                artifacts_json, constraints_json, expected_output, status, result_json,
+                error, requires_human_intervention, created_at, updated_at, orchestration_action_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', NULL, 0, ?, ?, ?)""",
+                (
+                    task_id, parent_run_id, from_agent.value, to_agent.value,
+                    delegation.task_type, delegation.instruction,
+                    self.db.dumps([item.model_dump(mode="json") for item in artifacts]),
+                    self.db.dumps(delegation.constraints), delegation.expected_output,
+                    DelegationStatus.QUEUED.value, now, now, orchestration_action_id,
+                ),
+            )
         self._set_status(task_id, DelegationStatus.RUNNING)
 
         # 专家只得到完成任务所需的最小上下文。完整聊天历史可能含有主 Agent
         # 的私有推理或无关信息，因此在 _scoped_context 中明确置空。
-        scoped = self._scoped_context(request_payload, delegation)
         try:
+            scoped = self._scoped_context(request_payload, delegation)
             # Runtime 当前是同步调用；to_thread 避免它阻塞 FastAPI 事件循环，
             # wait_for 则给这次委派增加明确的时间边界。
             analysis = await asyncio.wait_for(
-                asyncio.to_thread(self._expert_callable(to_agent), scoped),
+                asyncio.to_thread(analyze or self._expert_callable(to_agent), scoped),
                 timeout=DELEGATION_TIMEOUT_SECONDS,
             )
             conclusion = str(analysis.get("summary", "专家分析已完成。"))
@@ -168,6 +163,22 @@ class DelegationService:
         except Exception as exc:
             self._fail(task_id, DelegationStatus.FAILED, str(exc)[:1000])
         return self.get(task_id)
+
+    def reconcile_interrupted(self, run_id: str, action_id: str) -> str | None:
+        """Keep the recorded expert attempt and close a stranded in-flight delegation."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT task_id FROM delegation_tasks WHERE parent_run_id=? AND orchestration_action_id=?",
+                (run_id, action_id),
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                """UPDATE delegation_tasks SET status='failed', error=?, requires_human_intervention=1, updated_at=?
+                   WHERE task_id=? AND status IN ('queued', 'running')""",
+                ("Interrupted before a durable expert result was committed", utc_now(), row["task_id"]),
+            )
+            return row["task_id"]
 
     def get(self, task_id: str) -> DelegationResult:
         """把数据库行和 JSON 字段还原为强类型 ``DelegationResult``。"""

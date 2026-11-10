@@ -215,7 +215,7 @@ class DocumentService:
         )
         return [StoredDocumentView(**row) for row in rows]
 
-    def retrieve(self, request: RetrievalRequest) -> RetrievalResult:
+    def retrieve(self, request: RetrievalRequest, *, pinned_version_ids: tuple[str, ...] = ()) -> RetrievalResult:
         conditions = ["d.project_id = ?"]
         parameters: list[object] = [request.project_id]
         if request.module_name:
@@ -225,7 +225,16 @@ class DocumentService:
             placeholders = ",".join("?" for _ in request.document_kinds)
             conditions.append(f"d.kind IN ({placeholders})")
             parameters.extend(kind.value for kind in request.document_kinds)
-        if not request.include_superseded:
+        if pinned_version_ids:
+            placeholders = ",".join("?" for _ in pinned_version_ids)
+            conditions.append(
+                f"""(c.version_id IN ({placeholders}) OR (
+                    c.status = 'active' AND d.document_id NOT IN (
+                        SELECT document_id FROM document_versions WHERE version_id IN ({placeholders})
+                    )))"""
+            )
+            parameters.extend((*pinned_version_ids, *pinned_version_ids))
+        elif not request.include_superseded:
             conditions.append("c.status = 'active'")
         rows = self.db.fetch_all(
             f"""SELECT c.*, d.name AS document_name, d.kind AS document_kind,
@@ -269,7 +278,7 @@ class DocumentService:
                     semantic_score=round(semantic, 6),
                 )
             )
-        ranked.sort(key=lambda item: (item.score, -item.ordinal), reverse=True)
+        ranked.sort(key=lambda item: (item.version_id in pinned_version_ids, item.score, -item.ordinal), reverse=True)
         return RetrievalResult(query=request.query, chunks=ranked[: request.top_k])
 
     def _chunk(self, content: str, target_tokens: int = 700) -> list[tuple[str, str]]:

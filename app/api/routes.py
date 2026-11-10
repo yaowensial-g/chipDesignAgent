@@ -55,6 +55,8 @@ from app.domain.models import (
 from app.domain.enums import AgentRole
 from app.models.factory import provider_factory
 from app.services.conversation_service import conversation_service
+from app.services.orchestrator_service import orchestrator_service
+from app.domain.orchestration import TaskPlan
 from app.services.diagnostics_service import diagnostics_service
 from app.services.task_service import task_service
 from app.services.patch_service import patch_service
@@ -163,7 +165,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     try:
         return await conversation_service.handle(request)
     except ValueError as exc:
-        if str(exc) == "Conversation belongs to a different project":
+        if request.orchestration_mode or str(exc) == "Conversation belongs to a different project":
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
@@ -176,7 +178,7 @@ async def send_conversation_message(session_id: str, request: ChatRequest) -> Ch
             request.model_copy(update={"session_id": session_id})
         )
     except ValueError as exc:
-        if str(exc) == "Conversation belongs to a different project":
+        if request.orchestration_mode or str(exc) == "Conversation belongs to a different project":
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
@@ -257,6 +259,46 @@ async def get_context_manifest(context_id: str) -> ContextManifestView:
     return manifest
 
 
+@router.get("/runs/{run_id}/plans")
+async def get_run_plans(run_id: str) -> list[TaskPlan]:
+    run = run_service.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.engine_version == "legacy":
+        return []
+    checkpoint = orchestrator_service.hierarchical.repo.checkpoint(run_id)
+    return [TaskPlan.model_validate_json(checkpoint["plan_json"])] if checkpoint["plan_json"] else []
+
+
+@router.get("/runs/{run_id}/tasks")
+async def get_run_tasks(run_id: str) -> list[dict]:
+    run = run_service.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.engine_version == "legacy":
+        return []
+    repo = orchestrator_service.hierarchical.repo
+    return [
+        {
+            **state.model_dump(mode="json"),
+            "observations": repo.observations(state.task_id),
+            "reflections": repo.reflections(state.task_id),
+            "verifications": repo.verifications(state.task_id),
+            "artifacts": [item.artifact for item in repo.local_outputs(state.task_id, "verified")],
+        }
+        for state in repo.states(run_id).values()
+    ]
+
+
+@router.get("/runs/{run_id}/artifacts/{artifact_id}")
+async def get_run_artifact(run_id: str, artifact_id: str) -> dict:
+    try:
+        item = orchestrator_service.hierarchical.artifact(run_id, artifact_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Verified artifact not found") from exc
+    return {"artifact": item.artifact, "content": item.content.decode("utf-8")}
+
+
 @router.post("/memories", response_model=MemoryView, status_code=status.HTTP_201_CREATED)
 async def create_memory(request: MemoryCreateRequest) -> MemoryView:
     """显式形成候选/正式记忆；普通 Agent 回复不会自动成为长期事实。"""
@@ -299,6 +341,8 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
         existing = run_service.get(run_id)
         if existing is None:
             raise KeyError(run_id)
+        if existing.engine_version == "hierarchical":
+            return await orchestrator_service.hierarchical.resume(run_id, request)
         updated = await run_service.resume(run_id, request)
         # Run 决策也是对话的一部分。若只由前端临时追加，页面刷新后“真实架构结论”
         # 和审批动作会消失，导致审计历史不完整。
@@ -376,6 +420,9 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
 @router.post("/runs/{run_id}/cancel", response_model=RunView)
 async def cancel_run(run_id: str) -> RunView:
     try:
+        existing = run_service.get(run_id)
+        if existing and existing.engine_version == "hierarchical":
+            return orchestrator_service.hierarchical.cancel(run_id)
         return await run_service.cancel(run_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Run not found") from exc

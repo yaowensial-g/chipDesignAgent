@@ -6,7 +6,9 @@ Registry 是模型与真实执行能力之间的安全边界。模型看到的�
 """
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
+
+from jsonschema import Draft7Validator
 
 from app.domain.enums import AgentRole, Mutability
 from app.domain.models import ToolDefinitionView
@@ -20,6 +22,9 @@ class RegisteredTool:
     """将公开定义与后端执行器绑定；某些编排 Tool 的 executor 可以为空。"""
     definition: ToolDefinitionView
     executor: ToolExecutor | None
+    scope: Literal["legacy", "task", "shared"] = "legacy"
+    capability: str | None = None
+    task_enabled: Callable[[], bool] | None = None
 
 
 class ToolRegistry:
@@ -48,6 +53,9 @@ class ToolRegistry:
         category: str = "common",
         enabled: bool = True,
         always_available: bool = False,
+        scope: Literal["legacy", "task", "shared"] = "legacy",
+        capability: str | None = None,
+        task_enabled: Callable[[], bool] | None = None,
     ) -> None:
         """注册一个 Tool，并把零散配置组装成强类型定义。
 
@@ -59,6 +67,8 @@ class ToolRegistry:
         # 重名通常表示模块导入或初始化顺序错误。直接失败比静默覆盖执行器安全。
         if name in self._tools:
             raise ValueError(f"Tool already registered: {name}")
+        input_schema = input_schema if input_schema is not None else {"type": "object", "properties": {}}
+        Draft7Validator.check_schema(input_schema)
         self._tools[name] = RegisteredTool(
             definition=ToolDefinitionView(
                 name=name,
@@ -70,7 +80,7 @@ class ToolRegistry:
                 requires_user_approval=requires_user_approval,
                 idempotent=idempotent,
                 timeout_seconds=timeout_seconds,
-                input_schema=input_schema or {"type": "object", "properties": {}},
+                input_schema=input_schema,
                 output_schema=output_schema or {"type": "object"},
                 preconditions=preconditions or [],
                 side_effect=side_effect,
@@ -80,6 +90,9 @@ class ToolRegistry:
                 always_available=always_available,
             ),
             executor=executor,
+            scope=scope,
+            capability=capability,
+            task_enabled=task_enabled,
         )
 
     def get(self, name: str) -> RegisteredTool:
@@ -89,22 +102,51 @@ class ToolRegistry:
         except KeyError as exc:
             raise KeyError(f"Unknown tool: {name}") from exc
 
-    def list(self) -> list[ToolDefinitionView]:
+    def list(self, *, include_task_only: bool = False) -> list[ToolDefinitionView]:
         """返回完整目录，主要用于诊断页面、文档和管理接口。"""
-        return [tool.definition for tool in self._tools.values()]
+        return [
+            tool.definition for tool in self._tools.values()
+            if include_task_only or tool.scope != "task"
+        ]
 
-    def for_role(self, role: AgentRole) -> list[ToolDefinitionView]:
+    def for_role(self, role: AgentRole, *, task: bool = False) -> list[ToolDefinitionView]:
         """返回某角色已授权且当前启用的 Tool。
 
         这是模型调用之前的权限过滤入口。禁用或越权 Tool 不会进入 Selector。
         """
         return [
-            tool.definition
+            tool.definition if tool.definition.enabled else tool.definition.model_copy(update={"enabled": True})
             for tool in self._tools.values()
-            if tool.definition.enabled and role in tool.definition.allowed_roles
+            if self._visible(tool, task)
+            and self._enabled(tool, task) and role in tool.definition.allowed_roles
         ]
 
-    def metadata_for_role(self, role: AgentRole) -> list[dict]:
+    def authorize(self, name: str, role: AgentRole, *, task: bool = False) -> RegisteredTool:
+        tool = self.get(name)
+        if not self._visible(tool, task):
+            raise PermissionError("Tool is unavailable at this entry point")
+        if not self._enabled(tool, task):
+            raise ValueError(f"Tool {name} is disabled")
+        if role not in tool.definition.allowed_roles:
+            raise PermissionError(f"Role {role.value} cannot call {name}")
+        return tool
+
+    @staticmethod
+    def _enabled(tool: RegisteredTool, task: bool) -> bool:
+        if task and tool.task_enabled is not None:
+            return tool.task_enabled()
+        return tool.definition.enabled
+
+    def validate_arguments(self, name: str, arguments: dict) -> None:
+        schema = self.get(name).definition.input_schema
+        if not Draft7Validator(schema).is_valid(arguments):
+            raise ValueError(f"Invalid arguments for tool {name}")
+
+    @staticmethod
+    def _visible(tool: RegisteredTool, task: bool) -> bool:
+        return tool.scope in {"shared", "task" if task else "legacy"}
+
+    def metadata_for_role(self, role: AgentRole, *, task: bool = False) -> list[dict]:
         """生成轻量 Selector 使用的 Metadata，不包含完整参数 Schema。
 
         Selector 只需要判断“任务是否相关”，不负责填写参数。将完整 Schema 留给
@@ -119,7 +161,7 @@ class ToolRegistry:
                 "category": tool.category,
                 "always_available": tool.always_available,
             }
-            for tool in self.for_role(role)
+            for tool in self.for_role(role, task=task)
         ]
 
     def set_enabled(self, name: str, enabled: bool) -> None:
@@ -128,6 +170,9 @@ class ToolRegistry:
         self._tools[name] = RegisteredTool(
             definition=registered.definition.model_copy(update={"enabled": enabled}),
             executor=registered.executor,
+            scope=registered.scope,
+            capability=registered.capability,
+            task_enabled=registered.task_enabled,
         )
 
 

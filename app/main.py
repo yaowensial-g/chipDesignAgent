@@ -4,7 +4,9 @@
 变得很长，应优先把状态转换拆到 Service，而不是继续扩展 main.py。
 """
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager, suppress
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -14,12 +16,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
 from app.config.secret_protection import SecretProtectionError
 from app.models.provider import ModelInvocationError
+from app.services.orchestrator_service import orchestrator_service
 
 
 logger = logging.getLogger("chipflow.errors")
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    recovery = asyncio.create_task(orchestrator_service.hierarchical.run_background())
+    try:
+        yield
+    finally:
+        recovery.cancel()
+        with suppress(asyncio.CancelledError):
+            await recovery
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Chip Design Multi-Agent API",
     version="0.6.0",
     description="Windows-first role-based chip design multi-agent workbench.",

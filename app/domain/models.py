@@ -151,6 +151,10 @@ class ChatRequest(BaseModel):
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     user_approved: bool = False
     user_role: UserRole | None = None
+    orchestration_mode: Literal["chat", "rtl_analysis"] | None = None
+    rtl_path: str | None = Field(default=None, min_length=1, max_length=500)
+    run_lint: bool = False
+    lint_top_module: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_$]*$", max_length=120)
 
 
 class TaskIntent(BaseModel):
@@ -409,6 +413,8 @@ class ContextManifestView(BaseModel):
     memory_ids: list[str] = Field(default_factory=list)
     chunk_ids: list[str] = Field(default_factory=list)
     observation_ids: list[str] = Field(default_factory=list)
+    orchestration_task_id: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
     turn_summary_ids: list[str] = Field(default_factory=list)
     raw_turn_ids: list[str] = Field(default_factory=list)
     sections: dict[str, Any] = Field(default_factory=dict)
@@ -461,6 +467,7 @@ class RunEventView(BaseModel):
     event_type: str
     message: str
     agent_id: str | None = None
+    orchestration_task_id: str | None = None
     created_at: str
 
 
@@ -476,6 +483,7 @@ class RunView(BaseModel):
     user_instruction: str
     route_reason: str = ""
     primary_agent: AgentRole | None = None
+    engine_version: Literal["legacy", "hierarchical"] = "legacy"
     legacy_task_id: str | None = None
     tool_run_id: str | None = None
     patch_id: str | None = None
@@ -500,6 +508,9 @@ class RunResumeRequest(BaseModel):
     evidence_reference: str | None = None
     workspace_id: str | None = None
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
+    wait_id: str | None = Field(default=None, max_length=120)
+    client_request_id: str | None = Field(default=None, min_length=1, max_length=120)
+    rtl_path: str | None = Field(default=None, min_length=1, max_length=500)
 
 
 class ChatResponse(BaseModel):

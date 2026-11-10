@@ -9,6 +9,7 @@ from app.config.model_settings import (
 from app.domain.models import DiagnosticCheck, DiagnosticReport
 from app.storage.database import database
 from app.tools.registry import tool_registry
+from app.tools.builtin import verilator_enabled, verilator_identity
 
 
 class DiagnosticsService:
@@ -155,18 +156,18 @@ class DiagnosticsService:
                 action=None if tool_names else "检查 app/tools/builtin.py 的注册过程。",
             )
         )
-        checks.append(
-            DiagnosticCheck(
-                check_id="verilator",
-                label="EDA 占位执行环境",
-                status="pass",
-                detail=(
-                    "当前编译、仿真、Lint、CDC、综合和 STA 使用 run_mock_eda；"
-                    "不要求安装 Verilator 或商业 EDA 工具。"
-                ),
-                action=None,
-            )
-        )
+        enabled = verilator_enabled()
+        identity = verilator_identity() if enabled else None
+        checks.append(DiagnosticCheck(
+            check_id="verilator", label="分层真实 Verilator Lint",
+            status="warning" if enabled and not identity else "pass",
+            detail=(
+                f"{identity['version']} 已启用，执行前需要批准绑定的 RTL 快照。" if identity else
+                "已启用，但 Verilator 版本检查未通过。" if enabled else
+                "真实 Lint 未启用。旧聊天入口的 EDA 占位模式可用。"
+            ),
+            action="检查 PATH、CHIP_AGENT_VERILATOR_PATH 和运行依赖。" if enabled and not identity else None,
+        ))
 
         statuses = {check.status for check in checks}
         overall = "error" if "error" in statuses else ("warning" if "warning" in statuses else "ok")

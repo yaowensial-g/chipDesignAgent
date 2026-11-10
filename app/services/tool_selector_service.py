@@ -18,6 +18,7 @@ from app.agents.runtime import runtime
 from app.config.model_settings import model_settings_service
 from app.domain.enums import AgentRole
 from app.domain.models import ToolDefinitionView, ToolShortlist
+from app.domain.orchestration import TASK_CONTROLS, TaskContract
 from app.tools.registry import ToolRegistry, tool_registry
 
 
@@ -47,11 +48,51 @@ class ToolSelectorService:
         # 第一道安全边界：先按主 Agent 的角色和 Tool enabled 状态硬过滤。
         # 这一步发生在任何模型调用之前。
         authorized = self.registry.for_role(primary_agent)
+        return self._select(primary_agent, request, intent, observations, authorized)
+
+    def select_for_task(
+        self,
+        contract: TaskContract,
+        context: dict[str, Any],
+        *,
+        permitted_tools: tuple[str, ...],
+        controls_only: bool = False,
+    ) -> tuple[list[ToolDefinitionView], dict[str, Any]]:
+        authorized = [
+            tool for tool in self.registry.for_role(contract.assigned_agent, task=True)
+            if tool.mutability in contract.constraints.allowed_mutability
+            and (
+                tool.name in TASK_CONTROLS
+                or (
+                    not controls_only and tool.name in permitted_tools
+                    and self.registry.get(tool.name).capability in contract.capability_requirements
+                )
+            )
+        ]
+        return self._select(
+            contract.assigned_agent, {"message": contract.goal}, {
+                "goal": contract.goal,
+                "candidate_tools": [tool.name for tool in authorized if tool.name not in TASK_CONTROLS],
+            },
+            context.get("observations", []), authorized, task=True,
+        )
+
+    def _select(
+        self,
+        primary_agent: AgentRole,
+        request: dict[str, Any],
+        intent: dict[str, Any],
+        observations: list[dict[str, Any]],
+        authorized: list[ToolDefinitionView],
+        *,
+        task: bool = False,
+    ) -> tuple[list[ToolDefinitionView], dict[str, Any]]:
         authorized_by_name = {tool.name: tool for tool in authorized}
 
         # Selector 只读取简短 Metadata，不读取完整参数 Schema，从而减少 Token，
         # 也避免大量相似参数干扰“这个任务需要哪类工具”的第一阶段判断。
-        metadata = self.registry.metadata_for_role(primary_agent)
+        metadata = self.registry.metadata_for_role(primary_agent, task=task)
+        metadata = [item for item in metadata if item["name"] in authorized_by_name]
         settings = model_settings_service.effective()
         started = perf_counter()
         fallback = False
@@ -84,6 +125,8 @@ class ToolSelectorService:
         # reply_to_user / ask_user 是结束或暂停 Run 所必需的“逃生 Tool”。
         # 即使 Selector 忘记返回，也要由后端加入候选集合。
         always = [tool.name for tool in authorized if tool.always_available]
+        if task and not any(name not in always for name in selected_names):
+            selected_names.extend(intent["candidate_tools"])
         selected_names = always + [name for name in selected_names if name not in always]
 
         if not selected_names:
@@ -101,7 +144,7 @@ class ToolSelectorService:
 
         # 至少保留两个位置给 reply_to_user 和 ask_user。上限同时控制主 Agent
         # 接收的 Schema 数量，防止工具规模增长后上下文无限膨胀。
-        limit = max(2, settings.selector_max_tools)
+        limit = max(2, settings.selector_max_tools, len(always) + int(task))
         selected_names = selected_names[:limit]
         shortlist = ToolShortlist(
             selected_tools=selected_names,

@@ -88,6 +88,9 @@ class ContextBuilderService:
         request: ChatRequest,
         agent_role: str,
         current_message_id: str,
+        *,
+        before_sequence: int | None = None,
+        pinned_version_ids: tuple[str, ...] = (),
     ) -> ContextBuildResult:
         # 首次上传仍兼容旧前端：入库后下轮只需项目/模块和查询，不必再次传整篇正文。
         for document in request.documents:
@@ -108,6 +111,7 @@ class ContextBuilderService:
             session_id,
             agent_role=agent_role,
             exclude_message_id=current_message_id,
+            before_sequence=before_sequence,
         )
         recent_turns = completed_turns[-self.summaries.policy.recent_turns:]
         older_turns = completed_turns[:-self.summaries.policy.recent_turns][
@@ -276,7 +280,8 @@ class ContextBuilderService:
                 module_name=request.module_name,
                 query=request.message,
                 top_k=50,
-            )
+            ),
+            pinned_version_ids=pinned_version_ids,
         )
         selected_chunks = []
         document_tokens = 0
@@ -284,7 +289,7 @@ class ContextBuilderService:
         document_cap = remaining
         current_document_refs = {(item.name, item.version) for item in request.documents}
         for chunk in retrieval.chunks:
-            current_request_evidence = (
+            current_request_evidence = chunk.version_id in pinned_version_ids or (
                 chunk.document_name, chunk.document_version
             ) in current_document_refs
             if chunk.score <= 0 and not current_request_evidence:
@@ -457,7 +462,7 @@ class ContextBuilderService:
     def _manifest(self, row: dict) -> ContextManifestView:
         payload = dict(row)
         for field in (
-            "message_ids", "memory_ids", "chunk_ids", "observation_ids",
+            "message_ids", "memory_ids", "chunk_ids", "observation_ids", "artifact_ids",
             "turn_summary_ids", "raw_turn_ids", "sections", "summary", "excluded",
         ):
             default = {} if field in {"sections", "summary"} else []

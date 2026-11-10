@@ -32,6 +32,7 @@ def register_orchestration_tools() -> None:
         ),
         dict(
             name="ask_user",
+            scope="shared",
             allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
             category="common",
             # 缺少权威信息时应暂停询问，而不是为了完成任务编造事实。
@@ -91,6 +92,8 @@ def register_orchestration_tools() -> None:
         ),
         dict(
             name="create_ds_candidate",
+            scope="shared",
+            capability="produce_ds_candidate",
             allowed_roles=[AgentRole.DESIGN],
             category="design",
             description="依据受控规格创建 DS Markdown 候选，并组织架构、设计、验证及多视角评审。",
@@ -104,6 +107,8 @@ def register_orchestration_tools() -> None:
         ),
         dict(
             name="create_rtl_candidate",
+            scope="shared",
+            capability="produce_rtl_candidate",
             allowed_roles=[AgentRole.DESIGN],
             category="design",
             description="根据用户已确认的 DS 生成 RTL 候选和 Diff；不会直接覆盖正式文件。",
@@ -170,7 +175,33 @@ def register_orchestration_tools() -> None:
     ]
 
     # Python 模块可能在测试或热加载场景被重复导入，因此按名称跳过已注册项。
-    existing = {tool.name for tool in tool_registry.list()}
+    roles = [AgentRole.DESIGN, AgentRole.VERIFICATION]
+    for name, description, properties, required, capability, allowed_roles in (
+        ("submit_task_output", "提交本任务的候选交付件供验收",
+         {
+             "output_keys": {"type": "array", "items": {"type": "string"}, "minItems": 1, "uniqueItems": True},
+             "text_outputs": {
+                 "type": "object",
+                 "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 16000},
+             },
+         },
+         ["output_keys"], "compose_report", roles),
+        ("report_task_failure", "报告无法继续执行的原因",
+         {"reason": {"type": "string", "minLength": 1, "maxLength": 4000}}, ["reason"], None, roles),
+        ("analyze_rtl_design", "依据绑定的 RTL 快照分析设计并引用源码行",
+         {"snapshot_ref": {"type": "string", "minLength": 1}}, ["snapshot_ref"], "rtl_design_analysis", [AgentRole.DESIGN]),
+        ("assess_rtl_verification", "依据已验收的源码快照和设计分析评估验证影响",
+         {"snapshot_ref": {"type": "string", "minLength": 1}, "design_ref": {"type": "string", "minLength": 1}},
+         ["snapshot_ref", "design_ref"], "rtl_verification_assessment", [AgentRole.VERIFICATION]),
+    ):
+        definitions.append(dict(
+            name=name, description=description, allowed_roles=allowed_roles,
+            mutability=Mutability.ANALYSIS, scope="task", capability=capability,
+            always_available=name in {"submit_task_output", "report_task_failure"},
+            input_schema={"type": "object", "properties": properties, "required": required, "additionalProperties": False},
+        ))
+
+    existing = {tool.name for tool in tool_registry.list(include_task_only=True)}
     for definition in definitions:
         if definition["name"] in existing:
             continue

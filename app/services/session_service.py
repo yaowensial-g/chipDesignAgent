@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
+from sqlite3 import Connection
 
 from app.domain.enums import AgentRole, UserRole
 from uuid import uuid4
@@ -152,10 +154,9 @@ class SessionService:
         delegation_task_id: str | None = None,
         metadata: dict | None = None,
         turn_id: str | None = None,
+        transaction: Connection | None = None,
     ) -> ConversationMessageView:
         """追加完整消息，并同步会话列表所需的标题、预览和计数。"""
-        if self.get(session_id) is None:
-            raise KeyError(session_id)
         message_id = str(uuid4())
         if role == "user":
             turn_id = turn_id or str(uuid4())
@@ -177,7 +178,7 @@ class SessionService:
             turn_id = pending["turn_id"] if pending else str(uuid4())
         now = utc_now()
         preview = " ".join(content.strip().split())[:120]
-        with self.db.transaction() as connection:
+        with (self.db.transaction() if transaction is None else nullcontext(transaction)) as connection:
             conversation = connection.execute(
                 "SELECT title FROM conversations WHERE session_id = ?", (session_id,)
             ).fetchone()
@@ -206,7 +207,10 @@ class SessionService:
                     updated_at = ? WHERE session_id = ?""",
                 (title, preview, now, session_id),
             )
-        return self.get_message(message_id)  # type: ignore[return-value]
+            row = connection.execute(
+                "SELECT * FROM conversation_messages WHERE message_id = ?", (message_id,),
+            ).fetchone()
+            return self._message_from_row(dict(row))
 
     def completed_turns(
         self,
@@ -215,6 +219,7 @@ class SessionService:
         agent_role: str,
         exclude_message_id: str | None = None,
         limit: int | None = None,
+        before_sequence: int | None = None,
     ) -> list[ConversationTurn]:
         """按时间正序返回完整问答；新 turn_id 与旧消息顺序配对同时兼容。"""
         parameters: list[object] = [session_id, agent_role]
@@ -222,6 +227,9 @@ class SessionService:
         if exclude_message_id:
             exclude = " AND message_id <> ?"
             parameters.append(exclude_message_id)
+        if before_sequence is not None:
+            exclude += " AND sequence < ?"
+            parameters.append(before_sequence)
         rows = self.db.fetch_all(
             f"""SELECT * FROM conversation_messages
             WHERE session_id = ? AND (agent_role IS NULL OR agent_role = ?){exclude}

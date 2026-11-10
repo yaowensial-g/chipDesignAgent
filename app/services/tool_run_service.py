@@ -7,6 +7,8 @@
 import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path, PurePosixPath
+from threading import RLock
 from uuid import uuid4
 
 from app.domain.enums import EngineeringIssueStatus, ToolRunStatus
@@ -16,9 +18,9 @@ from app.domain.models import (
     ToolRunRequest,
     ToolRunView,
 )
-from app.services.workspace_service import utc_now, workspace_service
+from app.services.workspace_service import WorkspaceService, utc_now, workspace_service
 from app.storage.database import Database, database
-from app.tools.builtin import register_builtin_tools
+from app.tools.builtin import check_lint_source, register_builtin_tools, run_verilator_lint, verilator_identity
 from app.tools.registry import ToolRegistry, tool_registry
 
 
@@ -28,9 +30,13 @@ class ToolRunService:
         self,
         db: Database = database,
         registry: ToolRegistry = tool_registry,
+        workspaces: WorkspaceService = workspace_service,
     ) -> None:
         self.db = db
         self.registry = registry
+        self.workspaces = workspaces
+        self._frozen_lock = RLock()
+        self._frozen_workers: set[str] = set()
         self.executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chipflow-tool")
         if registry is tool_registry:
             register_builtin_tools()
@@ -38,18 +44,13 @@ class ToolRunService:
     def start(self, request: ToolRunRequest) -> ToolRunView:
         """校验 Workspace、角色、审批和 executor，然后创建 queued ToolRun。"""
         # resolve_path(".") 同时验证 Workspace 存在且根路径仍在受控目录中。
-        workspace_service.resolve_path(request.workspace_id, ".")
-        registered = self.registry.get(request.tool_name)
-        if not registered.definition.enabled:
-            raise ValueError(
-                f"Tool {request.tool_name} is disabled; use run_mock_eda through the chat orchestrator"
-            )
-        if request.role not in registered.definition.allowed_roles:
-            raise PermissionError(f"Role {request.role.value} cannot call {request.tool_name}")
+        self.workspaces.resolve_path(request.workspace_id, ".")
+        registered = self.registry.authorize(request.tool_name, request.role)
         if registered.definition.requires_user_approval and not request.user_approved:
             raise PermissionError("Tool requires explicit user approval")
         if registered.executor is None:
             raise ValueError(f"Tool {request.tool_name} is orchestrator-managed and cannot run as a local process")
+        self.registry.validate_arguments(request.tool_name, request.arguments)
         run_id = str(uuid4())
         now = utc_now()
         self.db.execute(
@@ -72,23 +73,132 @@ class ToolRunService:
     def _execute(self, run_id: str, request: ToolRunRequest) -> None:
         """后台执行器：运行 Tool、截断数据库日志、保存原始日志并解析 Issue。"""
         self._set_status(run_id, ToolRunStatus.RUNNING)
-        registered = self.registry.get(request.tool_name)
         try:
+            registered = self.registry.authorize(request.tool_name, request.role)
             if registered.executor is None:
                 raise ValueError(f"Tool {request.tool_name} has no engineering executor")
             command, exit_code, stdout, stderr = registered.executor(
                 request.workspace_id, request.arguments
             )
-            status = (
-                ToolRunStatus.COMPLETED
-                if exit_code == 0
-                else ToolRunStatus.TIMED_OUT
-                if exit_code == 124
-                else ToolRunStatus.FAILED
-            )
         except Exception as exc:
             command, exit_code, stdout, stderr = [], 1, "", f"TOOL_INTERNAL: {exc}"
-            status = ToolRunStatus.FAILED
+        self._save_execution(run_id, request.workspace_id, request.tool_name, command, exit_code, stdout, stderr)
+
+    def frozen_lint_link(self, action_id: str) -> dict | None:
+        return self.db.fetch_one("SELECT * FROM orchestration_tool_runs WHERE action_id=?", (action_id,))
+
+    def start_frozen_lint(self, action_id: str, request: ToolRunRequest, target: dict, content: bytes) -> ToolRunView:
+        """Register the linked job before launching it, and reuse the job on replay."""
+        registered = self.registry.authorize(request.tool_name, request.role, task=True)
+        if request.tool_name != "verilator_lint" or not registered.definition.requires_user_approval or not request.user_approved:
+            raise PermissionError("Frozen Lint requires an explicitly approved Verilator action")
+        self.registry.validate_arguments(request.tool_name, request.arguments)
+        if request.arguments != {"files": [target["relative_path"]], "top_module": target["top_module"]}:
+            raise ValueError("Lint arguments do not match the approved target")
+        self.workspaces.resolve_path(request.workspace_id, ".")
+        if hashlib.sha256(content).hexdigest() != target["content_hash"]:
+            raise ValueError("Lint snapshot hash mismatch")
+        serialized = self.db.dumps(target)
+        with self._frozen_lock:
+            with self.db.transaction() as conn:
+                existing = conn.execute(
+                    "SELECT tool_run_id, target_json FROM orchestration_tool_runs WHERE action_id=?", (action_id,),
+                ).fetchone()
+                if existing is None:
+                    run_id = str(uuid4())
+                    timestamp = utc_now()
+                    conn.execute(
+                        "INSERT INTO tool_runs VALUES (?, ?, ?, 'queued', ?, '[]', NULL, '', '', ?, ?)",
+                        (run_id, request.workspace_id, request.tool_name, self.db.dumps(request.arguments), timestamp, timestamp),
+                    )
+                    conn.execute(
+                        "INSERT INTO orchestration_tool_runs VALUES (?, ?, ?)", (action_id, run_id, serialized),
+                    )
+                else:
+                    run_id = existing["tool_run_id"]
+                    if existing["target_json"] != serialized:
+                        raise ValueError("Existing ToolRun has a different approved target")
+            run = self.get(run_id)
+            if run.status == ToolRunStatus.QUEUED and run_id not in self._frozen_workers:
+                self._frozen_workers.add(run_id)
+                try:
+                    future = self.executor.submit(self._execute_frozen_lint, run_id, request, target, content)
+                    future.add_done_callback(lambda _: self._forget_worker(run_id))
+                except RuntimeError:
+                    self._frozen_workers.discard(run_id)
+                    raise
+            return self.get(run_id)
+
+    def reconcile_frozen_lint(self, run_id: str) -> ToolRunView:
+        """Reconcile a job after restart. A running process is never relaunched."""
+        with self._frozen_lock:
+            if run_id not in self._frozen_workers:
+                self.db.execute(
+                    """UPDATE tool_runs SET status='failed', updated_at=?,
+                       stderr=stderr || ? WHERE run_id=? AND status IN ('running', 'parsing')""",
+                    (utc_now(), "\nTOOL_INTERRUPTED: Lint result is unknown after restart.", run_id),
+                )
+            run = self.get(run_id)
+            if run is None:
+                raise KeyError(run_id)
+            return run
+
+    def cancel_queued_lint(self, run_id: str) -> None:
+        with self._frozen_lock:
+            self.db.execute(
+                """UPDATE tool_runs SET status='cancelled', updated_at=?, stderr=?
+                   WHERE run_id=? AND status='queued'""",
+                (utc_now(), "TOOL_APPROVAL: Approved Lint target changed before launch.", run_id),
+            )
+
+    def _forget_worker(self, run_id: str) -> None:
+        with self._frozen_lock:
+            self._frozen_workers.discard(run_id)
+
+    def _execute_frozen_lint(self, run_id: str, request: ToolRunRequest, target: dict, content: bytes) -> None:
+        with self.db.transaction() as conn:
+            claimed = conn.execute(
+                "UPDATE tool_runs SET status='running', updated_at=? WHERE run_id=? AND status='queued'",
+                (utc_now(), run_id),
+            ).rowcount
+        if not claimed:
+            return
+        try:
+            self.registry.authorize(request.tool_name, request.role, task=True)
+            identity = verilator_identity()
+            if identity is None or any(target[key] != value for key, value in identity.items()):
+                raise ValueError("Approved Verilator executable is unavailable")
+            check_lint_source(content)
+            directory = self.db.path.parent / "lint-inputs" / run_id
+            directory.mkdir(parents=True)
+            filename = PurePosixPath(target["relative_path"].replace("\\", "/")).name
+            if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:v|sv)", filename, re.I):
+                raise ValueError("Invalid frozen RTL filename")
+            source = directory / filename
+            try:
+                with source.open("xb") as handle:
+                    handle.write(content)
+                command, code, stdout, stderr = run_verilator_lint(
+                    target["executable"], [filename], directory, target["top_module"],
+                )
+            finally:
+                source.unlink(missing_ok=True)
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+        except Exception as exc:
+            command, code, stdout, stderr = [], 1, "", f"TOOL_INTERNAL: {exc}"
+        self._save_execution(run_id, request.workspace_id, request.tool_name, command, code, stdout, stderr)
+
+    def _save_execution(
+        self, run_id: str, workspace_id: str, name: str, command: list[str],
+        exit_code: int, stdout: str, stderr: str,
+    ) -> None:
+        status = (
+            ToolRunStatus.COMPLETED if exit_code == 0 else
+            ToolRunStatus.TIMED_OUT if exit_code == 124 else ToolRunStatus.FAILED
+        )
         # 先进入 parsing，表示外部进程已经结束但 Issue 尚未完全生成。
         # 数据库只保留末尾 1MB，完整原始输出另外写入 Workspace/logs。
         self.db.execute(
@@ -103,14 +213,19 @@ class ToolRunService:
                 run_id,
             ),
         )
-        workspace_service.write_text(request.workspace_id, f"logs/{run_id}.stdout.log", stdout)
-        workspace_service.write_text(request.workspace_id, f"logs/{run_id}.stderr.log", stderr)
-        self._store_issues(
-            run_id,
-            request.tool_name,
-            stdout + "\n" + stderr,
-            f"logs/{run_id}.stderr.log" if stderr else f"logs/{run_id}.stdout.log",
-        )
+        try:
+            self.workspaces.write_text(workspace_id, f"logs/{run_id}.stdout.log", stdout)
+            self.workspaces.write_text(workspace_id, f"logs/{run_id}.stderr.log", stderr)
+            self._store_issues(
+                run_id, name, stdout + "\n" + stderr,
+                f"logs/{run_id}.stderr.log" if stderr else f"logs/{run_id}.stdout.log",
+            )
+        except (OSError, ValueError, KeyError):
+            self.db.execute(
+                "UPDATE tool_runs SET stderr=stderr || ? WHERE run_id=?",
+                ("\nTOOL_LOGS: 无法完成日志或问题落盘。", run_id),
+            )
+            status = ToolRunStatus.FAILED
         self._set_status(run_id, status)
 
     def _set_status(self, run_id: str, status: ToolRunStatus) -> None:

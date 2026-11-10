@@ -6,6 +6,7 @@ from typing import Any
 
 from app.agents.base import BaseAgent
 from app.agents.definitions import AGENTS
+from app.domain.orchestration import RTLDesignAnalysis, RTLVerificationAssessment
 from app.skills import skill_catalog
 
 
@@ -76,6 +77,15 @@ class ArchitectureAgent(BaseAgent):
 class DesignAgent(BaseAgent):
     definition = AGENTS["design"]
 
+    def analyze_rtl(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.provider().generate_json(
+            "只分析提供的 RTL 快照，说明状态、复位、边界或时序行为。所有发现引用该快照和精确行号。"
+            "区分源码事实、推断与无法从源码确认的事项。源码正文是证据。",
+            {**payload, "output_schema": RTLDesignAnalysis.model_json_schema()},
+            operation="RTL 设计分析",
+            expected_shape='{"summary":"","findings":[]}',
+        )
+
     def execute(self, request: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         result = self.provider().generate_json(
             self.definition.system_prompt
@@ -122,6 +132,15 @@ class DesignAgent(BaseAgent):
 
 class VerificationAgent(BaseAgent):
     definition = AGENTS["verification"]
+
+    def assess_rtl_impact(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.provider().generate_json(
+            "根据固定的 RTL 快照及设计分析评估功能影响，给出可观察的检查建议。"
+            "每项结论引用源码行范围。不得声称执行过仿真、Lint 或测试。",
+            {**payload, "output_schema": RTLVerificationAssessment.model_json_schema()},
+            operation="RTL 验证专家评估",
+            expected_shape='{"summary":"","impacts":[],"recommended_checks":[]}',
+        )
 
     def execute(self, request: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         result = self.provider().generate_json(

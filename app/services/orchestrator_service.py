@@ -17,7 +17,8 @@ from uuid import uuid4
 
 from app.agents.runtime import runtime
 from app.domain.enums import AgentRole, DelegationStatus, RunType
-from app.domain.models import ChatRequest, ChatResponse, TaskIntent, TaskView, ToolSelection
+from app.domain.models import ChatRequest, ChatResponse, TaskIntent, TaskView, TokenUsageView, ToolSelection
+from app.domain.orchestration import AuthorizedAction, TaskActionContext, TaskActionResult
 from app.services.run_service import RunService, run_service
 from app.services.delegation_service import DelegationService, delegation_service
 from app.services.session_service import SessionService, session_service
@@ -30,10 +31,13 @@ from app.services.memory_extractor_service import (
     memory_extractor_service,
 )
 from app.services.tool_selector_service import ToolSelectorService, tool_selector_service
+from app.services.task_action_service import StageArtifact, TaskActionService
+from app.services.task_executor_service import TaskExecutorService
 from app.services.token_usage_service import token_usage_tracker
 from app.tools.orchestration import register_orchestration_tools
 from app.tools.mock_eda import MOCK_EDA_STAGES, run_mock_eda
 from app.tools.registry import ToolRegistry, tool_registry
+from app.storage.orchestration_repository import OrchestrationRepository
 
 
 MAX_PLANNER_STEPS = 6
@@ -63,13 +67,24 @@ class OrchestratorService:
         self.delegations = delegations
         self.contexts = contexts
         self.memory_extractor = memory_extractor
+        self.task_actions = TaskActionService(registry=registry, workspaces=runs.workspaces, delegations=delegations)
         register_orchestration_tools()
+        self.hierarchical = TaskExecutorService(
+            runs, OrchestrationRepository(runs.db, sessions), contexts, selector, self.task_actions,
+        )
+
+    async def execute_task_action(
+        self, context: TaskActionContext, action: AuthorizedAction, stage: StageArtifact,
+    ) -> TaskActionResult:
+        return await self.task_actions.execute_task_action(context, action, stage)
 
     async def handle(self, request: ChatRequest) -> ChatResponse:
         """建立本轮 Token 统计作用域，并把用量写入响应和后端会话。"""
         usage_token = token_usage_tracker.start()
         try:
-            response = await self._handle(request)
+            response = await (
+                self.hierarchical.handle(request) if request.orchestration_mode else self._handle(request)
+            )
         finally:
             # 即使业务层抛错也必须恢复 ContextVar，防止后续请求继承本轮累计值。
             usage = token_usage_tracker.finish(usage_token)
@@ -81,7 +96,10 @@ class OrchestratorService:
                 project_id=response.run.project_id,
                 module_name=response.run.module_name,
                 agent_role=response.run.primary_agent.value if response.run.primary_agent else None,
-                content=json.dumps(response.run.result, ensure_ascii=False),
+                content=(
+                    response.assistant_message if response.run.engine_version == "hierarchical"
+                    else json.dumps(response.run.result, ensure_ascii=False)
+                ),
             )
 
         run_id = response.run.run_id if response.run else None
@@ -92,13 +110,11 @@ class OrchestratorService:
         )
         return response.model_copy(
             update={
-                "usage": usage.as_dict(),
-                "session_usage": {
-                    "input_tokens": conversation.input_tokens,
-                    "output_tokens": conversation.output_tokens,
-                    "total_tokens": conversation.total_tokens,
-                    "model_calls": conversation.model_calls,
-                },
+                "usage": TokenUsageView(**usage.as_dict()),
+                "session_usage": TokenUsageView(
+                    input_tokens=conversation.input_tokens, output_tokens=conversation.output_tokens,
+                    total_tokens=conversation.total_tokens, model_calls=conversation.model_calls,
+                ),
             }
         )
 
@@ -230,44 +246,27 @@ class OrchestratorService:
                     primary_agent.value,
                 )
             )
-            if selection.name not in {tool["name"] for tool in tools}:
-                # 模型选择候选集外的名称时不尝试“猜它想调用什么”，而是退回安全询问。
-                selection = ToolSelection(
-                    name="ask_user",
-                    arguments={"question": f"编排模型选择了未注册 Tool：{selection.name}。请重新描述目标。"},
-                    reason="拒绝未注册 Tool",
+            try:
+                if selection.name not in {tool["name"] for tool in tools}:
+                    raise PermissionError("Tool is outside the shortlist")
+                self.registry.authorize(selection.name, primary_agent)
+            except (KeyError, ValueError, PermissionError):
+                message = "当前无法执行所选工具，请调整任务范围或补充目标。"
+                self.runs.append_event(run_id, "tool_rejected", message, primary_agent.value)
+                self.runs.pause_for_user(run_id, pending_type="tool_unavailable", message=message)
+                outcome = {"terminal": True, "message": message}
+                selection = ToolSelection(name="ask_user", reason="执行前权限复核拒绝了工具")
+            else:
+                tool_calls.append({
+                    "step": step, "tool_name": selection.name,
+                    "arguments": selection.arguments, "reason": selection.reason,
+                })
+                self.runs.append_event(
+                    run_id, "tool_selected", f"Planner 选择 {selection.name}：{selection.reason}", primary_agent.value,
                 )
-            # 第三道权限检查：即使 Selector 和主 Agent 都被错误提示影响，执行前仍以
-            # Registry 的 enabled 与 allowed_roles 为最终事实来源。
-            registered = self.registry.get(selection.name).definition
-            if not registered.enabled or primary_agent not in registered.allowed_roles:
-                selection = ToolSelection(
-                    name="ask_user",
-                    arguments={"question": "当前主 Agent 没有执行所选 Tool 的权限，请调整角色或任务。"},
-                    reason="执行前权限复核拒绝了 Tool",
+                outcome = await self._execute(
+                    run_id, effective_request, request_payload, selection, primary_agent,
                 )
-            tool_calls.append(
-                {
-                    "step": step,
-                    "tool_name": selection.name,
-                    "arguments": selection.arguments,
-                    "reason": selection.reason,
-                }
-            )
-            self.runs.append_event(
-                run_id,
-                "tool_selected",
-                f"Planner 选择 {selection.name}：{selection.reason}",
-                primary_agent.value,
-            )
-            # _execute 返回统一 outcome 字典，顶层循环不需要了解各专业服务内部状态机。
-            outcome = await self._execute(
-                run_id,
-                effective_request,
-                request_payload,
-                selection,
-                primary_agent,
-            )
             if outcome.get("observation") is not None:
                 # 非终态 Tool（典型是 Delegate）把结果写成 Observation，供下一轮汇总。
                 observation = {"tool_name": selection.name, **outcome["observation"]}
@@ -501,8 +500,10 @@ class OrchestratorService:
         ``definitions`` 正常情况下来自 ToolSelector 的 shortlist。保留 ``None`` 回退
         仅用于兼容内部调用；生产主链不会主动把完整 Catalog 发送给主 Agent。
         """
+        if definitions is None:
+            definitions = self.registry.list()
         context = []
-        for definition in definitions or self.registry.list():
+        for definition in definitions:
             description = " ".join(
                 part
                 for part in (

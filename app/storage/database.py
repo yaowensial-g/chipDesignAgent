@@ -12,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from app.storage.orchestration_schema import SCHEMA as ORCHESTRATION_SCHEMA
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "chipflow.db"
@@ -407,7 +409,7 @@ class Database:
             ON context_manifests(run_id, created_at);
         """
         with self._lock, self.connect() as connection:
-            connection.executescript(schema)
+            connection.executescript(schema + ORCHESTRATION_SCHEMA)
             # 兼容已有本地数据库：CREATE TABLE IF NOT EXISTS 不会为旧表增加新列，
             # 因而必须检查 PRAGMA 后再执行最小迁移。
             issue_columns = {
@@ -420,6 +422,19 @@ class Database:
             run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
             if "primary_agent" not in run_columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN primary_agent TEXT")
+            if "engine_version" not in run_columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN engine_version TEXT NOT NULL DEFAULT 'legacy'")
+            event_columns = {row[1] for row in connection.execute("PRAGMA table_info(run_events)")}
+            if "orchestration_task_id" not in event_columns:
+                connection.execute("ALTER TABLE run_events ADD COLUMN orchestration_task_id TEXT")
+            delegation_columns = {row[1] for row in connection.execute("PRAGMA table_info(delegation_tasks)")}
+            if "orchestration_action_id" not in delegation_columns:
+                connection.execute("ALTER TABLE delegation_tasks ADD COLUMN orchestration_action_id TEXT")
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_delegation_action
+                   ON delegation_tasks(parent_run_id, orchestration_action_id)
+                   WHERE orchestration_action_id IS NOT NULL"""
+            )
             conversation_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(conversations)")
             }
@@ -487,6 +502,8 @@ class Database:
                 "context_version": "INTEGER NOT NULL DEFAULT 2",
                 "turn_summary_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "raw_turn_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "orchestration_task_id": "TEXT",
+                "artifact_ids_json": "TEXT NOT NULL DEFAULT '[]'",
             }
             for column, declaration in manifest_migrations.items():
                 if column not in manifest_columns:

@@ -6,14 +6,93 @@ Shell 字符串；所有路径和参数都必须先经过白名单校验，并�
 """
 
 import json
+import os
 import re
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 from app.domain.enums import AgentRole, Mutability
 from app.services.workspace_service import workspace_service
 from app.tools.registry import tool_registry
+
+
+def verilator_enabled() -> bool:
+    return os.getenv("CHIP_AGENT_VERILATOR_ENABLED", "").lower() in {"1", "true"}
+
+
+def verilator_executable() -> str | None:
+    configured = os.getenv("CHIP_AGENT_VERILATOR_PATH")
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            return None
+        executable = shutil.which(str(path))
+    else:
+        executable = shutil.which("verilator") or shutil.which("verilator_bin")
+    if executable:
+        resolved = Path(executable).resolve()
+        if os.name != "nt" or resolved.suffix.lower() == ".exe":
+            return str(resolved)
+    return None
+
+
+@lru_cache(maxsize=8)
+def _probe_verilator(executable: str, size: int, mtime_ns: int, root: str | None, path: str | None) -> str | None:
+    try:
+        probe = subprocess.run(
+            [executable, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, shell=False, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    banner = probe.stdout.strip().splitlines()
+    return banner[0][:250] if probe.returncode == 0 and banner and banner[0].startswith("Verilator ") else None
+
+
+def verilator_identity() -> dict | None:
+    if not verilator_enabled() or (executable := verilator_executable()) is None:
+        return None
+    try:
+        info = Path(executable).stat()
+    except OSError:
+        return None
+    version = _probe_verilator(executable, info.st_size, info.st_mtime_ns, os.getenv("VERILATOR_ROOT"), os.getenv("PATH"))
+    if version is None:
+        return None
+    return {
+        "executable": executable, "version": version, "executable_size": info.st_size,
+        "executable_mtime_ns": info.st_mtime_ns, "verilator_root": os.getenv("VERILATOR_ROOT"),
+    }
+
+
+def verilator_available() -> bool:
+    return verilator_identity() is not None
+
+
+def check_lint_source(content: bytes) -> None:
+    # Phase C compiles one self-contained source. No unapproved preprocessor includes or macros.
+    if b"`" in content:
+        raise ValueError("当前真实 Lint 只支持无预处理指令的单文件 RTL。")
+
+
+def run_verilator_lint(executable: str, files: list[str], cwd: Path, top_module: str) -> tuple[list[str], int, str, str]:
+    command = [executable, "--lint-only", "-Wall", *files]
+    if top_module:
+        command.extend(["--top-module", top_module])
+    try:
+        completed = subprocess.run(
+            command, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300, shell=False, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        return command, completed.returncode, completed.stdout, completed.stderr
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else exc.stdout or ""
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else exc.stderr or ""
+        return command, 124, stdout, stderr + "\nTOOL_TIMEOUT: Verilator Lint 超时"
 
 
 def _discover_testcases(workspace_id: str, arguments: dict) -> tuple[list[str], int, str, str]:
@@ -62,34 +141,35 @@ def _verilator_lint(workspace_id: str, arguments: dict) -> tuple[list[str], int,
         if not path.exists():
             return [executable, "--lint-only"], 2, "", f"TOOL_ARGUMENT: 文件不存在 {item}"
         resolved_files.append(str(path))
-    # 使用参数列表和 shell=False，避免文件名或模型参数被解释成额外 Shell 命令。
-    command = [executable, "--lint-only", "-Wall", *resolved_files]
-    top_module = arguments.get("top_module")
-    if top_module:
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", str(top_module)):
-            return command, 2, "", "TOOL_ARGUMENT: top_module 格式非法"
-        command.extend(["--top-module", str(top_module)])
+    top_module = arguments.get("top_module", "")
+    if top_module and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", top_module):
+        return [executable, "--lint-only"], 2, "", "TOOL_ARGUMENT: top_module 格式非法"
     workspace = workspace_service.get(workspace_id)
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=workspace.root_path,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300,
-            shell=False,
-            check=False,
-        )
-        return command, completed.returncode, completed.stdout, completed.stderr
-    except subprocess.TimeoutExpired as exc:
-        return command, 124, exc.stdout or "", (exc.stderr or "") + "\nTOOL_TIMEOUT: Verilator Lint 超时"
+    return run_verilator_lint(executable, resolved_files, Path(workspace.root_path), top_module)
 
 
 def register_builtin_tools() -> None:
     """幂等注册真实工程 Tool；声明权限和审批要求，执行器只负责动作本身。"""
-    existing = {tool.name for tool in tool_registry.list()}
+    existing = {tool.name for tool in tool_registry.list(include_task_only=True)}
+    if "read_rtl_source" not in existing:
+        tool_registry.register(
+            name="read_rtl_source",
+            description="读取已授权的 Workspace RTL 文件并保留精确字节版本。",
+            allowed_roles=[AgentRole.DESIGN, AgentRole.VERIFICATION],
+            mutability=Mutability.READ,
+            requires_user_approval=False,
+            idempotent=True,
+            timeout_seconds=15,
+            input_schema={
+                "type": "object",
+                "properties": {"relative_path": {"type": "string", "minLength": 1, "maxLength": 500}},
+                "required": ["relative_path"],
+                "additionalProperties": False,
+            },
+            execution_kind="orchestration",
+            scope="task",
+            capability="read_rtl",
+        )
     if "discover_testcases" not in existing:
         tool_registry.register(
             name="discover_testcases",
@@ -119,6 +199,8 @@ def register_builtin_tools() -> None:
     if "verilator_lint" not in existing:
         tool_registry.register(
             name="verilator_lint",
+            scope="shared",
+            capability="real_rtl_lint",
             description="使用 Verilator 对指定 HDL 文件执行受控 Lint。",
             when_to_use="用户明确要求执行 Lint，或设计/验证任务需要用真实工具检查 HDL 时。",
             when_not_to_use="用户只询问 Lint 概念，或尚未明确授权启动本地进程时。",
@@ -146,9 +228,9 @@ def register_builtin_tools() -> None:
             preconditions=["存在可访问的 Workspace", "Verilator 已安装", "用户授权启动本地进程"],
             side_effect="local_process",
             category="common",
-            # 当前产品运行环境不保证安装 EDA 工具。保留真实 Adapter 代码供未来启用，
-            # 但默认不暴露给 Agent；现阶段统一调用 run_mock_eda。
+            # 保留旧入口的禁用行为，分层入口按部署开关和版本探测单独开放。
             enabled=False,
+            task_enabled=verilator_available,
             executor=_verilator_lint,
         )
 

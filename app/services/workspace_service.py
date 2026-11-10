@@ -20,6 +20,7 @@ from app.storage.database import Database, PROJECT_ROOT, database
 
 
 DEFAULT_WORKSPACE_ROOT = PROJECT_ROOT / "data" / "workspaces"
+MAX_RTL_SOURCE_BYTES = 48_000
 
 
 def utc_now() -> str:
@@ -104,6 +105,31 @@ class WorkspaceService:
         temporary.write_text(content, encoding="utf-8")
         temporary.replace(target)
         return target
+
+    def read_rtl_source(self, workspace_id: str, project_id: str, relative_path: str) -> bytes:
+        workspace = self.get(workspace_id)
+        if workspace is None:
+            raise KeyError(workspace_id)
+        if workspace.project_id != project_id:
+            raise PermissionError("Workspace belongs to a different project")
+        root = Path(workspace.root_path).resolve()
+        self._assert_within_root(root)
+        relative = Path(relative_path)
+        if relative.anchor or ".." in relative.parts or ":" in relative_path:
+            raise ValueError("Invalid relative RTL path")
+        target = self.resolve_path(workspace_id, relative_path)
+        if target != root / relative:
+            raise ValueError("RTL paths must point directly to the authorized file")
+        if target.suffix.lower() not in {".sv", ".svh", ".v", ".vh"}:
+            raise ValueError("Unsupported RTL file type")
+        if not target.is_file():
+            raise FileNotFoundError("RTL source is unavailable")
+        with target.open("rb") as source:
+            content = source.read(MAX_RTL_SOURCE_BYTES + 1)
+        if not content or len(content) > MAX_RTL_SOURCE_BYTES or b"\0" in content:
+            raise ValueError("RTL source is empty, oversized, or binary")
+        content.decode("utf-8")
+        return content
 
     def _assert_within_root(self, path: Path) -> None:
         if path != self.root and self.root not in path.parents:
