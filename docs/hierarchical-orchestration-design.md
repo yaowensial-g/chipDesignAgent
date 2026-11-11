@@ -104,7 +104,7 @@ flowchart TD
 | `max_action_steps` | 8 | 每 Task 执行代次。首次领取并准备派发 `action_id` 时计数，执行失败也计。审批前挂起、恢复同一动作、轮询和重复回调无需另计。额度耗尽仍可提交验收、提问或报告失败。 |
 | `max_repair_attempts` | 3 | 每 Task 执行代次。验收失败后，只有可修复且后端进入修正时才递增。首次验收加最多三轮修正，共享该代次剩余动作与决策额度。 |
 | `max_decisions` | 16 | 每 Task 执行代次。每次发起合并的 Reflection 与动作选择前计数，包括无效返回和模型调用错误。最后一个决策槽仅允许提交、提问或报告失败。Selector 与 Verifier 调用计入 Run 总模型用量。 |
-| `max_replans` | 2 | 每 Run。完整重规划每次提案先计数，非法提案也计。第一版保留配置位，暂不自动发起重规划。 |
+| `max_replans` | 2 | 每 Run。调用前记账，非法提案和中断也计入。串行 RTL 路径的启用方式见第 13 节。 |
 | `max_plan_tasks` | 8 | 每个候选计划版本校验节点总量，重规划同样受限。 |
 
 后端冻结实际生效的配置和计数，契约预算可以收紧。等待恢复、验证失败修正和服务重启均沿用同一代次。后端另设单次超时与 Run 总模型额度。
@@ -709,3 +709,39 @@ $env:CHIP_AGENT_VERILATOR_PATH = 'C:\tools\verilator\bin\verilator_bin.exe'
 ```
 
 批准后后台登记并启动一个 ToolRun，客户端可以轮询 Run。`result.lint_tool_run_id` 指向 `GET /api/v1/tool-runs/{id}` 和对应 Issue 列表。日志也保存在 Workspace 的 `logs` 目录。独立验收复核退出码、绑定快照、执行命令和持久化日志摘要。成功才发布 `lint_result` 给报告节点。失败保留 ToolRun 与诊断。重启可恢复尚未领取的队列记录，已领取且结果不明的进程不会自动重跑。旧聊天入口及独立 ToolRun 的默认禁用策略继续沿用。
+
+## 13. 串行 DAG 的增量重规划
+
+设置 `CHIP_AGENT_HIERARCHICAL_ENABLED=1` 和 `CHIP_AGENT_REPLANNING_ENABLED=1` 后，新建的 `rtl_analysis` Run 可使用增量重规划。`run_lint: true` 继续使用第 12 节的工具与审批配置。重规划开关默认关闭，现有聊天、Legacy、DS 和固定 `eda_project` 链路沿用各自的调度规则。没有冻结规划策略的旧分层 Run 可以按原契约恢复。关闭重规划开关时，已发布的新计划可以继续执行，待处理重规划会停止并保留记录。
+
+### 触发与验收
+
+- 独立 Verifier 先验收候选产物，失败时优先使用局部 Repair。Repair 用尽后，执行器根据失败类别和剩余额度决定是否排队重规划。
+- `report_task_failure` 可以携带 `PlanIssue`。后端核对当前任务、计划节点、实际 Observation 和可见产物。缺少必要输入、权限不足、审批拒绝、工具缺失和未知外部结果均按原流程等待或结束。
+- 已验收 Artifact 的失效需要独立 Verifier 的确定性证据，或用户对指定 Artifact ID 的明确确认。Hash 用于检查已存字节与已记录版本是否一致。模型报告语义问题时，若规则无法证实，Run 进入 `artifact_invalidation` 等待。通过 `/runs/{run_id}/resume` 带 `wait_id` 批准或拒绝。用户确认失效后，后端沿当前代次的真实 Artifact 绑定计算生产者和递归消费者，并在同一事务中标记失效与持久化触发事件。
+- `ReplannerService` 向主模型请求一个 `PlanDelta`，支持新增、替换、移除未执行节点、调整依赖与输入、建议重跑和调整交付节点。新增节点使用提案内别名。后端生成 ID 和版本，用原 `PlanningPolicy` 复验角色、能力、工具、约束、验收、节点上限、DAG 和 UART 必需交付链。辅助节点可使用获准的只读 RTL 快照和报告能力。下游领取任务时绑定当前生产代次已验证的产物。
+- 保留无关的已完成代次及其绑定。仅增加控制边时，已有成果可沿用。已确认失效的输出及其实际消费者输出标记为 `invalidated`。新版本验证通过后替代的旧产物标记为 `superseded`。显式重跑或实质变更契约时，按已有输出绑定保守重跑数据消费者。重新执行的任务可读取本任务上一代的验收诊断，交付与证据引用使用当前代次的绑定。
+
+### 持久化与故障恢复
+
+| 结构 | 职责 |
+|---|---|
+| `orchestration_plans` | 按 Run 记录不可变契约快照、前一计划、变更原因与受影响节点。`active` 部分唯一索引保证一个活动版本。Run 完成时活动计划进入 `closed`。 |
+| `orchestration_replans` | 按 Run 对提案编号，保存触发证据、旧计划、提案、诊断、涉及节点和新计划。状态包含 `proposing`、`rejected`、`applied`、`interrupted`。 |
+| `orchestration_task_attempts` | 按 `(run_id, task_id, generation)` 保存契约版本、状态、动作与决策计数。`orchestration_tasks` 提供当前状态投影。 |
+| `orchestration_attempt_bindings` | 保存每代次精确的输入 Artifact ID，建立反向消费者索引。旧 `orchestration_bindings` 保留，旧绑定回填为第一代。 |
+| `orchestration_actions` | 增加计划 ID、代次和代次内序号。保留原 `decision_sequence` 作为任务内存储序号。Observation 与 Verification 通过 Action 追溯代次。 |
+| `orchestration_late_results` | 保存无法进入当前状态的晚到结果、Artifact 元数据和验收回执。外部工具原始结果仍可通过 ToolRun 查询。 |
+
+旧计划、旧动作和旧绑定采用增量回填，无需删除旧表。计划发布在同一 SQLite 写事务中切换活动版本、处理旧等待项并创建必要的新代次。工具领取、外部结果落账和验收发布会核对计划、代次及输入状态。外部工具同时校验已持久化的审批、Workspace、参数和冻结目标。Lint 重跑需要对新代次的动作重新批准。重启发现未完成的模型提案时，记录中断并保留已消耗的额度。已成功发布的计划直接恢复，已完成的专业动作按已有 ToolRun 对账。
+
+每个新 Run 冻结规划和 Run 总预算。`CHIP_AGENT_MAX_PLAN_TASKS` 默认 `8`，`CHIP_AGENT_MAX_REPLANS` 默认 `2`，`CHIP_AGENT_MAX_RUN_ACTIONS` 默认 `192`，`CHIP_AGENT_MAX_RUN_DECISIONS` 默认 `384`。任务契约的上限默认是 `8` 次动作、`16` 次决策、`3` 次 Repair。同一逻辑任务的 Repair 次数跨代次累计。Run 总量汇总各代次持久化计数。
+
+查询使用 `/plans` 查看版本链，`/replans` 查看提案账本，`/tasks?include_history=true` 查看各代次的动作、绑定、Observation、Reflection、Verifier 结果、Artifact 状态及晚到结果。多 Worker 调度和外部写操作自动补偿属于后续范围。
+
+### 实现文件
+
+- 运行时、契约与工具参数。[runtime.py](../app/agents/runtime.py)、[orchestration.py](../app/domain/orchestration.py)、[工具参数定义](../app/tools/orchestration.py)、[task_action_service.py](../app/services/task_action_service.py)
+- 规划、血缘、执行与验收。[replanner_service.py](../app/services/replanner_service.py)、[global_planner_service.py](../app/services/global_planner_service.py)、[dependency_tracker_service.py](../app/services/dependency_tracker_service.py)、[task_executor_service.py](../app/services/task_executor_service.py)、[task_verifier_service.py](../app/services/task_verifier_service.py)、[tool_run_service.py](../app/services/tool_run_service.py)
+- 存储、事务校验与查询。[database.py](../app/storage/database.py)、[orchestration_schema.py](../app/storage/orchestration_schema.py)、[orchestration_repository.py](../app/storage/orchestration_repository.py)、[orchestration_fence.py](../app/storage/orchestration_fence.py)、[routes.py](../app/api/routes.py)
+- 测试与运行手册。[test_hierarchical_run.py](../tests/test_hierarchical_run.py)、[test_verilator_stage.py](../tests/test_verilator_stage.py)、[runtime-flow.md](runtime-flow.md)

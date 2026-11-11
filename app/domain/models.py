@@ -151,10 +151,20 @@ class ChatRequest(BaseModel):
     tool_arguments: dict[str, Any] = Field(default_factory=dict)
     user_approved: bool = False
     user_role: UserRole | None = None
-    orchestration_mode: Literal["chat", "rtl_analysis"] | None = None
+    orchestration_mode: Literal["chat", "rtl_analysis", "eda_project"] | None = None
     rtl_path: str | None = Field(default=None, min_length=1, max_length=500)
     run_lint: bool = False
     lint_top_module: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_$]*$", max_length=120)
+    eda_manifest_path: str = Field(default="chipdesign.json", max_length=250)
+    eda_operations: list[str] = Field(default_factory=list, max_length=6)
+    eda_testcases: list[str] = Field(default_factory=list, max_length=4)
+    eda_seed: int = Field(default=1, ge=1, le=2_147_483_647)
+    eda_signal: str | None = Field(default=None, max_length=250)
+    eda_clock: str | None = Field(default=None, max_length=250)
+    eda_ready: str | None = Field(default=None, max_length=250)
+    eda_wave_testcase: str | None = Field(default=None, max_length=80)
+    eda_applied_patch_id: str | None = Field(default=None, max_length=120)
+    eda_repair_path: str | None = Field(default=None, max_length=250)
 
 
 class TaskIntent(BaseModel):

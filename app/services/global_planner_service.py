@@ -27,6 +27,7 @@ from app.domain.orchestration import (
 from app.models.provider import ModelInvocationError
 from app.services.delegation_service import ALLOWED_EXPERTS
 from app.tools.builtin import register_builtin_tools
+from app.tools.eda_catalog import register_eda_tools
 from app.tools.orchestration import register_orchestration_tools
 from app.tools.registry import ToolRegistry, tool_registry
 
@@ -60,6 +61,7 @@ class GlobalPlannerService:
         if registry is tool_registry:
             register_builtin_tools()
             register_orchestration_tools()
+            register_eda_tools()
 
     def plan(
         self,
@@ -71,6 +73,7 @@ class GlobalPlannerService:
         *,
         simple_question: bool = False,
         validate_workflow: Callable[[TaskPlanDraft], None] | None = None,
+        fixed_draft: TaskPlanDraft | None = None,
     ) -> PlanningResult:
         if set(policy.required_inputs) - policy.input_types.keys():
             return PlanningResult(status="waiting_for_user", message="请补充任务需要的工程输入。")
@@ -82,10 +85,10 @@ class GlobalPlannerService:
             )
 
         diagnostics: list[str] = []
-        for _ in range(1 if simple_question else 2):
+        for _ in range(1 if simple_question or fixed_draft is not None else 2):
             try:
                 raw = (
-                    self._single_task(intent, policy)
+                    fixed_draft if fixed_draft is not None else self._single_task(intent, policy)
                     if simple_question
                     else (self.propose or runtime.propose_task_plan)(
                         {
@@ -149,6 +152,14 @@ class GlobalPlannerService:
             }
             for role in sorted(allowed_roles, key=lambda item: item.value)
         }
+
+    def validate_revision(self, draft: TaskPlanDraft, policy: PlanningPolicy) -> None:
+        catalog = self._catalog(policy)
+        if set(policy.required_tools) - {name for tools in catalog.values() for name in tools}:
+            raise InvalidPlan("required_tool_unavailable")
+        if set(policy.required_inputs) - policy.input_types.keys():
+            raise InvalidPlan("required_input_unavailable")
+        self._validate(draft, policy, catalog)
 
     @staticmethod
     def _single_task(intent: TaskIntent, policy: PlanningPolicy) -> TaskPlanDraft:

@@ -5,9 +5,12 @@
 """
 
 import hashlib
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+import os
+import shutil
 from threading import RLock
 from uuid import uuid4
 
@@ -20,8 +23,12 @@ from app.domain.models import (
 )
 from app.services.workspace_service import WorkspaceService, utc_now, workspace_service
 from app.storage.database import Database, database
+from app.storage.orchestration_fence import frozen_approval_is_current
 from app.tools.builtin import check_lint_source, register_builtin_tools, run_verilator_lint, verilator_identity
 from app.tools.registry import ToolRegistry, tool_registry
+from app.tools.adapters.base import EDAToolResult
+from app.tools.adapters import verilator_adapter
+from app.tools.project_manifest import FrozenProject
 
 
 class ToolRunService:
@@ -84,7 +91,7 @@ class ToolRunService:
             command, exit_code, stdout, stderr = [], 1, "", f"TOOL_INTERNAL: {exc}"
         self._save_execution(run_id, request.workspace_id, request.tool_name, command, exit_code, stdout, stderr)
 
-    def frozen_lint_link(self, action_id: str) -> dict | None:
+    def frozen_tool_link(self, action_id: str) -> dict | None:
         return self.db.fetch_one("SELECT * FROM orchestration_tool_runs WHERE action_id=?", (action_id,))
 
     def start_frozen_lint(self, action_id: str, request: ToolRunRequest, target: dict, content: bytes) -> ToolRunView:
@@ -98,9 +105,29 @@ class ToolRunService:
         self.workspaces.resolve_path(request.workspace_id, ".")
         if hashlib.sha256(content).hexdigest() != target["content_hash"]:
             raise ValueError("Lint snapshot hash mismatch")
+        return self._start_frozen(action_id, request, target, self._execute_frozen_lint, content)
+
+    def start_frozen_eda(
+        self, action_id: str, request: ToolRunRequest, target: dict, project: FrozenProject,
+    ) -> ToolRunView:
+        registered = self.registry.authorize(request.tool_name, request.role, task=True)
+        if (
+            request.tool_name not in verilator_adapter.VERILATOR_TOOLS
+            or not registered.definition.requires_user_approval or not request.user_approved
+        ):
+            raise PermissionError("Frozen EDA requires approval")
+        self.registry.validate_arguments(request.tool_name, request.arguments)
+        self.workspaces.resolve_path(request.workspace_id, ".")
+        if project.input_hash != target["content_hash"] or request.arguments != target["arguments"]:
+            raise ValueError("EDA inputs do not match the approved target")
+        return self._start_frozen(action_id, request, target, self._execute_frozen_eda, project)
+
+    def _start_frozen(self, action_id, request, target, execute, inputs) -> ToolRunView:
         serialized = self.db.dumps(target)
         with self._frozen_lock:
             with self.db.transaction() as conn:
+                if not frozen_approval_is_current(conn, action_id, target, request.arguments):
+                    raise PermissionError("The frozen ToolRun no longer has an active approved action")
                 existing = conn.execute(
                     "SELECT tool_run_id, target_json FROM orchestration_tool_runs WHERE action_id=?", (action_id,),
                 ).fetchone()
@@ -122,33 +149,91 @@ class ToolRunService:
             if run.status == ToolRunStatus.QUEUED and run_id not in self._frozen_workers:
                 self._frozen_workers.add(run_id)
                 try:
-                    future = self.executor.submit(self._execute_frozen_lint, run_id, request, target, content)
+                    future = self.executor.submit(execute, run_id, request, target, inputs)
                     future.add_done_callback(lambda _: self._forget_worker(run_id))
                 except RuntimeError:
                     self._frozen_workers.discard(run_id)
                     raise
             return self.get(run_id)
 
-    def reconcile_frozen_lint(self, run_id: str) -> ToolRunView:
+    def eda_result(self, run_id: str) -> EDAToolResult | None:
+        row = self.db.fetch_one("SELECT result_json FROM eda_tool_results WHERE tool_run_id=?", (run_id,))
+        return EDAToolResult.model_validate_json(row["result_json"]) if row else None
+
+    def eda_artifact(self, run_id: str, name: str) -> bytes:
+        row = self.db.fetch_one(
+            "SELECT content_hash, content FROM eda_run_artifacts WHERE tool_run_id=? AND name=?", (run_id, name),
+        )
+        if row is None or hashlib.sha256(row["content"]).hexdigest() != row["content_hash"]:
+            raise KeyError(name)
+        return row["content"]
+
+    def _execute_frozen_eda(
+        self, run_id: str, request: ToolRunRequest, target: dict, project: FrozenProject,
+    ) -> None:
+        if not self._claim_frozen(run_id):
+            return
+        try:
+            self.registry.authorize(request.tool_name, request.role, task=True)
+            identity = verilator_identity()
+            if identity is None or any(target[key] != value for key, value in identity.items()):
+                raise ValueError("Approved Verilator executable is unavailable")
+            if request.tool_name in verilator_adapter.SIMULATION_TOOLS and (
+                target["simulation_environment"] != verilator_adapter.simulation_environment(identity["executable"])
+            ):
+                raise ValueError("Approved simulation toolchain changed")
+            # The child only receives the frozen inputs and its own output directory.
+            scratch = self.db.path.parent / f"eda-{run_id}"
+            scratch.mkdir(mode=0o777 if os.name == "nt" else 0o700)
+            try:
+                result, stdout, stderr, files = verilator_adapter.execute(
+                    request.tool_name, identity["executable"], identity["version"], project,
+                    tuple(request.arguments.get("testcases", ())), request.arguments.get("seed", 1), scratch,
+                    coverage=request.arguments.get("coverage", False),
+                )
+            finally:
+                shutil.rmtree(scratch, ignore_errors=True)
+        except (OSError, ValueError, KeyError, PermissionError) as error:
+            result = EDAToolResult(
+                tool_name=request.tool_name, tool_version=target["version"], input_hash=project.input_hash,
+                status="ERROR", exit_code=None,
+            )
+            stdout, stderr, files = "", str(error), {}
+        result.stdout_path = f"logs/{run_id}.stdout.log"
+        result.stderr_path = f"logs/{run_id}.stderr.log"
+        result.issues = parse_tool_issues(request.tool_name, stdout + "\n" + stderr)
+        with self.db.transaction() as conn:
+            for name, content in files.items():
+                digest = hashlib.sha256(content).hexdigest()
+                conn.execute("INSERT INTO eda_run_artifacts VALUES (?, ?, ?, ?)", (run_id, name, digest, content))
+                result.artifacts.append({"name": name, "sha256": digest, "bytes": len(content)})
+            conn.execute("INSERT INTO eda_tool_results VALUES (?, ?)", (run_id, result.model_dump_json()))
+        status_code = 0 if result.status == "PASS" else 124 if result.status == "TIMEOUT" else (result.exit_code or 1)
+        self._save_execution(
+            run_id, request.workspace_id, request.tool_name, result.commands[0] if result.commands else [],
+            status_code, stdout, stderr,
+        )
+
+    def reconcile_frozen_tool(self, run_id: str) -> ToolRunView:
         """Reconcile a job after restart. A running process is never relaunched."""
         with self._frozen_lock:
             if run_id not in self._frozen_workers:
                 self.db.execute(
                     """UPDATE tool_runs SET status='failed', updated_at=?,
                        stderr=stderr || ? WHERE run_id=? AND status IN ('running', 'parsing')""",
-                    (utc_now(), "\nTOOL_INTERRUPTED: Lint result is unknown after restart.", run_id),
+                    (utc_now(), "\nTOOL_INTERRUPTED: External EDA result is unknown after restart.", run_id),
                 )
             run = self.get(run_id)
             if run is None:
                 raise KeyError(run_id)
             return run
 
-    def cancel_queued_lint(self, run_id: str) -> None:
+    def cancel_queued_tool(self, run_id: str) -> None:
         with self._frozen_lock:
             self.db.execute(
                 """UPDATE tool_runs SET status='cancelled', updated_at=?, stderr=?
                    WHERE run_id=? AND status='queued'""",
-                (utc_now(), "TOOL_APPROVAL: Approved Lint target changed before launch.", run_id),
+                (utc_now(), "TOOL_APPROVAL: Approved EDA target changed before launch.", run_id),
             )
 
     def _forget_worker(self, run_id: str) -> None:
@@ -156,12 +241,7 @@ class ToolRunService:
             self._frozen_workers.discard(run_id)
 
     def _execute_frozen_lint(self, run_id: str, request: ToolRunRequest, target: dict, content: bytes) -> None:
-        with self.db.transaction() as conn:
-            claimed = conn.execute(
-                "UPDATE tool_runs SET status='running', updated_at=? WHERE run_id=? AND status='queued'",
-                (utc_now(), run_id),
-            ).rowcount
-        if not claimed:
+        if not self._claim_frozen(run_id):
             return
         try:
             self.registry.authorize(request.tool_name, request.role, task=True)
@@ -190,6 +270,24 @@ class ToolRunService:
         except Exception as exc:
             command, code, stdout, stderr = [], 1, "", f"TOOL_INTERNAL: {exc}"
         self._save_execution(run_id, request.workspace_id, request.tool_name, command, code, stdout, stderr)
+
+    def _claim_frozen(self, run_id: str) -> bool:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """SELECT l.action_id,l.target_json,t.arguments_json FROM orchestration_tool_runs l
+                   JOIN tool_runs t ON t.run_id=l.tool_run_id WHERE t.run_id=? AND t.status='queued'""", (run_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if not frozen_approval_is_current(conn, row["action_id"], json.loads(row["target_json"]), json.loads(row["arguments_json"])):
+                conn.execute("UPDATE tool_runs SET status='cancelled', updated_at=?, stderr=? WHERE run_id=?",
+                             (utc_now(), "TOOL_APPROVAL: Frozen action is no longer current.", run_id))
+                return False
+            claimed = conn.execute(
+                "UPDATE tool_runs SET status='running', updated_at=? WHERE run_id=? AND status='queued'",
+                (utc_now(), run_id),
+            ).rowcount
+        return bool(claimed)
 
     def _save_execution(
         self, run_id: str, workspace_id: str, name: str, command: list[str],
@@ -360,7 +458,7 @@ class ToolRunService:
 
 
 VERILATOR_PATTERN = re.compile(
-    r"%(?P<severity>Error|Warning)(?:-(?P<code>[A-Z0-9_]+))?:\s*(?:(?P<file>[^:\r\n]+):(?P<line>\d+)(?::\d+)?:\s*)?(?P<message>.+)",
+    r"%(?P<severity>Error|Warning|Fatal)(?:-(?P<code>[A-Z0-9_]+))?:\s*(?:(?P<file>(?:[A-Za-z]:)?[^:\r\n]+):(?P<line>\d+)(?::\d+)?:\s*)?(?P<message>.+)",
     flags=re.IGNORECASE,
 )
 
@@ -373,7 +471,7 @@ def parse_tool_issues(tool_name: str, text: str) -> list[dict]:
         match = VERILATOR_PATTERN.search(line)
         if match:
             data = match.groupdict()
-            severity = data["severity"].lower()
+            severity = "warning" if data["severity"].lower() == "warning" else "error"
             message = data["message"].strip()
             file = data.get("file")
             line_number = int(data["line"]) if data.get("line") else None
@@ -393,7 +491,11 @@ def parse_tool_issues(tool_name: str, text: str) -> list[dict]:
         seen.add(fingerprint)
         results.append(
             {
-                "stage": "lint" if "lint" in tool_name else "tool_execution",
+                "stage": (
+                    "lint" if "lint" in tool_name else
+                    "simulation" if tool_name in verilator_adapter.SIMULATION_TOOLS else
+                    "compile" if tool_name == "run_compile" else "tool_execution"
+                ),
                 "severity": severity,
                 "code": code,
                 "message": message,

@@ -57,6 +57,8 @@ from app.models.factory import provider_factory
 from app.services.conversation_service import conversation_service
 from app.services.orchestrator_service import orchestrator_service
 from app.domain.orchestration import TaskPlan
+from app.tools.adapters.base import EDAToolResult
+from fastapi.responses import Response
 from app.services.diagnostics_service import diagnostics_service
 from app.services.task_service import task_service
 from app.services.patch_service import patch_service
@@ -266,28 +268,52 @@ async def get_run_plans(run_id: str) -> list[TaskPlan]:
         raise HTTPException(status_code=404, detail="Run not found")
     if run.engine_version == "legacy":
         return []
-    checkpoint = orchestrator_service.hierarchical.repo.checkpoint(run_id)
-    return [TaskPlan.model_validate_json(checkpoint["plan_json"])] if checkpoint["plan_json"] else []
+    return orchestrator_service.hierarchical.repo.plans(run_id)
+
+
+@router.get("/runs/{run_id}/replans")
+async def get_run_replans(run_id: str) -> list[dict]:
+    run = run_service.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if run.engine_version == "legacy":
+        return []
+    return orchestrator_service.hierarchical.repo.replan_history(run_id)
 
 
 @router.get("/runs/{run_id}/tasks")
-async def get_run_tasks(run_id: str) -> list[dict]:
+async def get_run_tasks(run_id: str, include_history: bool = False) -> list[dict]:
     run = run_service.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     if run.engine_version == "legacy":
         return []
     repo = orchestrator_service.hierarchical.repo
-    return [
-        {
+    tasks = []
+    for state in repo.states(run_id).values():
+        item = {
             **state.model_dump(mode="json"),
-            "observations": repo.observations(state.task_id),
-            "reflections": repo.reflections(state.task_id),
-            "verifications": repo.verifications(state.task_id),
-            "artifacts": [item.artifact for item in repo.local_outputs(state.task_id, "verified")],
+            "observations": repo.observations(state.task_id, state.generation),
+            "reflections": repo.reflections(state.task_id, state.generation),
+            "verifications": repo.verifications(state.task_id, state.generation),
+            "artifacts": [item.artifact for item in repo.local_outputs(state.task_id, "verified", state.generation)],
         }
-        for state in repo.states(run_id).values()
-    ]
+        if include_history:
+            attempts = []
+            for attempt in repo.attempts(run_id, state.task_id):
+                generation = attempt["generation"]
+                attempts.append(attempt | {
+                    "input_bindings": repo.input_bindings(state.task_id, generation),
+                    "actions": repo.action_history(state.task_id, generation),
+                    "late_results": repo.late_results(state.task_id, generation),
+                    "observations": repo.observations(state.task_id, generation),
+                    "reflections": repo.reflections(state.task_id, generation),
+                    "verifications": repo.verifications(state.task_id, generation),
+                    "artifacts": repo.artifact_history(state.task_id, generation),
+                })
+            item["attempts"] = attempts
+        tasks.append(item)
+    return tasks
 
 
 @router.get("/runs/{run_id}/artifacts/{artifact_id}")
@@ -503,9 +529,13 @@ async def list_artifacts(workspace_id: str) -> list[ArtifactView]:
 # ToolRun / Issue：真实本地工具执行与逐条错误处理
 # ---------------------------------------------------------------------------
 @router.get("/tools", response_model=list[ToolDefinitionView])
-async def list_tools(role: AgentRole | None = Query(default=None)) -> list[ToolDefinitionView]:
+async def list_tools(
+    role: AgentRole | None = Query(default=None), task: bool = Query(default=False),
+) -> list[ToolDefinitionView]:
     """不传 role 返回诊断用全量目录；传 role 返回该角色实际可见 Tool。"""
-    return tool_registry.for_role(role) if role else tool_registry.list()
+    if task and role is None:
+        raise HTTPException(status_code=422, detail="role is required for the task tool catalog")
+    return tool_registry.for_role(role, task=task) if role else tool_registry.list()
 
 
 @router.post("/tool-runs", response_model=ToolRunView, status_code=status.HTTP_202_ACCEPTED)
@@ -533,6 +563,23 @@ async def list_tool_issues(run_id: str) -> list[EngineeringIssueView]:
     if tool_run_service.get(run_id) is None:
         raise HTTPException(status_code=404, detail="Tool run not found")
     return tool_run_service.issues(run_id)
+
+
+@router.get("/tool-runs/{run_id}/eda-result", response_model=EDAToolResult)
+async def get_eda_result(run_id: str) -> EDAToolResult:
+    result = tool_run_service.eda_result(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="EDA result not available")
+    return result
+
+
+@router.get("/tool-runs/{run_id}/artifacts/{name}")
+async def get_eda_artifact(run_id: str, name: str) -> Response:
+    try:
+        content = tool_run_service.eda_artifact(run_id, name)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="EDA artifact not found") from exc
+    return Response(content, media_type="application/octet-stream")
 
 
 @router.get("/tool-runs/{run_id}/issues/next", response_model=EngineeringIssueView | None)

@@ -16,7 +16,7 @@ from app.services.orchestrator_service import orchestrator_service
 from app.services.workspace_service import workspace_service
 from app.tools import builtin
 
-from test_hierarchical_run import ScriptedRuntime, SimulatedRestart, UART, request_for, rtl_plan, executor_factory
+from test_hierarchical_run import ReplanningRuntime, ScriptedRuntime, SimulatedRestart, UART, request_for, rtl_plan, executor_factory
 from test_task_contracts import task_node, upstream
 
 
@@ -115,6 +115,56 @@ def approve(run):
 
 
 @pytest.mark.asyncio
+async def test_replan_requires_fresh_approval_for_real_lint(executor_factory, monkeypatch):
+    executable = os.getenv("CHIP_AGENT_TEST_REAL_VERILATOR")
+    if not executable:
+        pytest.skip("set CHIP_AGENT_TEST_REAL_VERILATOR to run real EDA integration")
+    monkeypatch.setenv("CHIP_AGENT_VERILATOR_ENABLED", "1")
+    monkeypatch.setenv("CHIP_AGENT_VERILATOR_PATH", executable)
+    monkeypatch.setenv("CHIP_AGENT_REPLANNING_ENABLED", "1")
+
+    class LintReplanningRuntime(LintRuntime, ReplanningRuntime):
+        pass
+
+    def lint_with_snapshot(payload):
+        draft = lint_plan(payload)
+        final = draft["tasks"][0]
+        final["inputs"] = (*final["inputs"], upstream("design", "rtl_snapshot"))
+        return draft
+
+    agent = LintReplanningRuntime(invalidate="rtl_snapshot")
+    executor = executor_factory(agent)
+    executor.planner = GlobalPlannerService(propose=lint_with_snapshot)
+    initial, _ = await start_lint(executor)
+    first_approval = approve(initial)
+    await executor.resume(initial.run_id, first_approval)
+    for _ in range(300):
+        await executor.poll_external()
+        reported = executor.runs.get(initial.run_id)
+        if reported.status.value != "running":
+            break
+        await asyncio.sleep(0.02)
+    assert reported.status.value == "waiting_for_user" and reported.pending_user_request["kind"] == "artifact_invalidation", reported.result
+    [old_tool] = executor.repo.tool_run_ids(initial.run_id)
+    assert executor.runs.tools.get(old_tool).exit_code == 0
+
+    waiting = await executor.resume(initial.run_id, RunResumeRequest(action="approve", wait_id=reported.pending_user_request["wait_id"]))
+    assert waiting.status.value == "waiting_for_approval", waiting.result
+    assert waiting.pending_user_request["approval"]["generation"] == 2
+    assert waiting.pending_user_request["lint_target"]["snapshot_ref"] != initial.pending_user_request["lint_target"]["snapshot_ref"]
+    assert waiting.pending_user_request["lint_target"]["content_hash"] == initial.pending_user_request["lint_target"]["content_hash"]
+    assert executor.repo.tool_run_ids(initial.run_id) == [old_tool]
+    await executor.resume(initial.run_id, first_approval)
+    assert executor.repo.tool_run_ids(initial.run_id) == [old_tool]
+    await executor.resume(initial.run_id, RunResumeRequest(action="approve", wait_id=waiting.pending_user_request["wait_id"]))
+    result = await wait_for_terminal(executor, initial.run_id)
+    assert result.status.value == "completed", result.result
+    assert result.result["lint_tool_run_id"] != old_tool
+    assert executor.runs.tools.get(result.result["lint_tool_run_id"]).exit_code == 0
+    assert [entry["status"] for entry in executor.repo.replan_history(initial.run_id)] == ["applied"]
+
+
+@pytest.mark.asyncio
 async def test_approval_binds_snapshot_and_duplicate_resume_does_not_execute_twice(executor_factory, fake_verilator):
     executor = lint_executor(executor_factory)
     run, path = await start_lint(executor)
@@ -142,12 +192,16 @@ async def test_approval_binds_snapshot_and_duplicate_resume_does_not_execute_twi
 
 
 @pytest.mark.asyncio
-async def test_rejection_and_replaced_executable_never_dispatch(executor_factory, fake_verilator):
+async def test_rejection_and_replaced_executable_never_dispatch(executor_factory, fake_verilator, monkeypatch):
+    monkeypatch.setenv("CHIP_AGENT_REPLANNING_ENABLED", "1")
     executable, calls = fake_verilator
     executor = lint_executor(executor_factory)
     run, _ = await start_lint(executor)
+    executor.repo.db.execute("UPDATE orchestration_blobs SET content=? WHERE content_hash=?",
+                             (b"damaged input", run.pending_user_request["lint_target"]["content_hash"]))
     rejected = await executor.resume(run.run_id, approve(run).model_copy(update={"action": "reject"}))
     assert rejected.status.value == "failed" and "拒绝" in rejected.result["message"]
+    assert not executor.repo.replan_history(run.run_id)
     assert not calls and executor.repo.latest_tool_run_id(run.run_id) is None
 
     another, _ = await start_lint(executor)

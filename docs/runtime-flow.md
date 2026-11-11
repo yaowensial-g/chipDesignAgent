@@ -1,6 +1,6 @@
 # 运行逻辑说明
 
-> 当前对话主链为 Backend Message → ContextBuilder/RAG → Role Resolution → Intent Enricher → Permission Filter → Tool Selector → Primary Agent → Tool/Delegate → Observation。
+> 默认对话主链为 Backend Message → ContextBuilder/RAG → Role Resolution → Intent Enricher → Permission Filter → Tool Selector → Primary Agent → Tool/Delegate → Observation。分层 RTL 链路的增量重规划见第 30 节。
 
 ## 1. 启动
 
@@ -704,5 +704,32 @@ stateDiagram-v2
 | 运行中 ToolRun | 数据行可见 | 否 | 否 |
 | Patch Ready | 是 | 可批准/拒绝 | 是，但依赖目标未变化 |
 | 已应用 Patch | 是 | 不自动回滚 | 历史保留 |
+| 分层 RTL Run | 是 | 是 | 从活动计划、任务代次、动作和等待项恢复 |
 
 “可查询”“可继续”和“精确恢复”是三个不同能力。系统对专业对象提供持久化查询，并为等待用户的 DS、RTL 和 Tool 审批提供受控恢复；未纳入恢复协议的外部进程不能宣称精确接管。
+
+## 30. 分层 RTL 的增量重规划
+
+```mermaid
+flowchart TD
+    P[活动计划] --> E[调度可执行任务并绑定已验证输入]
+    E --> R[Local ReAct 和 Reflection]
+    R --> V[独立 Verifier]
+    V -->|通过| N[发布产物并继续调度]
+    V -->|可修正且有额度| R
+    V -->|局部修正耗尽| T[持久化全局重规划触发]
+    R -->|有证据的全局计划问题| T
+    R -->|确认上游产物失效| T
+    T --> B[核对权限与剩余预算]
+    B -->|允许| D[记账并请求 PlanDelta]
+    B -->|预算耗尽或无法继续| F[结束并保留诊断]
+    D -->|通过契约和 DAG 校验| S[原子切换计划并创建必要代次]
+    D -->|拒绝提案并记录原因| B
+    S --> P
+    N -->|还有任务| P
+    N -->|完成全局验收| C[发布最终报告]
+```
+
+需要用户确认 Artifact 失效时，`pending_user_request.kind` 为 `artifact_invalidation`。使用 `wait_id` 和 `approve` 或 `reject` 恢复，且可以通过 `client_request_id` 对同一决定去重。受影响的 Lint 重新绑定已验收的快照后会生成自己的 `tool_approval` 等待项。启用方式和预算配置见架构设计。[架构设计第 13 节](hierarchical-orchestration-design.md#13-串行-dag-的增量重规划)
+
+启动后先扫描持久化检查点。待处理触发优先于普通调度。中断的提案占用原预算，已应用的计划从活动版本继续。专业工具的已完成记录通过绑定的 ToolRun 对账，已领取但结果不明的执行结束并保留诊断。过期结果写入历史审计。任务的 Repair、Run 的动作与决策总量以及提案预算都由已持久化的记录计算。

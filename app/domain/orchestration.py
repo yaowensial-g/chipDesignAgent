@@ -82,6 +82,8 @@ class ExecutionPolicy(ContractModel):
 class RunExecutionPolicy(ContractModel):
     max_plan_tasks: int = Field(default=8, ge=1)
     max_replans: int = Field(default=2, ge=0)
+    max_run_actions: int = Field(default=192, ge=0)
+    max_run_decisions: int = Field(default=384, ge=1)
 
 
 class TaskContract(ContractModel):
@@ -109,6 +111,9 @@ class TaskPlan(ContractModel):
     created_at: AwareDatetime
     version: Positive
     status: Literal["active", "superseded", "closed"]
+    previous_plan_id: Key | None = None
+    change_reason: Text | None = None
+    affected_tasks: tuple[Key, ...] = ()
 
 
 class TaskPlanDraft(ContractModel):
@@ -131,6 +136,53 @@ class EvidenceRef(ContractModel):
     kind: Literal["artifact", "document_version", "chunk", "observation", "tool_run", "message"]
     ref_id: Key
     locator: Text | None = None
+
+
+class PlanIssue(ContractModel):
+    issue_type: Literal["missing_prerequisite", "invalid_dependency", "infeasible_path", "artifact_invalid"]
+    affected_task_ids: Annotated[tuple[Key, ...], Field(min_length=1, max_length=32)]
+    related_artifact_ids: Annotated[tuple[Key, ...], Field(max_length=32)] = ()
+    evidence: Annotated[tuple[EvidenceRef, ...], Field(min_length=1, max_length=32)]
+    reason: Text
+    suggested_change: Text
+
+
+class ReplanTrigger(ContractModel):
+    kind: Literal["repair_exhausted", "plan_issue", "artifact_invalid"]
+    task_id: Key
+    reason: Text
+    evidence: tuple[EvidenceRef, ...] = ()
+    issue: PlanIssue | None = None
+    invalidated_artifact_ids: tuple[Key, ...] = ()
+    required_reruns: tuple[Key, ...] = ()
+
+
+class AddedTask(ContractModel):
+    op: Literal["add_task"]
+    task: TaskContract
+
+
+class ReplacedTask(ContractModel):
+    op: Literal["replace_task"]
+    task: TaskContract
+
+
+class UpdatedDependencies(ContractModel):
+    op: Literal["update_dependencies"]
+    task_id: Key
+    depends_on: tuple[Key, ...]
+    inputs: tuple[InputSpec, ...] | None = None
+
+
+class TaskDeltaTarget(ContractModel):
+    op: Literal["remove_task", "rerun_task", "update_final_task"]
+    task_id: Key
+
+
+class PlanDelta(ContractModel):
+    operations: Annotated[tuple[Annotated[
+        AddedTask | ReplacedTask | UpdatedDependencies | TaskDeltaTarget, Field(discriminator="op")
+    ], ...], Field(min_length=1, max_length=32)]
 
 
 class Observation(ContractModel):
@@ -218,6 +270,7 @@ class TaskActionResult(ContractModel):
     professional_refs: tuple[ProfessionalRef, ...] = ()
     wait: ActionWaitRequest | None = None
     error_code: Key | None = None
+    plan_issue: PlanIssue | None = None
 
     @model_validator(mode="after")
     def check_outcome(self) -> "TaskActionResult":
@@ -347,6 +400,7 @@ class TaskActionContext(ContractModel):
     permitted_tools: tuple[Key, ...] = ()
     allowed_rtl_paths: tuple[str, ...] = ()
     lint_top_module: Key | None = None
+    eda_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     inputs: tuple[ArtifactPayload, ...] = ()
     action_count: Count = 0
 

@@ -9,7 +9,7 @@ from typing import Callable
 
 from app.agents.runtime import runtime
 from app.domain.enums import DelegationStatus, Mutability
-from app.domain.models import DelegationArtifactRef, ToolDefinitionView, ToolSelection
+from app.domain.models import DelegationArtifactRef, PatchCreateRequest, ToolDefinitionView, ToolSelection
 from app.domain.orchestration import (
     TASK_CONTROLS,
     ActionApproval,
@@ -32,6 +32,10 @@ from app.services.delegation_service import ALLOWED_EXPERTS, DelegationService, 
 from app.services.workspace_service import WorkspaceService, workspace_service
 from app.tools.registry import ToolRegistry, tool_registry
 from app.tools.builtin import check_lint_source, verilator_identity
+from app.tools.adapters.verilator_adapter import VERILATOR_TOOLS, SIMULATION_TOOLS, simulation_environment
+from app.tools.eda_catalog import EDA_INSPECT, EDA_TOOLS
+from app.tools.eda_inspection import coverage_summary, module_hierarchy, signal_references, signal_trace
+from app.tools.project_manifest import FrozenProject, read_project
 
 
 StageArtifact = Callable[[str, bytes, dict[str, str]], Artifact]
@@ -49,6 +53,8 @@ class TaskActionService:
         self.workspaces = workspaces
         self.delegations = delegations
         self.runtime = agent_runtime
+        self.tools = None
+        self.patches = None
 
     def authorize_task_action(
         self,
@@ -93,6 +99,12 @@ class TaskActionService:
             return self._failure("invalid_tool_arguments", "工具参数不符合要求。")
         if {"role", "workspace_id", "user_approved", "status", "approval"} & selection.arguments.keys():
             return self._failure("protected_tool_argument", "工具参数包含后端保留字段。")
+        if selection.name in EDA_TOOLS:
+            scoped_arguments = dict(selection.arguments)
+            if selection.name == "propose_eda_patch":
+                scoped_arguments.pop("after_content", None)
+            if scoped_arguments != context.eda_arguments.get(selection.name):
+                return self._failure("eda_scope_denied", "工程工具参数必须与本次用户请求一致。")
         if context.workspace_id:
             workspace = self.workspaces.get(context.workspace_id)
             if workspace is None or workspace.project_id != context.project_id:
@@ -118,11 +130,14 @@ class TaskActionService:
             if context.workspace_id is None:
                 return self._failure("workspace_required", "该工程工具需要 Workspace。")
             input_hash = None
-            if selection.name == "verilator_lint":
+            if selection.name == "verilator_lint" or selection.name in VERILATOR_TOOLS:
                 try:
-                    target, _ = self.lint_target(context, selection)
+                    target, _ = (
+                        self.lint_target(context, selection) if selection.name == "verilator_lint"
+                        else self.eda_target(context, selection)
+                    )
                 except (KeyError, ValueError) as exc:
-                    return self._failure("lint_scope_denied", str(exc))
+                    return self._failure("lint_scope_denied" if selection.name == "verilator_lint" else "eda_scope_denied", str(exc))
                 input_hash = hashlib.sha256(json.dumps(target, sort_keys=True).encode()).hexdigest()
             expected = ActionApproval(
                 **identity, workspace_id=context.workspace_id, tool_name=selection.name, input_hash=input_hash,
@@ -163,6 +178,139 @@ class TaskActionService:
             "relative_path": source, "top_module": context.lint_top_module, **identity,
         }, item.content
 
+    def eda_target(self, context: TaskActionContext, selection: ToolSelection) -> tuple[dict, FrozenProject]:
+        if context.contract.assigned_agent != context.primary_agent:
+            raise ValueError("外部 EDA 进程必须由主角色任务申请。")
+        source = self._eda_input(context, "project_manifest")
+        project = FrozenProject.model_validate_json(source.content)
+        identity = verilator_identity()
+        if identity is None:
+            raise ValueError("未找到可用的 Verilator。")
+        if selection.name in SIMULATION_TOOLS and any(
+            name not in project.manifest.testcases for name in selection.arguments["testcases"]
+        ):
+            raise ValueError("用例未在冻结的工程清单登记。")
+        if selection.name == "run_regression" and set(selection.arguments["testcases"]) != project.manifest.testcases.keys():
+            raise ValueError("完整回归必须显式选择清单中的全部用例。")
+        if selection.name == "run_impacted_tests":
+            target_path = source.artifact.metadata.get("patch_path")
+            if not target_path:
+                raise ValueError("影响分析需要已应用且匹配快照的 Patch。")
+            impacted = {
+                name for name, case in project.manifest.testcases.items()
+                if not case.depends_on or target_path in {*case.depends_on, *case.sources}
+            }
+            if set(selection.arguments["testcases"]) != impacted:
+                raise ValueError("选定用例与清单计算的受影响集合不一致。")
+        environment = simulation_environment(identity["executable"]) if selection.name in SIMULATION_TOOLS else None
+        return {
+            "snapshot_ref": source.artifact.artifact_id, "content_hash": project.input_hash,
+            "manifest_path": project.manifest_path, "top_module": project.manifest.top_module,
+            "arguments": selection.arguments, "simulation_environment": environment, **identity,
+        }, project
+
+    def _eda_input(self, context: TaskActionContext, kind: str) -> ArtifactPayload:
+        candidates = [item for item in context.inputs if item.artifact.artifact_type == kind]
+        if len(candidates) != 1:
+            raise ValueError(f"缺少已绑定的工程输入：{kind}")
+        return self._bound_input(context, candidates[0].artifact.artifact_id, kind)
+
+    def _inspect_eda(self, context: TaskActionContext, selection: ToolSelection, stage: StageArtifact) -> TaskActionResult:
+        name, arguments = selection.name, selection.arguments
+        evidence_id = None
+        if name == "get_project_manifest":
+            if context.workspace_id is None:
+                raise ValueError("工程清单读取需要 Workspace")
+            project = read_project(self.workspaces, context.workspace_id, context.project_id, arguments["manifest_path"])
+            metadata = {"input_hash": project.input_hash, "manifest_path": project.manifest_path}
+            if patch_id := arguments.get("applied_patch_id"):
+                if self.patches is None:
+                    raise ValueError("Patch evidence store is unavailable")
+                metadata.update({
+                    "patch_id": patch_id,
+                    "patch_path": self.patches.verify_applied_snapshot(patch_id, context.workspace_id, project.files),
+                })
+            payload = self._stage(
+                context, stage, "project_manifest", project.model_dump_json().encode("utf-8"),
+                metadata,
+            )
+            return self._observed(f"已冻结 {len(project.files)} 个工程输入文件。", payload)
+        if name in {"get_module_hierarchy", "find_signal_references"}:
+            source = self._eda_input(context, "project_manifest")
+            project = FrozenProject.model_validate_json(source.content)
+            data = module_hierarchy(project) if name == "get_module_hierarchy" else signal_references(project, arguments["signal"])
+        elif name == "propose_eda_patch":
+            return self._propose_eda_patch(context, arguments, stage)
+        else:
+            source = self._eda_input(context, "eda_result")
+            receipt = json.loads(source.content)
+            tool_run_id = receipt["tool_run_id"]
+            if self.tools is None:
+                raise ValueError("ToolRun evidence store is unavailable")
+            result = self.tools.eda_result(tool_run_id)
+            if result is None:
+                raise ValueError("Bound ToolRun has no EDA result")
+            if name == "parse_eda_log":
+                data = {"tool_run_id": tool_run_id, "status": result.status, "issues": result.issues[:200]}
+            elif name == "get_coverage_summary":
+                artifacts = {item["name"]: item for item in result.artifacts}
+                cases = [case["testcase"] for case in result.metrics.get("testcases", [])]
+                summaries = {}
+                for case in cases:
+                    filename = f"{case}.coverage.dat"
+                    if filename in artifacts:
+                        summaries[case] = coverage_summary(self.tools.eda_artifact(tool_run_id, filename))
+                data = {
+                    "tool_run_id": tool_run_id, "testcases": summaries,
+                    "missing_testcases": [case for case in cases if case not in summaries],
+                }
+            else:
+                filename = f"{arguments['testcase']}.vcd"
+                artifact = next((item for item in result.artifacts if item["name"] == filename), None)
+                data = {"tool_run_id": tool_run_id, "testcase": arguments["testcase"], "available": artifact is not None}
+                if artifact is not None:
+                    data["waveform"] = artifact
+                    if name == "analyze_signal_trace":
+                        data["trace"] = signal_trace(
+                            self.tools.eda_artifact(tool_run_id, filename), arguments["signal"],
+                            arguments.get("clock"), arguments.get("ready"),
+                        )
+                else:
+                    data["reason"] = "该次真实仿真没有可用的 VCD 波形。"
+        evidence_id = source.artifact.artifact_id
+        payload = self._stage(context, stage, name, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        return self._observed(f"已生成 {name} 工程证据。", payload, evidence_id)
+
+    def _propose_eda_patch(self, context: TaskActionContext, arguments: dict, stage: StageArtifact) -> TaskActionResult:
+        source = self._eda_input(context, "project_manifest")
+        receipt = self._eda_input(context, "eda_result")
+        proof = json.loads(receipt.content)
+        result = proof["result"]
+        target = arguments["target_path"]
+        project = FrozenProject.model_validate_json(source.content)
+        if result["status"] == "PASS":
+            artifact = self._stage(
+                context, stage, "propose_eda_patch", b'{"status":"not_required"}',
+            )
+            return self._observed("真实 EDA 已通过，无需候选 Patch。", artifact, receipt.artifact.artifact_id)
+        if (
+            self.patches is None or context.workspace_id is None or target not in project.manifest.sources
+            or target not in project.files or result["status"] != "FAIL"
+            or not any(issue.get("file") and issue.get("line") for issue in result["issues"])
+        ):
+            return self._failure("patch_evidence_missing", "候选 Patch 需要有源码位置的实际失败证据和冻结的目标 RTL。")
+        before = project.files[target].replace("\r\n", "\n")
+        after = arguments["after_content"]
+        if after.replace("\r\n", "\n") == before:
+            return self._failure("empty_patch", "候选 Patch 没有改变 RTL。")
+        patch = self.patches.create(PatchCreateRequest(
+            workspace_id=context.workspace_id, target_path=target, after_content=after,
+            reason=context.contract.goal,
+            sources=[f"ToolRun:{proof['tool_run_id']}", f"input:{project.input_hash}", f"artifact:{receipt.artifact.artifact_id}"],
+        ), expected_before=before)
+        artifact = self._stage(context, stage, "propose_eda_patch", patch.model_dump_json().encode("utf-8"))
+        return self._observed(f"已生成待审批 Patch {patch.patch_id}。", artifact, receipt.artifact.artifact_id)
+
     async def execute_task_action(
         self,
         context: TaskActionContext,
@@ -176,6 +324,8 @@ class TaskActionService:
             return self._failure("stale_action", "动作授权与当前任务不匹配。")
         name, args = action.selection.name, action.selection.arguments
         try:
+            if name in EDA_INSPECT:
+                return await asyncio.to_thread(self._inspect_eda, context, action.selection, stage)
             if name == "read_rtl_source":
                 content = await asyncio.to_thread(
                     self.workspaces.read_rtl_source, context.workspace_id, context.project_id, args["relative_path"],
@@ -194,7 +344,8 @@ class TaskActionService:
                 )
                 return TaskActionResult(outcome="waiting_for_user", summary=wait.message, wait=wait)
             if name == "report_task_failure":
-                return self._failure("task_failure_reported", args["reason"])
+                return TaskActionResult(outcome="failed", summary=args["reason"], error_code="task_failure_reported",
+                                        plan_issue=args.get("plan_issue"))
             if name == "submit_task_output":
                 return self._submit(context, args, stage)
         except FileNotFoundError:
@@ -223,6 +374,30 @@ class TaskActionService:
             if self._local_candidate(context, item.artifact) and item.artifact.output_key in keys
         }
         for key, text in text_outputs.items():
+            if context.eda_arguments:
+                entries = []
+                for item in context.inputs:
+                    if item.artifact.artifact_type == "propose_eda_patch":
+                        patch = json.loads(item.content)
+                        if patch.get("patch_id"):
+                            entries.append(
+                                f"- 待审核 Patch {patch['patch_id']} · {patch['target_path']} · [artifact:{item.artifact.artifact_id}]"
+                            )
+                    if item.artifact.artifact_type == "project_manifest" and item.artifact.metadata.get("patch_id"):
+                        entries.append(
+                            f"- 已应用 Patch {item.artifact.metadata['patch_id']} · "
+                            f"{item.artifact.metadata['patch_path']} · [artifact:{item.artifact.artifact_id}]"
+                        )
+                    if item.artifact.artifact_type == "eda_result" and item.artifact.status == "verified":
+                        receipt = json.loads(item.content)
+                        result = receipt["result"]
+                        entries.append(
+                            f"- {result['tool_name']} **{result['status']}** · {result['tool_version']} · "
+                            f"ToolRun {receipt['tool_run_id']} · SHA-256 {result['input_hash']} · "
+                            f"[artifact:{item.artifact.artifact_id}]"
+                        )
+                if entries:
+                    text += "\n\n## 实际 EDA 执行记录\n\n" + "\n".join(entries)
             candidate = self._stage_output(context, stage, outputs[key], text.encode("utf-8"), {})
             candidates[key] = candidate.artifact.artifact_id
         return TaskActionResult(

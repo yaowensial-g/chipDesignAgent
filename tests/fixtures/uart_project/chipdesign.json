@@ -1,0 +1,8 @@
+{
+  "top_module": "uart_top",
+  "filelists": ["rtl.f"],
+  "testcases": {
+    "uart_pass": {"top_module": "uart_pass", "sources": ["dv/uart_pass.sv"]},
+    "uart_fail": {"top_module": "uart_fail", "sources": ["dv/uart_fail.sv"]}
+  }
+}

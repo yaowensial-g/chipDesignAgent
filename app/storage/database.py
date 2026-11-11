@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.storage.orchestration_schema import SCHEMA as ORCHESTRATION_SCHEMA
+from app.storage.orchestration_schema import SCHEMA as ORCHESTRATION_SCHEMA, migrate_replanning
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -410,6 +410,8 @@ class Database:
         """
         with self._lock, self.connect() as connection:
             connection.executescript(schema + ORCHESTRATION_SCHEMA)
+            connection.execute("BEGIN IMMEDIATE")
+            migrate_replanning(connection)
             # 兼容已有本地数据库：CREATE TABLE IF NOT EXISTS 不会为旧表增加新列，
             # 因而必须检查 PRAGMA 后再执行最小迁移。
             issue_columns = {

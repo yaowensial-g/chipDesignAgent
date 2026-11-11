@@ -16,6 +16,7 @@ from pathlib import Path
 from app.domain.enums import AgentRole, Mutability
 from app.services.workspace_service import workspace_service
 from app.tools.registry import tool_registry
+from app.tools.adapters.verilator_adapter import LINT_FLAGS
 
 
 def verilator_enabled() -> bool:
@@ -79,7 +80,7 @@ def check_lint_source(content: bytes) -> None:
 
 
 def run_verilator_lint(executable: str, files: list[str], cwd: Path, top_module: str) -> tuple[list[str], int, str, str]:
-    command = [executable, "--lint-only", "-Wall", *files]
+    command = [executable, *LINT_FLAGS, *files]
     if top_module:
         command.extend(["--top-module", top_module])
     try:

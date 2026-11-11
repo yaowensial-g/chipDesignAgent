@@ -23,10 +23,12 @@ class PatchService:
         self.workspaces = workspaces
         self.db = db
 
-    def create(self, request: PatchCreateRequest) -> PatchView:
+    def create(self, request: PatchCreateRequest, *, expected_before: str | None = None) -> PatchView:
         """读取目标当前内容，生成 Diff，并以 ``patch_ready`` 状态落库。"""
         target = self.workspaces.resolve_path(request.workspace_id, request.target_path)
         before = target.read_text(encoding="utf-8") if target.exists() else ""
+        if expected_before is not None and before != expected_before:
+            raise ValueError("Target changed after the EDA snapshot was frozen")
         diff = "".join(
             difflib.unified_diff(
                 before.splitlines(keepends=True),
@@ -70,6 +72,19 @@ class PatchService:
             created_at=row["created_at"],
             applied_at=row["applied_at"],
         )
+
+    def verify_applied_snapshot(self, patch_id: str, workspace_id: str, files: dict[str, str]) -> str:
+        """Return the approved target only if the frozen source contains the applied patch."""
+        row = self.db.fetch_one(
+            "SELECT workspace_id, target_path, status, after_content FROM patches WHERE patch_id=?", (patch_id,),
+        )
+        if not row or row["workspace_id"] != workspace_id or row["status"] != "applied":
+            raise ValueError("The Patch must already be applied in this Workspace")
+        path = row["target_path"].replace("\\", "/")
+        actual = files.get(path)
+        if actual is None or actual.replace("\r\n", "\n") != row["after_content"].replace("\r\n", "\n"):
+            raise ValueError("Frozen source does not match the approved Patch")
+        return path
 
     def decide(self, patch_id: str, decision: PatchDecisionRequest) -> PatchView:
         """处理 approve/reject/custom 三种人工决定。

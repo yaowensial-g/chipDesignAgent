@@ -106,7 +106,9 @@ class WorkspaceService:
         temporary.replace(target)
         return target
 
-    def read_rtl_source(self, workspace_id: str, project_id: str, relative_path: str) -> bytes:
+    def read_rtl_source(
+        self, workspace_id: str, project_id: str, relative_path: str, *, byte_limit: int = MAX_RTL_SOURCE_BYTES,
+    ) -> bytes:
         workspace = self.get(workspace_id)
         if workspace is None:
             raise KeyError(workspace_id)
@@ -125,8 +127,8 @@ class WorkspaceService:
         if not target.is_file():
             raise FileNotFoundError("RTL source is unavailable")
         with target.open("rb") as source:
-            content = source.read(MAX_RTL_SOURCE_BYTES + 1)
-        if not content or len(content) > MAX_RTL_SOURCE_BYTES or b"\0" in content:
+            content = source.read(byte_limit + 1)
+        if not content or len(content) > byte_limit or b"\0" in content:
             raise ValueError("RTL source is empty, oversized, or binary")
         content.decode("utf-8")
         return content

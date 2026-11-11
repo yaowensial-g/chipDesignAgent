@@ -10,6 +10,8 @@ from app.domain.orchestration import (
     RTLVerificationAssessment, TaskContract, VerificationResult,
 )
 from app.services.tool_run_service import ToolRunService
+from app.tools.eda_catalog import EDA_INSPECT
+from app.tools.project_manifest import FrozenProject
 
 
 class TaskVerifierService:
@@ -70,6 +72,38 @@ class TaskVerifierService:
         if not item.content or ref.byte_size != len(item.content) or digest != ref.object_key or digest != item.artifact.content_hash:
             raise ValueError("Content does not match recorded reference")
 
+    def confirms_invalidation(
+        self, item: ArtifactPayload, producer_inputs: tuple[ArtifactPayload, ...],
+        sibling_outputs: tuple[ArtifactPayload, ...],
+    ) -> bool:
+        """Independently recheck the original evidence and deterministic acceptance rules."""
+        try:
+            self._check_content(item)
+        except ValueError:
+            return True
+        kind = item.artifact.artifact_type
+        if kind == "rtl_snapshot":
+            try:
+                self._snapshot(item)
+            except (ValueError, KeyError):
+                return True
+            return False
+        try:
+            snapshots = {
+                source.artifact.artifact_id: self._snapshot(source)
+                for source in (*producer_inputs, *sibling_outputs)
+                if source.artifact.artifact_type == "rtl_snapshot" and kind in {"design_analysis", "verification_assessment", "lint_result"}
+            }
+        except (ValueError, KeyError):
+            return False
+        try:
+            self._check_type(item, snapshots, producer_inputs)
+        except ValueError:
+            return True
+        except KeyError:
+            return False
+        return False
+
     def _snapshot(self, item: ArtifactPayload) -> RTLSourceSnapshot:
         self._check_content(item)
         artifact = item.artifact
@@ -91,12 +125,31 @@ class TaskVerifierService:
             report = item.content.decode("utf-8")
             if not report.strip() or any(
                 f"[artifact:{source.artifact.artifact_id}]" not in report
-                for source in inputs if source.artifact.artifact_type in {"design_analysis", "verification_assessment", "lint_result"}
+                for source in inputs if source.artifact.artifact_type in {
+                    "design_analysis", "verification_assessment", "lint_result", "project_manifest", "eda_result", *EDA_INSPECT,
+                }
             ):
                 raise ValueError("Report is empty or misses required citations")
             return
         if artifact_type == "lint_result":
             self._check_lint(item, snapshots)
+            return
+        if artifact_type == "project_manifest":
+            project = FrozenProject.model_validate_json(item.content)
+            if not project.files or any(
+                sha256(text.encode()).hexdigest() != project.hashes.get(path) for path, text in project.files.items()
+            ):
+                raise ValueError("Invalid frozen project contents")
+            return
+        if artifact_type == "eda_result":
+            self._check_eda(item, inputs)
+            return
+        if artifact_type in EDA_INSPECT:
+            if not isinstance(json.loads(item.content), dict) or not any(
+                ref.ref_id == source.artifact.artifact_id
+                for ref in item.artifact.evidence for source in inputs
+            ):
+                raise ValueError("Missing bound project evidence")
             return
         if artifact_type == "design_analysis":
             findings = RTLDesignAnalysis.model_validate_json(item.content).findings
@@ -114,7 +167,7 @@ class TaskVerifierService:
         if self.tools is None:
             raise ValueError("ToolRun evidence cannot be resolved")
         proof = LintResult.model_validate_json(item.content)
-        link = self.tools.frozen_lint_link(item.artifact.source_action_id)
+        link = self.tools.frozen_tool_link(item.artifact.source_action_id)
         tool = self.tools.get(proof.tool_run_id)
         snapshot = snapshots.get(proof.snapshot_ref)
         if link is None or tool is None or snapshot is None:
@@ -132,3 +185,29 @@ class TaskVerifierService:
             or proof.stderr_hash != sha256(tool.stderr.encode()).hexdigest()
         ):
             raise ValueError("Real Lint evidence failed verification")
+
+    def _check_eda(self, item: ArtifactPayload, inputs: tuple[ArtifactPayload, ...]) -> None:
+        proof = json.loads(item.content)
+        link = self.tools.frozen_tool_link(item.artifact.source_action_id) if self.tools else None
+        project = next((source for source in inputs if source.artifact.artifact_type == "project_manifest"), None)
+        if link is None or project is None or proof.get("tool_run_id") != link["tool_run_id"]:
+            raise ValueError("Missing approved EDA provenance")
+        target = json.loads(link["target_json"])
+        tool = self.tools.get(link["tool_run_id"])
+        result = self.tools.eda_result(link["tool_run_id"])
+        expected = {"PASS": ToolRunStatus.COMPLETED, "FAIL": ToolRunStatus.FAILED, "ERROR": ToolRunStatus.FAILED,
+                    "TIMEOUT": ToolRunStatus.TIMED_OUT}
+        if (
+            tool is None or result is None or result.model_dump(mode="json") != proof.get("result")
+            or expected[result.status] != tool.status or tool.tool_name != result.tool_name
+            or tool.arguments != target["arguments"]
+            or project.artifact.artifact_id != target["snapshot_ref"]
+            or result.input_hash != FrozenProject.model_validate_json(project.content).input_hash
+            or result.input_hash != target["content_hash"] or result.tool_version != target["version"]
+            or (result.status == "PASS" and (result.exit_code != 0 or not result.commands))
+        ):
+            raise ValueError("EDA receipt does not match the actual ToolRun")
+        for artifact in result.artifacts:
+            raw = self.tools.eda_artifact(link["tool_run_id"], artifact["name"])
+            if sha256(raw).hexdigest() != artifact["sha256"]:
+                raise ValueError("EDA artifact digest mismatch")

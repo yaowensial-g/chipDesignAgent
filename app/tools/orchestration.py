@@ -175,6 +175,11 @@ def register_orchestration_tools() -> None:
     ]
 
     # Python 模块可能在测试或热加载场景被重复导入，因此按名称跳过已注册项。
+    from app.domain.orchestration import EvidenceRef, PlanIssue
+
+    plan_issue = PlanIssue.model_json_schema()
+    plan_issue.pop("$defs", None)
+    plan_issue["properties"]["evidence"]["items"] = EvidenceRef.model_json_schema()
     roles = [AgentRole.DESIGN, AgentRole.VERIFICATION]
     for name, description, properties, required, capability, allowed_roles in (
         ("submit_task_output", "提交本任务的候选交付件供验收",
@@ -187,7 +192,8 @@ def register_orchestration_tools() -> None:
          },
          ["output_keys"], "compose_report", roles),
         ("report_task_failure", "报告无法继续执行的原因",
-         {"reason": {"type": "string", "minLength": 1, "maxLength": 4000}}, ["reason"], None, roles),
+         {"reason": {"type": "string", "minLength": 1, "maxLength": 4000}, "plan_issue": plan_issue},
+         ["reason"], None, roles),
         ("analyze_rtl_design", "依据绑定的 RTL 快照分析设计并引用源码行",
          {"snapshot_ref": {"type": "string", "minLength": 1}}, ["snapshot_ref"], "rtl_design_analysis", [AgentRole.DESIGN]),
         ("assess_rtl_verification", "依据已验收的源码快照和设计分析评估验证影响",
