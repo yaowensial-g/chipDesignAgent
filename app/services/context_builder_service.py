@@ -7,6 +7,8 @@ import json
 from dataclasses import dataclass
 from uuid import uuid4
 
+from app.domain.design_config import ProjectDesignConfig
+
 from app.domain.models import (
     ChatHistoryMessage,
     ChatRequest,
@@ -16,6 +18,7 @@ from app.domain.models import (
     RetrievalRequest,
 )
 from app.config.model_settings import model_settings_service
+from app.services.config_service import config_context
 from app.services.document_service import DocumentService, document_service
 from app.services.conversation_summary_service import (
     ConversationSummaryService,
@@ -39,6 +42,7 @@ class ContextBuildResult:
     memory_ids: list[str]
     chunk_ids: list[str]
     memory_context: list[dict]
+    project_config: dict
     estimated_tokens: int
     sections: dict[str, object]
     summary: dict[str, object]
@@ -56,6 +60,7 @@ class ContextBudgetConfig:
     long_term_memory: int = 2_000
     documents: int = 12_000
     output_reserve: int = 3_000
+    project_config: int = 2_500
 
 
 class ContextBuilderService:
@@ -91,6 +96,7 @@ class ContextBuilderService:
         *,
         before_sequence: int | None = None,
         pinned_version_ids: tuple[str, ...] = (),
+        project_config: ProjectDesignConfig | None = None,
     ) -> ContextBuildResult:
         # 首次上传仍兼容旧前端：入库后下轮只需项目/模块和查询，不必再次传整篇正文。
         for document in request.documents:
@@ -144,6 +150,16 @@ class ContextBuilderService:
             )
         remaining = self.token_budget - fixed_tokens
         excluded: list[dict[str, object]] = []
+        config, omitted_config_items = {}, 0
+        if project_config is not None:
+            if project_config.project_id != request.project_id:
+                raise ValueError("Project configuration scope mismatch")
+            config, omitted_config_items = config_context(
+                project_config, request.module_name, request.message, self.tokens,
+                min(self.budget.project_config, remaining),
+            )
+        config_tokens = self.tokens.count(self.db.dumps(config)) if config else 0
+        remaining -= config_tokens
 
         history: list[ChatHistoryMessage] = []
         selected_messages = []
@@ -238,7 +254,6 @@ class ContextBuilderService:
             request.project_id,
             request.module_name,
             request.message,
-            limit=30,
             agent_role=agent_role,
         )
         selected_memories = []
@@ -265,11 +280,6 @@ class ContextBuilderService:
                 "memory_id": memory.memory_id,
                 "kind": memory.kind,
                 "content": memory.content,
-                "confidence": memory.confidence,
-                "authority": memory.authority,
-                "sources": memory.source_refs,
-                "retrieval_score": memory.retrieval_score,
-                "selection_reason": memory.selection_reason,
             }
             for memory in selected_memories
         ]
@@ -325,11 +335,13 @@ class ContextBuilderService:
             for chunk in selected_chunks
         ]
 
-        estimated = fixed_tokens + history_tokens + memory_tokens + document_tokens
+        estimated = fixed_tokens + config_tokens + history_tokens + memory_tokens + document_tokens
         if estimated > self.token_budget:
             raise RuntimeError("ContextBuilder produced an over-budget context")
         effective = request.model_copy(update={"history": history, "documents": documents})
         sections = {
+            "project_config": {"revision": config.get("revision"), "tokens": config_tokens,
+                               "omitted_items": omitted_config_items},
             "history": {
                 "items": len(history),
                 "tokens": history_tokens,
@@ -387,6 +399,7 @@ class ContextBuilderService:
             "turn_summary_ids": turn_summary_ids,
             "raw_turn_ids": raw_turn_ids,
             "memory_ids": [memory.memory_id for memory in selected_memories],
+            "project_config": config,
             "chunk_ids": [chunk.chunk_id for chunk in selected_chunks],
         }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
         return ContextBuildResult(
@@ -397,6 +410,7 @@ class ContextBuilderService:
             memory_ids=[memory.memory_id for memory in selected_memories],
             chunk_ids=[chunk.chunk_id for chunk in selected_chunks],
             memory_context=memory_context,
+            project_config=config,
             estimated_tokens=estimated,
             sections=sections,
             summary={

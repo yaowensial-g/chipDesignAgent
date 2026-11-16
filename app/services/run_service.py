@@ -189,18 +189,18 @@ class RunService:
         return self.get(run_id)  # type: ignore[return-value]
 
     async def execute_ds_tool(
-        self, run_id: str, request: ChatRequest
+        self, run_id: str, request: ChatRequest, *, project_config: dict | None = None,
     ) -> tuple[RunView, TaskView | None, str]:
         """将顶层 Run 切为 DS 类型，并复用既有 DS Workflow。"""
         self._set_run_type(run_id, RunType.DS_DESIGN)
-        return await self._start_ds(run_id, request)
+        return await self._start_ds(run_id, request, project_config=project_config)
 
     def execute_rtl_tool(
-        self, run_id: str, request: ChatRequest
+        self, run_id: str, request: ChatRequest, *, project_config: dict | None = None,
     ) -> tuple[RunView, None, str]:
         """将顶层 Run 切为 RTL 类型，并生成等待审批的 Candidate Patch。"""
         self._set_run_type(run_id, RunType.RTL_IMPLEMENTATION)
-        return self._start_rtl(run_id, request)
+        return self._start_rtl(run_id, request, project_config=project_config)
 
     def execute_engineering_tool(
         self,
@@ -233,7 +233,7 @@ class RunService:
         return self.get(run_id)  # type: ignore[return-value]
 
     async def _start_ds(
-        self, run_id: str, request: ChatRequest
+        self, run_id: str, request: ChatRequest, *, project_config: dict | None = None,
     ) -> tuple[RunView, TaskView | None, str]:
         """校验 DS 前置资料、创建专业 Task，并把状态映射回统一 Run。"""
         # AS 是 DS 的设计基线。缺少时保留 Run 并等待用户，而不是让模型猜架构。
@@ -257,7 +257,8 @@ class RunService:
                 custom_reviewers=request.custom_reviewers,
                 max_discussion_rounds=request.max_discussion_rounds,
                 instruction=request.message,
-            )
+            ),
+            project_config=project_config,
         )
         status = self._task_status(task)
         result = {"task": task.model_dump(mode="json")}
@@ -283,7 +284,7 @@ class RunService:
         return self.get(run_id), task, message  # type: ignore[return-value]
 
     def _start_rtl(
-        self, run_id: str, request: ChatRequest
+        self, run_id: str, request: ChatRequest, *, project_config: dict | None = None,
     ) -> tuple[RunView, None, str]:
         """校验已确认 DS，生成 RTL Candidate，并停在人工 Diff 审批点。"""
         if not request.ds_markdown:
@@ -306,7 +307,8 @@ class RunService:
                 ds_markdown=request.ds_markdown,
                 documents=request.documents,
                 instruction=request.message,
-            )
+            ),
+            project_config=project_config,
         )
         result = candidate.model_dump(mode="json")
         self._update(

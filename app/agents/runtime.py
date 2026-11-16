@@ -565,6 +565,11 @@ class LLMChipDesignRuntime:
             "instruction": request.get("instruction") or request.get("message", ""),
             "documents": documents,
             "history": request.get("history", []),
+            "project_configuration": request.get("_project_config", {}),
+            "project_configuration_guidance": (
+                "项目配置是当前目标规格，优先于长期记忆。pending 表示尚无实现证据。"
+                "如果配置与 RTL 或验证结果冲突，指出差异并依据工程证据处理。"
+            ) if request.get("_project_config") else "",
             "long_term_memory": request.get("_memory_context", []),
             "context_manifest": request.get("_context_manifest", {}),
         }

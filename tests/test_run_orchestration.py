@@ -4,6 +4,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.orchestrator_service import orchestrator_service
 from app.skills import skill_catalog
 
 
@@ -92,7 +93,16 @@ def test_tool_catalog_exposes_planning_metadata() -> None:
     assert tools["verilator_lint"]["enabled"] is False
 
 
-def test_rtl_chat_creates_reviewable_patch_run() -> None:
+def test_rtl_chat_creates_reviewable_patch_run(monkeypatch) -> None:
+    enqueued = []
+
+    def enqueue(**kwargs):
+        run = orchestrator_service.runs.get(kwargs["run_id"])
+        messages = orchestrator_service.sessions.run_messages(run.session_id, run.run_id, "design")
+        enqueued.append((run.status.value, messages))
+        raise RuntimeError("injected enqueue failure")
+
+    monkeypatch.setattr(orchestrator_service.memory_extractor, "enqueue_run", enqueue)
     body = _chat(
         "根据已经确认的 DS 生成 RTL",
         ds_markdown="# scheduler DS\n已确认。",
@@ -102,6 +112,7 @@ def test_rtl_chat_creates_reviewable_patch_run() -> None:
     run = response.json()["run"]
     assert run["run_type"] == "rtl_implementation"
     assert run["status"] == "waiting_for_approval"
+    assert not enqueued
     assert run["patch_id"]
     workspace_root = Path(run["result"]["workspace"]["root_path"])
     assert not (workspace_root / "rtl" / "scheduler.sv").exists()
@@ -113,6 +124,22 @@ def test_rtl_chat_creates_reviewable_patch_run() -> None:
     assert approved.status_code == 200
     assert approved.json()["status"] == "completed"
     assert (workspace_root / "rtl" / "scheduler.sv").exists()
+    [(status, messages)] = enqueued
+    assert status == "completed"
+    assert [message.message_type for message in messages] == ["chat", "chat", "run_decision", "run_status"]
+    assert messages[-1].role == "assistant"
+
+
+def test_completed_chat_enqueues_after_both_messages_are_persisted(monkeypatch) -> None:
+    enqueued = []
+    monkeypatch.setattr(orchestrator_service.memory_extractor, "enqueue_run", lambda **kwargs: enqueued.append(kwargs))
+    response = client.post("/api/v1/chat", json=_chat("解释 ready/valid 握手"))
+    assert response.status_code == 200
+    run = response.json()["run"]
+    [event] = enqueued
+    assert event["run_id"] == run["run_id"]
+    messages = orchestrator_service.sessions.run_messages(run["session_id"], run["run_id"], event["agent_role"])
+    assert [message.role for message in messages] == ["user", "assistant"]
 
 
 def test_lint_chat_uses_mock_function_without_external_environment() -> None:

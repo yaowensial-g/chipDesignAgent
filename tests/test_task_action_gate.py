@@ -112,9 +112,8 @@ async def test_uart_uses_real_source_bytes_and_verified_upstream_inputs(uart):
         }
 
     memories = SimpleNamespace(retrieve=lambda *args, **kwargs: [])
-    extractor = SimpleNamespace(extract_from_event=lambda **kwargs: None)
     service = TaskActionService(
-        workspaces=workspaces, delegations=DelegationService(db, memories, extractor),
+        workspaces=workspaces, delegations=DelegationService(db, memories),
         agent_runtime=SimpleNamespace(analyze_rtl_design=analyze, assess_rtl_verification=assess),
     )
     read = await dispatch(service, context, "read_rtl_source", {"relative_path": "rtl/uart.sv"}, stored)

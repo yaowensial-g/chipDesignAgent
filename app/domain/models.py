@@ -347,7 +347,7 @@ class MemoryCreateRequest(BaseModel):
     module_name: str | None = None
     scope: str = "module"
     memory_key: str | None = Field(default=None, max_length=240)
-    kind: Literal["fact", "decision", "assumption", "inference", "question", "preference", "experience"]
+    kind: Literal["semantic", "fact", "decision", "assumption", "inference", "question", "preference", "experience"]
     content: str = Field(min_length=1)
     confidence: int = Field(default=5, ge=1, le=10)
     importance: int = Field(default=5, ge=1, le=10)
@@ -370,6 +370,8 @@ class MemoryCreateRequest(BaseModel):
         ]
         if self.status == "active" and self.kind in {"fact", "decision"} and not traceable_sources:
             raise ValueError("active fact/decision requires at least one source")
+        if self.status == "active" and self.kind == "semantic" and not traceable_sources:
+            raise ValueError("active semantic memory requires at least one source")
         if self.visibility == "role_private" and not self.owner_agent_role:
             raise ValueError("role_private memory requires owner_agent_role")
         return self

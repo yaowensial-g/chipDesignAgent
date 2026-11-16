@@ -20,10 +20,6 @@ from app.domain.models import (
 )
 from app.services.workspace_service import utc_now
 from app.services.memory_service import MemoryService, memory_service
-from app.services.memory_extractor_service import (
-    MemoryExtractorService,
-    memory_extractor_service,
-)
 from app.storage.database import Database, database
 
 
@@ -49,11 +45,9 @@ class DelegationService:
         self,
         db: Database = database,
         memories: MemoryService = memory_service,
-        memory_extractor: MemoryExtractorService = memory_extractor_service,
     ) -> None:
         self.db = db
         self.memories = memories
-        self.memory_extractor = memory_extractor
 
     async def delegate(
         self,
@@ -149,15 +143,6 @@ class DelegationService:
                     task_id,
                 ),
             )
-            # 专家建议只能形成 proposed 候选，不能直接修改 active 项目事实。
-            self.memory_extractor.extract_from_event(
-                source_type="delegation",
-                source_id=task_id,
-                project_id=request_payload["project_id"],
-                module_name=request_payload.get("module_name"),
-                agent_role=to_agent.value,
-                content=conclusion,
-            )
         except TimeoutError:
             self._fail(task_id, DelegationStatus.TIMED_OUT, "Expert delegation timed out")
         except Exception as exc:
@@ -221,7 +206,6 @@ class DelegationService:
             request_payload["project_id"],
             request_payload["module_name"],
             delegation.instruction,
-            limit=6,
             agent_role=delegation.to_agent.value,
             shared_only=True,
         )

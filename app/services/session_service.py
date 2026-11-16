@@ -352,6 +352,24 @@ class SessionService:
         )
         return self._message_from_row(row) if row else None
 
+    def attach_message_to_run(self, message_id: str, run_id: str) -> None:
+        self.db.execute(
+            """UPDATE conversation_messages SET run_id = ? WHERE message_id = ?
+            AND run_id IS NULL AND session_id = (SELECT session_id FROM runs WHERE run_id = ?)""",
+            (run_id, message_id, run_id),
+        )
+
+    def run_messages(
+        self, session_id: str, run_id: str, agent_role: str,
+    ) -> list[ConversationMessageView]:
+        rows = self.db.fetch_all(
+            """SELECT * FROM conversation_messages WHERE session_id = ? AND run_id = ?
+            AND (agent_role IS NULL OR agent_role = ?) AND delegation_task_id IS NULL
+            AND role IN ('user', 'assistant') ORDER BY sequence""",
+            (session_id, run_id, agent_role),
+        )
+        return [self._message_from_row(row) for row in rows]
+
     def messages(
         self, session_id: str, *, before: int | None = None, limit: int = 50
     ) -> ConversationMessagesPage:

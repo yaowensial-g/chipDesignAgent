@@ -19,7 +19,7 @@
 |---|---|---|---|
 | L0 当前执行状态 | 当前请求、Run、Observation、审批状态 | `runs`、`run_events` | 否，属于执行现场 |
 | L1 短期上下文 | 最近 5 轮完整原文、较早 30 轮独立摘要 | `conversation_messages`、`conversation_turn_summaries` | 否，摘要是派生数据 |
-| L2 长期记忆 | 项目事实、决策、假设、经验 | `memories`、`memory_sources`、`memory_relations` | 只有满足生命周期与来源规则的 active 项才可作为事实使用 |
+| L2 长期记忆 | 稳定偏好、长期约定、设计理由、经验证的经验 | `memories`、`memory_sources`、`memory_relations` | 供后续任务参考，参数与工程状态由权威工程数据提供 |
 | L3 原始证据 | FS/AS/ICD、RTL、Artifact、日志 | `document_versions`、`document_chunks`、Workspace | 是证据，但仍需考虑版本和状态 |
 
 这里最重要的约束是：**持久化不等于可信，进入 Prompt 也不等于成为正式事实。**
@@ -32,8 +32,11 @@
 | 上下文选择和预算 | [`context_builder_service.py`](../app/services/context_builder_service.py) | `ContextBuilderService.build()`、`save_manifest()` |
 | 会话消息、轮次与角色可见性 | [`session_service.py`](../app/services/session_service.py) | `add_message()`、`completed_turns()`、`get_turn()` |
 | 独立轮次摘要 | [`conversation_summary_service.py`](../app/services/conversation_summary_service.py) | `enqueue_turn()`、`summarize_turn()`、`get_recent_turn_summaries()`、`retry_failed_summaries()` |
-| 长期记忆治理 | [`memory_service.py`](../app/services/memory_service.py) | `create()`、`promote()`、`retrieve()`、`invalidate_sources()` |
-| 自动候选提取 | [`memory_extractor_service.py`](../app/services/memory_extractor_service.py) | `extract_from_message()`、`extract_from_event()` |
+| 项目配置 | [ConfigService](../app/services/config_service.py) | `get_config()`、`apply_updates()`、`run_config()` |
+| 配置提取与完成检查 | [ConfigExtractorService](../app/services/config_extractor_service.py)、[ConfigCompletionService](../app/services/config_completion_service.py) | `prepare()`、`complete()` |
+| 长期记忆治理 | [`memory_service.py`](../app/services/memory_service.py) | `save_semantic_memory()`、`retrieve()`、`create()`、`promote()`、`invalidate_sources()` |
+| Run 级异步提取 | [`memory_extractor_service.py`](../app/services/memory_extractor_service.py) | `enqueue_run()`、`retry_runs()`、`run_background()` |
+| Run 提取上下文 | [`memory_extraction_context.py`](../app/services/memory_extraction_context.py) | `MemoryExtractionContextBuilder.build()` |
 | 文档版本与检索 | [`document_service.py`](../app/services/document_service.py) | `ingest()`、`retrieve()` |
 | Delegate 上下文隔离 | [`delegation_service.py`](../app/services/delegation_service.py) | `_scoped_context()` |
 | 数据模型 | [`models.py`](../app/domain/models.py) | `ConversationTurnSummaryView`、`MemoryView`、`ContextManifestView` |
@@ -60,16 +63,15 @@ sequenceDiagram
     O->>S: resolve session/role
     O->>S: add_message(current user message)
     S->>DB: 原子写消息、sequence、会话计数
-    O->>E: extract_from_message
-    E->>DB: 可选写 proposed/needs_review + extraction event
-    O->>C: build(session, role, current_message_id)
+    O->>DB: 校验并写入增量配置
+    O->>C: build(session, role, current_message_id, project_config)
     C->>D: 入库本轮携带的文档
     C->>S: 读取完整轮次，不含当前消息
     C->>Q: 读取较早轮次 completed 摘要
     C->>M: 检索 active Memory
     C->>D: 检索 active Document Chunk
     C-->>O: effective_request + selection metadata
-    O->>DB: 创建 Run
+    O->>DB: 创建 Run 并关联 User 消息
     O->>C: save_manifest(run_id)
     O->>R: 发送实际上下文
     R-->>O: Agent/Tool 结果
@@ -77,7 +79,13 @@ sequenceDiagram
     O-->>Q: 非阻塞 enqueue_turn
     Q->>S: 后台只读取本轮 User + Assistant
     Q->>DB: 幂等保存独立摘要
-    O->>E: completed Run 可触发候选提取
+    O->>DB: 按固定配置版本检查实际实现，保存最终配置快照
+    O->>E: completed Run 调用 enqueue_run
+    E->>DB: 幂等写入 pending 事件
+    O-->>U: 返回 ChatResponse
+    E->>DB: 后台认领事件、读取本 Run 上下文
+    E->>M: 校验并应用 ADD 或 UPDATE
+    M->>DB: 语义记忆与事件完成原子提交
 ```
 
 当前用户消息先被持久化，但 `ContextBuilderService.build()` 通过 `exclude_message_id` 将它从历史中排除，因为它会继续以 `request.message` 发送给模型。这样数据库保留完整审计记录，Prompt 又不会重复出现同一句话。
@@ -122,7 +130,7 @@ sequenceDiagram
 |---|---|
 | `project_id` / `module_name` / `scope` | 项目和模块作用域 |
 | `memory_key` | 稳定语义键，例如 `uart.clock_frequency`；冲突检测依赖它 |
-| `kind` | `fact`、`decision`、`assumption`、`inference`、`question`、`preference`、`experience` |
+| `kind` | 自动提取统一使用 `semantic`。旧类型继续可读 |
 | `content` | 可注入模型的记忆正文 |
 | `confidence` | 1–10，参与检索排序 |
 | `importance` | 1–10；高重要性的事实/决策可成为关键约束 |
@@ -131,13 +139,13 @@ sequenceDiagram
 | `owner_agent_role` | 私有记忆的所属角色 |
 | `status` | 生命周期状态 |
 | `review_reason` | 冲突、部分来源失效等复核原因 |
-| `extraction_key` | 自动提取项的唯一幂等键 |
+| `extraction_key` | 兼容旧候选接口的可选幂等键。新流程的键存在事件表 |
 
 `memory_sources` 不删除历史证据，而是用 `status=active/invalidated`、`invalidated_at` 和 `invalidation_reason` 表达来源是否仍有效。
 
 ### 4.3 提取事件和 Context Manifest
 
-`memory_extraction_events` 以 `source_type:source_id` 为 `extraction_key`，记录 `processing/completed/failed`、尝试次数、生成的 Memory ID 和错误。它解决两个问题：同一事件重复投递不会产生重复记忆；Provider 故障后可以观察并安全重试。
+`memory_extraction_events` 以 `run:<run_id>` 幂等，包含 `pending`、`processing`、`completed`、`failed`、尝试次数、记忆 ID 和错误。既有 `error` 列记录上一次失败，`updated_at` 用于判断租约及重试时间。
 
 `context_manifests` 保存一次模型调用实际选中的证据集合，而不是仅保存配置。主要内容包括：
 
@@ -252,66 +260,32 @@ ContextBuilder 只注入 completed 摘要，并以原始 sequence 排序：
 
 若对应轮次没有 completed 摘要，则该轮 User 和 Assistant 原文一起回退。摘要与其来源原文不会同时注入。摘要、回退原文和最近原文都作为完整单元参与预算；放不下时整轮排除，并在 Manifest 的 `excluded` 中记录原因。
 
-## 7. 长期记忆如何形成
+## 7. Run 级长期记忆提取
 
-### 7.1 每条新消息由模型一次性判断
+### 7.1 完成触发与恢复
 
-`MemoryExtractorService.extract_from_message()` 不再用关键词或时钟正则预筛选。每条尚未完成提取审计的新消息都会进行一次结构化模型调用，由模型判断当前消息是否明确新增、确认或修订了值得跨会话保留的信息。纯提问、闲聊、讨论中的建议和未确认设想应返回空数组；空结果仍将审计事件标为 completed，表示该消息已经判断过。
+Legacy 聊天和 Resume 在最终 Assistant 消息持久化之后投递。Legacy 异步工具的统一 Run 由 `GET /runs/{id}` 同步终态后投递。分层执行器在终态和最终回复提交后调用完成回调，覆盖初始聊天、Resume 和后台执行。文档换版继续负责 RAG 和来源失效，专家结果经由父 Run 进入提取上下文。
 
-当前接入的事件包括：
+`enqueue_run()` 校验 Run 已完成、作用域匹配、已持久化关联回复，再写入 `pending` 事件并尝试投递。进程内用 `ThreadPoolExecutor`、`BoundedSemaphore` 和 scheduled 集合限制并发与队列。默认上限为 2 个 Worker、32 个任务槽位。队满时由应用启动后的周期扫描补投。失败事件可通过再次 enqueue 立即重试，后台扫描在 1 分钟后重试。超过 15 分钟未写回的 `processing` 事件可重新认领。
 
-| 事件 | 调用位置 | 来源类型 |
-|---|---|---|
-| 所有新用户消息 | `OrchestratorService._handle()` | `conversation_message` |
-| 所有 Run 决策消息 | `routes.resume_run()` 先保存为用户决策消息 | `conversation_message` |
-| 完成的 Run | `OrchestratorService.handle()` 或恢复接口 | `run` |
-| 新文档版本提交成功 | `DocumentService.ingest()` | `document_version` |
-| Delegate 成功结束 | `DelegationService.delegate()` | `delegation` |
+Worker 通过 SQLite 条件更新认领事件并增加 `attempts`。保存时再次验证尝试次数，过期 Worker 的结果无法覆盖新一次尝试。一次模型调用和最终提交之间若进程中断，恢复可能重新调用模型。记忆写入与事件的 `completed` 状态在同一事务提交，提交失败时整批回滚。空结果也记为 `completed`，完成的事件跳过模型调用。
 
-### 7.2 有限上下文和结构化模型提取
+### 7.2 提取上下文与输出
 
-消息调用会提供当前消息、项目、模块、角色，以及最多 6 条当前角色可见前文和最多 6 条相关 active Memory。前文总预算约 1,200 Token，单条前文最多 320 Token，单条旧记忆最多 240 Token。当前消息通过 `exclude_message_id` 从前文中排除，避免正文重复。
+- 会话通过 `run_id`、会话 ID 和主角色精确关联。包含原始请求、最终回复、恢复消息和决策动作。旧 Run 的原始请求可从 `runs.user_instruction` 读取。
+- 执行证据包括有引用的 Observation、真实工具状态和有限指标、独立验收结果、已验证制品的元数据和专家建议。提取上下文排除 Planner 和 Reflection 的内部推理、原始日志及原始 Tool Call。
+- `ConfigService.run_config(run_id, final=True)` 返回本轮最终配置快照。Worker 优先读取完成检查后的快照，并在配置区保留 revision。完整配置仅在后端用于精确重复检查，模型最多读取 1,500 Token 的当前模块投影。
+- 相关记忆按项目、模块和角色检索，默认 Top-K 为 5。内容过长的记忆不作为模型可更新的完整目标。候选记忆只携带 ID 和正文。
 
-前文和旧记忆只用于理解指代、识别修订并复用稳定 `memory_key`，不能单独成为候选依据。例如“那就用第二种，深度改成 32”可以结合前文确定讨论对象，但候选值 32 必须来自当前消息。模型可以为“UART 时钟为 50 MHz，FIFO 深度设为 32，复位低有效”返回三个独立候选；“UART 时钟为 50 MHz 可以吗？”应返回空候选。
+提取 Prompt 保留稳定偏好、长期约定、设计理由与有工具或独立验证证据的经验。项目参数与权威工程数据、临时假设、普通日志和一次性指令应当跳过。输出为 `{"memories":[...]}`，每项为 `add` 加正文，或 `update` 加本轮提供的目标 ID 与更新后完整正文。没有长期价值时数组为空。
 
-Run 的 `accept_assumption` 同样走消息提取，但 Prompt 明确限制只能形成 assumption；入库前还有确定性防线，会把模型误报的 fact/decision 强制降级为 assumption。模型只负责候选字段，不能直接执行 SQL、激活记忆或替代旧事实。在模型不可用的受控运行模式下事件以空候选完成；模型调用或解析实际抛错时标为 failed 并保留错误。
+`generate_memories(prompt, payload)` 通过现有 Provider 执行结构化提取。生产实例只使用已启用的 DeepSeek 主模型，地址必须为 `https://api.deepseek.com`。端点不可用时事件记录可重试错误。测试以本地替身覆盖输出验证及完整入库流程。
 
-### 7.3 去重与幂等
+### 7.3 语义记忆写入
 
-第一层是事件幂等：
+`MemoryService.save_semantic_memory()` 从已完成的来源 Run 校验 project、module 和角色。新记录使用 `kind=semantic`、`status=active`、`scope=module`、`visibility=role_private`，owner 为 Run 主角色。兼容列使用固定值。
 
-```text
-conversation_message:<message_id>
-document_version:<version_id>
-run:<run_id>
-delegation:<task_id>
-```
-
-完成事件再次执行时直接返回之前关联的 Memory。
-
-第二层是单批确定性去重。模型 Prompt 先要求同一工程属性只输出一个稳定的小写点分 `memory_key`，但后端不信任模型一定做到：`MemoryExtractorService._deduplicate_candidates()` 会规范化 key 和正文，对完全相同的 `(key, kind, content)` 只保留第一条，并吸收重复项中更高的 confidence 和 importance。相同 key 的不同值、不同 kind 或不同工程属性会继续保留，避免把冲突和独立约束误合并。
-
-第三层是候选幂等。每个候选根据事件 key、kind、规范化 `memory_key` 和规范化正文计算 SHA-256 `extraction_key`，不再包含候选序号；数据库对非空 `extraction_key` 建唯一索引。即使失败重试时模型调换了候选顺序，也会命中原候选。
-
-第四层是跨事件逻辑去重。`MemoryService.create_or_merge_candidate()` 在写事务内查询相同项目、模块、scope、visibility（角色私有项还要求 owner 相同）的 `proposed`、`needs_review` 和 `active` Memory：
-
-- 规范化 key、kind 和规范化正文都相同：复用原 Memory ID，只追加经过来源校验的新 source；
-- 规范化 key 相同但正文不同：保留两条候选，并将新候选及已有 proposed 候选标为 `needs_review`，已有 active 不降级；
-- 正文相同但 kind 不同，或工程属性不同：不合并，也不凭内容相似判冲突；
-- 重复候选不会覆盖首次记录的正文、状态、authority、confidence 或 importance。
-
-key 规范化使用 Unicode NFKC、大小写折叠以及 `-`、`_`、`.` 分隔符统一；正文规范化消除空白、普通标点和少量安全的中文表述差异，同时保留否定词、数字、单位、小数点及数值正负号。首版刻意不引入模糊匹配、向量库、Schema 迁移或额外 LLM 调用。
-
-### 7.4 自动候选永远不是 active
-
-自动提取统一使用：
-
-- `status=proposed`；
-- 会话消息来源使用 `authority=user_event`；
-- 文档、Run、Delegate 等来源初始使用 `authority=agent`；
-- `visibility=project_shared`。
-
-如果相同作用域、相同 `memory_key` 已有内容不同的 active Memory，新候选会被确定性地改为 `needs_review`，并写入冲突原因。
+ADD 在相同项目、模块、角色内比较正文的 NFKC 和空白规范化结果。完全重复的 active 记忆保留原正文和 ID，只追加来源。UPDATE 要求目标在送给模型的记忆集合内，且仍为同角色、同模块 active 语义记忆，正文与更新时间需匹配读取时的版本。正文变化后，旧引用标为 `semantic_content_updated`，历史引用可审计，同时追加当前 Run。非法或已变化的更新目标跳过。
 
 ## 8. 来源校验、激活和冲突处理
 
@@ -334,12 +308,12 @@ key 规范化使用 Unicode NFKC、大小写折叠以及 `-`、`_`、`.` 分隔�
 
 ### 8.2 创建和提升
 
-公共 API 创建时只允许请求 `proposed` 或 `active`。其中 active 的 `fact/decision` 至少需要一个可追溯来源。`needs_review/stale/superseded/rejected` 由生命周期规则产生，调用方不能任意指定。
+公共 API 创建时只允许请求 `proposed` 或 `active`。active 的 `semantic`、`fact` 和 `decision` 至少需要一个可追溯来源。`needs_review/stale/superseded/rejected` 由生命周期规则产生，调用方不能任意指定。
 
-推荐路径是：
+显式候选的兼容路径为
 
 ```text
-高价值事件 → proposed/needs_review
+POST /memories → proposed/needs_review
 → 人工或正式工作流确认
 → POST /memories/{id}/promote
 → 校验新来源
@@ -352,7 +326,7 @@ key 规范化使用 Unicode NFKC、大小写折叠以及 `-`、`_`、`.` 分隔�
 
 ```mermaid
 stateDiagram-v2
-    [*] --> proposed: 自动提取或显式候选
+    [*] --> proposed: API 显式候选
     proposed --> needs_review: 同 memory_key 与 active 内容冲突
     proposed --> active: 有效来源确认并 promote
     needs_review --> active: 人工选择新结论并 promote
@@ -436,7 +410,7 @@ uart.clock_frequency = UART clock 为 100 MHz (active)
 - 只返回 `status='active'`；
 - 普通主 Agent 可看 `project_shared` 和属于自己的 `role_private`；
 - Delegate 使用 `shared_only=True`，只能看 `project_shared`；
-- active 的 fact/decision 至少仍有一个 active source。
+- active 的 semantic、fact 和 decision 至少仍有一个 active 来源。
 
 这一步发生在排序前，模型无法通过 Prompt 请求绕过。
 
@@ -465,7 +439,7 @@ score = lexical × 0.55
 - 普通候选要求 `lexical >= 0.04`；
 - `importance >= 9` 且类型为 fact/decision 的项目约束可跳过词法阈值，标为 `critical_constraint`。
 
-排序顺序是：关键约束优先，然后按得分、重要性和更新时间降序。返回数量最多 30 条；ContextBuilder 再进行 Token 预算选择。因此 `limit=8` 不会用无关记忆强行填满八条。
+关键约束优先，其余按得分、重要性和更新时间降序。默认返回最多 5 条，显式 limit 的上限为 30。ContextBuilder 随后应用 Token 预算。
 
 ## 11. ContextBuilder 的输入和输出
 
@@ -499,6 +473,7 @@ score = lexical × 0.55
 | 当前请求与 Run | 3,000 | 至少预留 3,000；请求更长时按请求估算增加 |
 | 最近 5 轮原文 | 6,000 | User/Assistant 以完整轮次原子选择 |
 | 较早 30 轮 | 6,000 | completed 摘要；未完成时使用完整原文回退 |
+| 项目配置 | 2,500 | 先分配，按项选择，记录 revision 和省略数量 |
 | 长期记忆 | 2,000 | 普通 Memory 上限；关键约束可借用剩余预算 |
 | 文档 | 12,000 | 当前字段是规划参考值；代码实际使用最后的全部剩余预算 |
 | 输出预留 | 3,000 | 至少 3,000；默认配置会参考模型 `max_output_tokens`，最高按 8,000 预留 |
@@ -551,14 +526,7 @@ Builder 严格按下面顺序消费预算：
 
 ### 11.5 Memory 选择
 
-Builder 调用 `MemoryService.retrieve(..., limit=30, agent_role=current_role)`。普通 Memory 共享约 2,000 Token 区；`selection_reason=critical_constraint` 的项可借用当前剩余预算。写入 Runtime 的 `_memory_context` 包含：
-
-- Memory ID、类型和正文；
-- confidence 和 authority；
-- 完整来源引用及来源状态；
-- retrieval score 和 selection reason。
-
-这样 Agent 可以引用约束，调试界面也能解释它为什么被选中。
+Builder 按当前角色检索最多 5 条。普通 Memory 共享 2,000 Token 区，旧版关键约束可使用总预算中的剩余额度。`_memory_context` 只包含 Memory ID、类型和正文。分数与选择原因写入 Manifest。
 
 ### 11.6 文档选择
 
@@ -641,46 +609,25 @@ GET /api/v1/contexts/{context_id}
 }
 ```
 
-Delegate 调用 `MemoryService.retrieve(..., shared_only=True, limit=6)`，因此：
+Delegate 调用 `MemoryService.retrieve(..., shared_only=True)`，使用默认 Top-K。
 
 - 不取得主 Agent 历史；
 - 不取得任何 `role_private` Memory；
 - 只能看到与 instruction 相关的 active 共享约束；
 - 专家结论返回主 Agent 作为 Observation；
-- 专家结论只能触发 proposed Memory，不能直接成为 active 项目事实。
+- 完成的专家建议由父 Run 提取器结合工程证据判断。
 
 主 Agent 始终保留控制权，没有 Handoff。
 
 ## 14. 三个完整例子
 
-### 14.1 用户确认时钟约束
+### 14.1 保存稳定验证偏好
 
-用户在 Design 会话输入：
+用户要求今后的 FIFO 设计始终评估峰值吞吐量。Run 完成后，提取器可保存该偏好，来源为当前 Run。已有同正文记忆时复用 Memory ID，将当前 Run 追加为有效来源。
 
-```text
-UART clock = 100 MHz，后续设计按照这个约束执行。
-```
+### 14.2 更新设计理由
 
-执行过程：
-
-1. 消息写入 `conversation_messages`；
-2. 在消息 ID 幂等检查通过后调用一次结构化提取模型；
-3. 模型判断当前消息已确认时钟约束并生成 `uart.clock_frequency` 候选；
-4. 写入 proposed Memory，来源是该消息；
-5. 同一消息重试通过 extraction event 返回原 Memory；
-6. 用户/工作流用 `user_confirmation` 来源调用 promote；
-7. 来源校验确认 ID 对应 user 消息；
-8. Memory 变为 active；
-9. 新会话查询 UART clock 时通过相关性或关键约束规则被检索。
-
-### 14.2 时钟从 100 MHz 变为 125 MHz
-
-1. 100 MHz 是 active，key 为 `uart.clock_frequency`；
-2. 新的 125 MHz 候选与同 key active 内容不同；
-3. 候选自动进入 needs_review；
-4. promote 125 MHz 时，在一个事务中激活新值、supersede 旧值、写关系；
-5. 默认检索只返回 125 MHz；
-6. 100 MHz 和它的来源仍可用于历史审计。
+下一次 Run 的验证表明应覆盖持续背压，并说明原有吞吐量评估在该条件下的缺口。若旧记忆在本轮相关记忆中，模型可提交 UPDATE。后端检查作用域和版本，保留失效的旧引用并登记本次执行来源。FIFO 深度等参数以工程数据为准。
 
 ### 14.3 AS v1 被 AS v2 替代
 
@@ -741,7 +688,9 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 
 `Database._initialize()` 使用 `CREATE TABLE IF NOT EXISTS` 和 `PRAGMA table_info` + 条件 `ALTER TABLE ADD COLUMN` 做增量迁移。重复启动不会重复添加字段，旧数据不会被删除。
 
-本轮轮次摘要迁移包括：
+本次改造增加 `idx_conversation_run` 和 `run_design_config(run_id, input_json, final_json)`。前者用于查找 Run 对话，后者保存输入和最终配置快照。旧 Run 在该表没有快照，原表、原字段、历史记忆和工程文件继续保留。
+
+此前的轮次摘要迁移包括
 
 - 为 `conversation_messages` 增加可空 `turn_id`，不改写旧正文；
 - 新建 `conversation_turn_summaries`，并对 `turn_id` 建唯一约束；
@@ -752,51 +701,16 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 `Database.transaction()` 使用进程内可重入锁和 SQLite `BEGIN IMMEDIATE`。当前需要原子性的关键操作包括：
 
 - 写消息并更新会话索引；
-- 创建/提升 Memory 和处理冲突；
+- 保存 Run 语义记忆与提取事件完成；
+- 创建/提升旧候选和处理冲突；
 - 来源级失效；
 - 文档换版、分块和来源失效。
 
 复杂生产迁移未来应迁到 Alembic 等正式工具；当前手写迁移只适合向后兼容的新增表、字段和索引。
 
-## 17. 测试如何证明这些行为
+## 17. 回归测试
 
-[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 覆盖二十五个关键场景：
-
-| 测试 | 验证内容 |
-|---|---|
-| `test_context_uses_five_raw_turns_and_thirty_independent_summaries` | 40 轮识别、最近 5 轮原文、较早 30 轮独立摘要和当前消息排除 |
-| `test_role_summaries_are_isolated_but_shared_fact_is_visible` | Design/Verification 摘要隔离与共享 active 事实 |
-| `test_constraint_extraction_promotion_and_cross_session_retrieval` | 模型候选入库、消息来源、调用幂等、promote 和跨会话检索 |
-| `test_message_model_handles_non_keyword_and_multiple_constraints` | 无关键词 FIFO 约束进入模型，以及单消息多候选 |
-| `test_question_reaches_model_but_empty_result_writes_no_memory` | 疑问消息经过判断但空结果不写 Memory |
-| `test_non_message_event_reuses_model_candidate_path` | 文档等非消息事件继续复用可选上下文的模型候选接口 |
-| `test_message_context_is_role_filtered_and_supports_reference_resolution` | 角色可见前文、当前消息排除、active Memory 和指代修订 |
-| `test_temporary_assumption_approval_cannot_become_fact` | 临时假设批准无法按 fact/decision 入库 |
-| `test_candidate_batch_exact_duplicates_create_one_memory` | 单批完全重复候选只入库一次，并保留更高评分 |
-| `test_candidate_batch_normalizes_memory_key_variants` | 点号、下划线、连字符等 key 变体可确定性去重 |
-| `test_candidate_batch_normalizes_safe_chinese_expression_variants` | 安全的中文表述差异不会产生重复 Memory |
-| `test_candidate_batch_keeps_different_engineering_attributes` | 不同工程属性不会因同句出现而误合并 |
-| `test_candidate_batch_conflicting_values_require_review` | 同 key 不同值保留并同时进入复核 |
-| `test_cross_event_duplicate_merges_sources_without_overwriting_memory` | 跨事件重复项复用 ID、追加来源且不覆盖既有字段 |
-| `test_failed_event_retry_is_order_independent` | 部分失败后调换候选顺序重试仍保持幂等 |
-| `test_cross_event_dedup_respects_role_private_owner` | role_private 候选按 owner 隔离，不跨角色合并 |
-| `test_conflicting_confirmed_constraint_supersedes_old_fact` | needs_review、原子替代和默认只返回新事实 |
-| `test_document_upgrade_invalidates_only_affected_source_and_is_atomic` | 来源级失效、独立来源保活和事务回滚 |
-| `test_delegate_receives_shared_memory_but_not_private_history` | Delegate 无历史、只接收共享 Memory |
-| `test_failed_or_missing_turn_summaries_fall_back_to_complete_raw_turns` | failed/未生成摘要回退完整原文，不丢信息或拆半轮 |
-| `test_turn_summary_is_idempotent_and_background_queue_uses_worker` | turn_id Upsert 幂等和后台 Worker 投递 |
-| `test_turn_summary_hard_limit_uses_compression_before_save` | 超过 500 Token 先压缩再保存 |
-| `test_turn_budget_never_splits_user_and_assistant_and_manifest_traces_turns` | 预算原子选择和 Manifest 轮次追溯 |
-| `test_memory_extraction_failure_is_audited_and_retry_is_idempotent` | 提取失败审计、重试和候选幂等 |
-| `test_schema_migration_is_repeatable_and_legacy_summary_is_not_trusted` | 增量迁移可重复、旧混合摘要不进入新上下文 |
-
-修改本子系统后至少应运行：
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests\test_context_memory.py tests\test_context_memory_v2.py -q
-```
-
-涉及编排、Delegate 或 API 时应再运行全量测试。
+[`tests/test_context_memory_v2.py`](../tests/test_context_memory_v2.py) 使用隔离 SQLite 测试 Run 上下文、提取 Prompt、模型异常、批量回滚、幂等认领、排队恢复和来源管理，也覆盖旧记忆的显式治理、角色隔离、摘要和预算。[Legacy 路由测试](../tests/test_run_orchestration.py) 和 [Hierarchical 路由测试](../tests/test_hierarchical_run.py) 验证完成后投递及最终回复持久化。
 
 ## 18. 调试指南
 
@@ -817,7 +731,7 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 1. Memory 是否 active；
 2. project/module 是否匹配；
 3. visibility 和 owner role 是否允许；
-4. fact/decision 是否至少还有一个 active source；
+4. semantic、fact 和 decision 是否至少还有一个 active 来源；
 5. 普通记忆是否达到 0.04 词法阈值；
 6. 是否在 ContextBuilder 的 Memory Token 区被排除；
 7. Manifest 中是否有该 ID、分数或排除原因。
@@ -855,5 +769,72 @@ GET /api/v1/memories?project_id=soc-a&module_name=uart&status=needs_review
 后续扩展时应保持三条不变量：
 
 - 原始消息和证据不因摘要或替代而被物理删除；
-- 模型只能提出候选，不能绕过来源和状态机直接写 active 事实；
+- 语义记忆由后端验证来源和作用域后入库，工程数据负责当前设计状态；
 - 每次进入模型的实际上下文必须可通过 Manifest 解释。
+
+## 20. 项目配置与端到端验证
+
+### 20.1 配置位置与读取接口
+
+配置文件的实际位置为 `<WorkspaceView.root_path>/.chipflow/design-config.json`。默认 Workspace 位于 `data/workspaces/<项目目录>-<Workspace ID 前缀>/`。第一次成功写入使用指定的同项目 Workspace，或者项目已有的最早 Workspace。没有已登记的 Workspace 时，服务按现有规则创建。后续请求通过项目登记和文件作用域找到同一份配置。每个项目有一份权威配置，各模块与实例独立保存同名参数。
+
+`ConfigService.get_config(project_id, module_name=None, workspace_id=None)` 读取当前配置。`get_pending_items(project_id, module_name)` 查询待实现项。`run_config(run_id, final=True)` 返回该 Run 的最终配置快照，也可通过 `final=False` 获取执行输入。示例文件如下。
+
+```json
+{
+  "project_id": "chip001",
+  "workspace_id": "workspace-id",
+  "revision": 3,
+  "modules": {
+    "uart_rx": {
+      "parameters": {
+        "fifo_depth": {
+          "config_item_id": "item-id",
+          "value": 64,
+          "revision": 2,
+          "status": "pending",
+          "source_message_id": "message-id",
+          "source_evidence": "把 FIFO 深度改为64",
+          "evidence_refs": [],
+          "history": []
+        }
+      },
+      "instances": {}
+    }
+  }
+}
+```
+
+ConfigService 在 SQLite `BEGIN IMMEDIATE` 内串行应用文件增量，通过同目录临时文件原子替换。每批有效目标变更增加一次项目 revision，每个改值项增加自身 revision、保存旧版本与来源、重新进入 pending。实现状态使用同一配置项 revision。相同值跳过写入，独立配置项的并发写入可以合并，过期的同项写入被拒绝。普通 Workspace 工具写入受管目录会被拒绝。
+
+### 20.2 Run 与状态证据
+
+Legacy 和 Hierarchical 在创建上下文前运行相同的配置提取方法。当前请求是唯一的配置变更证据，最近 3 个完整可见轮次和已有配置用于消解指代。后端校验 Pydantic 输出、用户原文出处和模块范围。模型失败或补丁冲突时继续使用已提交配置。Resume 使用原 Run 固定的目标规格，并在完成时执行同一终态处理。
+
+ContextBuilder 固定当前模块配置版本，先分配独立预算，并在 Manifest 的 `sections.project_config` 记录 revision、Token 和省略数量。Agent 判断实际工程状态时可以对照 RTL 和工具结果识别目标与实现的偏差。
+
+`ConfigCompletionService` 可从本轮已应用的 Patch 或已验收的 RTL 或工程快照核对模块级整数常量声明。证据须与当前 Workspace 内容以及本轮配置项 revision 匹配。当前检查覆盖简单模块参数。实例覆盖和复杂表达式须等待可验证的展开或专项证据。
+
+要标记 `verified`，在已批准的 EDA 清单用例上登记具体覆盖目标，并在测试台实际断言对应要求。以下片段位于 `testcases.<name>` 下。
+
+```json
+{
+  "top_module": "uart_pass",
+  "sources": ["dv/uart_pass.sv"],
+  "depends_on": ["rtl/uart_top.sv"],
+  "config_checks": [{"module": "uart_top", "parameter": "fifo_depth", "value": 64}]
+}
+```
+
+只有绑定到本轮有效快照的相应用例实际通过，且匹配的模块参数已实现，才记录工具证据并推进到 verified。未覆盖该要求的仿真和 Lint 不推进 verified。其后 Memory Worker 读取该 Run 的最终快照，在保存前跳过可识别的重复配置陈述。
+
+### 20.3 开发环境复现
+
+在安装项目开发依赖的工作区运行以下命令。第一条执行 Legacy 和 Hierarchical 聊天、Legacy Patch Resume、分层 EDA 审批恢复、并发改值和异步记忆入库测试。第二条运行完整回归。
+
+```powershell
+python -m pytest -q tests/test_design_config.py tests/test_eda_project.py tests/test_context_memory_v2.py
+python -m pytest -q
+```
+
+测试使用临时 SQLite 与 Workspace、结构化模型替身和 EDA 适配器替身。生产部署通过现有模型设置启用 DeepSeek，并填入有效 Key 和 Base URL `https://api.deepseek.com`。两条提取链路固定使用该地址，专用 HTTP Client 禁用重定向和环境代理。现有工程项目配置的读取和确定性完成检查可以独立运行。

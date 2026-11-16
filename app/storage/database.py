@@ -174,6 +174,11 @@ class Database:
             created_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES runs(run_id)
         );
+        CREATE TABLE IF NOT EXISTS run_design_config (
+            run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+            input_json TEXT NOT NULL,
+            final_json TEXT
+        );
         -- Conversation 只保存会话索引信息；正文放在 conversation_messages，避免
         -- 列表页为了展示标题而扫描大段历史消息。
         CREATE TABLE IF NOT EXISTS conversations (
@@ -523,6 +528,9 @@ class Database:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversation_turn ON conversation_messages(session_id, turn_id, sequence)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_conversation_run ON conversation_messages(run_id, session_id, sequence)"
             )
             connection.commit()
 

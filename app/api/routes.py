@@ -70,7 +70,6 @@ from app.services.session_service import session_service
 from app.services.delegation_service import delegation_service
 from app.services.document_service import document_service
 from app.services.memory_service import memory_service
-from app.services.memory_extractor_service import memory_extractor_service
 from app.services.context_builder_service import context_builder_service
 from app.services.conversation_summary_service import conversation_summary_service
 from app.tools.registry import tool_registry
@@ -167,7 +166,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     try:
         return await conversation_service.handle(request)
     except ValueError as exc:
-        if request.orchestration_mode or str(exc) == "Conversation belongs to a different project":
+        if request.orchestration_mode or str(exc) in {"Conversation belongs to a different project", "Project Workspace is unavailable"}:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
@@ -180,7 +179,7 @@ async def send_conversation_message(session_id: str, request: ChatRequest) -> Ch
             request.model_copy(update={"session_id": session_id})
         )
     except ValueError as exc:
-        if request.orchestration_mode or str(exc) == "Conversation belongs to a different project":
+        if request.orchestration_mode or str(exc) in {"Conversation belongs to a different project", "Project Workspace is unavailable"}:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise
 
@@ -234,6 +233,8 @@ async def get_run(run_id: str) -> RunView:
     run = run_service.get(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if run.engine_version == "legacy" and run.tool_run_id:
+        orchestrator_service.complete_run(run)
     return run
 
 
@@ -368,6 +369,7 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
         if existing is None:
             raise KeyError(run_id)
         if existing.engine_version == "hierarchical":
+            # 分层执行器先提交终态和最终回复，再通过完成回调投递。
             return await orchestrator_service.hierarchical.resume(run_id, request)
         updated = await run_service.resume(run_id, request)
         # Run 决策也是对话的一部分。若只由前端临时追加，页面刷新后“真实架构结论”
@@ -390,27 +392,6 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             run_id=run_id,
             metadata={"action": request.action, "evidence_reference": request.evidence_reference},
         )
-        # Run 决策和普通聊天走同一条消息提取链。拒绝、取消、纯提问等内容由模型
-        # 返回空候选；accept_assumption 只授权暂时继续，后端会强制按 assumption 保存，
-        # 即使模型误报也不能把临时假设写成 fact/decision。
-        memory_extractor_service.extract_from_message(
-            message_id=decision_message.message_id,
-            project_id=existing.project_id,
-            module_name=existing.module_name,
-            agent_role=agent_role or "design",
-            content=user_text,
-            session_id=existing.session_id,
-            temporary_assumption=request.action == "accept_assumption",
-        )
-        if updated.status.value == "completed":
-            memory_extractor_service.extract_from_event(
-                source_type="run",
-                source_id=run_id,
-                project_id=existing.project_id,
-                module_name=existing.module_name,
-                agent_role=agent_role,
-                content=str(updated.result),
-            )
         assistant_text = (
             str(updated.pending_user_request.get("message"))
             if updated.pending_user_request and updated.pending_user_request.get("message")
@@ -425,6 +406,7 @@ async def resume_run(run_id: str, request: RunResumeRequest) -> RunView:
             run_id=run_id,
             turn_id=decision_message.turn_id,
         )
+        orchestrator_service.complete_run(updated)
         # Run Resume 与普通聊天遵循同一轮次摘要机制。投递异常不能覆盖已经成功的
         # Run 状态和已持久化消息，失败任务可由 SummaryService 后续重试。
         if decision_message.turn_id:

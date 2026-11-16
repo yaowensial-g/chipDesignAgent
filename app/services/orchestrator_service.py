@@ -11,14 +11,19 @@ Session 解析角色 → Intent → Tool 权限过滤 → 轻量 Selector → �
 
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
 from typing import Any
 from uuid import uuid4
 
 from app.agents.runtime import runtime
 from app.domain.enums import AgentRole, DelegationStatus, RunType
-from app.domain.models import ChatRequest, ChatResponse, TaskIntent, TaskView, TokenUsageView, ToolSelection
+from app.domain.models import ChatRequest, ChatResponse, RunView, TaskIntent, TaskView, TokenUsageView, ToolSelection
 from app.domain.orchestration import AuthorizedAction, TaskActionContext, TaskActionResult
+from app.services.config_completion_service import ConfigCompletionService
+from app.services.config_extractor_service import ConfigExtractorService
+from app.services.config_service import ConfigService
+from app.services.design_data_model import deepseek_design_model
 from app.services.run_service import RunService, run_service
 from app.services.delegation_service import DelegationService, delegation_service
 from app.services.session_service import SessionService, session_service
@@ -41,6 +46,7 @@ from app.storage.orchestration_repository import OrchestrationRepository
 
 
 MAX_PLANNER_STEPS = 6
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorService:
@@ -59,6 +65,7 @@ class OrchestratorService:
         delegations: DelegationService = delegation_service,
         contexts: ContextBuilderService = context_builder_service,
         memory_extractor: MemoryExtractorService = memory_extractor_service,
+        config_extractor: ConfigExtractorService | None = None,
     ) -> None:
         self.runs = runs
         self.registry = registry
@@ -67,10 +74,15 @@ class OrchestratorService:
         self.delegations = delegations
         self.contexts = contexts
         self.memory_extractor = memory_extractor
+        self.config_extractor = config_extractor or ConfigExtractorService(
+            ConfigService(runs.db, runs.workspaces), sessions, deepseek_design_model("项目配置增量提取", "updates"),
+        )
+        self.config_completion = ConfigCompletionService(self.config_extractor.configs)
         self.task_actions = TaskActionService(registry=registry, workspaces=runs.workspaces, delegations=delegations)
         register_orchestration_tools()
         self.hierarchical = TaskExecutorService(
             runs, OrchestrationRepository(runs.db, sessions), contexts, selector, self.task_actions,
+            on_completed=self.complete_run, config_extractor=self.config_extractor,
         )
 
     async def execute_task_action(
@@ -89,18 +101,8 @@ class OrchestratorService:
             # 即使业务层抛错也必须恢复 ContextVar，防止后续请求继承本轮累计值。
             usage = token_usage_tracker.finish(usage_token)
 
-        if response.run and response.run.status.value == "completed":
-            self.memory_extractor.extract_from_event(
-                source_type="run",
-                source_id=response.run.run_id,
-                project_id=response.run.project_id,
-                module_name=response.run.module_name,
-                agent_role=response.run.primary_agent.value if response.run.primary_agent else None,
-                content=(
-                    response.assistant_message if response.run.engine_version == "hierarchical"
-                    else json.dumps(response.run.result, ensure_ascii=False)
-                ),
-            )
+        if response.run and response.run.engine_version == "legacy":
+            self.complete_run(response.run)
 
         run_id = response.run.run_id if response.run else None
         conversation = self.sessions.record_token_usage(
@@ -117,6 +119,21 @@ class OrchestratorService:
                 ),
             }
         )
+
+    def complete_run(self, run: RunView) -> None:
+        if run.status.value != "completed" or run.primary_agent is None:
+            return
+        try:
+            self.config_completion.complete(run.run_id)
+        except Exception:
+            logger.exception("Could not finalize design configuration for Run %s", run.run_id)
+        try:
+            self.memory_extractor.enqueue_run(
+                run_id=run.run_id, project_id=run.project_id, module_name=run.module_name,
+                agent_role=run.primary_agent.value,
+            )
+        except Exception:
+            logger.exception("Could not enqueue memory extraction for Run %s", run.run_id)
 
     async def _handle(self, request: ChatRequest) -> ChatResponse:
         """处理一条用户消息，并返回统一 ``ChatResponse``。
@@ -151,26 +168,19 @@ class OrchestratorService:
             request.message,
             agent_role=primary_agent.value,
         )
-        # 每条新消息都由提取模型一次性判断是否值得长期保存。Service 只携带当前
-        # 角色可见的少量前文和相关 active Memory；失败会写审计但不阻断主请求。
-        self.memory_extractor.extract_from_message(
-            message_id=user_message.message_id,
-            project_id=request.project_id,
-            module_name=request.module_name,
-            agent_role=primary_agent.value,
-            content=request.message,
-            session_id=session_id,
-        )
+        config = await asyncio.to_thread(self.config_extractor.prepare, request, user_message, primary_agent.value)
         context = self.contexts.build(
             session_id,
             request,
             primary_agent.value,
             user_message.message_id,
+            project_config=config,
         )
         effective_request = context.effective_request
         request_payload = effective_request.model_dump(mode="json")
         # 这两个下划线字段是模型上下文而不是公共 ChatRequest 字段，因此不污染 API 契约。
         request_payload["_memory_context"] = context.memory_context
+        request_payload["_project_config"] = context.project_config
         request_payload["_context_manifest"] = {
             "message_ids": context.message_ids,
             "turn_summary_ids": context.turn_summary_ids,
@@ -190,6 +200,8 @@ class OrchestratorService:
         run_id = self.runs.create_orchestration_run(
             session_id, effective_request, intent.model_dump(mode="json"), primary_agent
         )
+        self.sessions.attach_message_to_run(user_message.message_id, run_id)
+        self.config_extractor.configs.record_input(run_id, config)
         self.sessions.set_active_run(session_id, run_id)
         manifest = self.contexts.save_manifest(
             session_id, run_id, primary_agent.value, context
@@ -430,7 +442,9 @@ class OrchestratorService:
 
         if name == "create_ds_candidate":
             # 顶层动态规划不重写成熟 DS 图，而是把它作为中粒度 Tool 复用。
-            run, task, message = await self.runs.execute_ds_tool(run_id, request)
+            run, task, message = await self.runs.execute_ds_tool(
+                run_id, request, project_config=request_payload.get("_project_config"),
+            )
             return {"terminal": True, "message": message, "task": task, "run": run}
 
         if name == "create_rtl_candidate":
@@ -438,7 +452,8 @@ class OrchestratorService:
             updates = dict(request.tool_arguments)
             updates.update(arguments)
             run, _, message = self.runs.execute_rtl_tool(
-                run_id, request.model_copy(update={"tool_arguments": updates})
+                run_id, request.model_copy(update={"tool_arguments": updates}),
+                project_config=request_payload.get("_project_config"),
             )
             return {"terminal": True, "message": message, "run": run}
 

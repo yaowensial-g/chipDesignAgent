@@ -18,7 +18,7 @@ class RTLService:
         self.workspaces = workspaces
         self.patches = patches
 
-    def create_candidate(self, request: RTLCandidateRequest) -> RTLCandidateResponse:
+    def create_candidate(self, request: RTLCandidateRequest, *, project_config: dict | None = None) -> RTLCandidateResponse:
         workspace = (
             self.workspaces.get(request.workspace_id)
             if request.workspace_id
@@ -34,6 +34,7 @@ class RTLService:
         target_path = request.target_path or f"rtl/{request.module_name}.sv"
         payload = request.model_dump(mode="json")
         payload["workspace_id"] = workspace.workspace_id
+        payload["_project_config"] = project_config or {}
         candidate = runtime.generate_rtl(payload)
         patch = self.patches.create(
             PatchCreateRequest(

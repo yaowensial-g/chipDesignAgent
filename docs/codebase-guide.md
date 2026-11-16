@@ -87,9 +87,13 @@ Pydantic 是后端 HTTP 契约的事实来源；前端类型与对应响应模�
 
 按 `session_id + agent_role` 增量处理即将移出原文窗口的消息。模型结构化摘要失败时不推进游标；离线回退保留待语义处理原文，不伪造总结。
 
+### `app/services/config_extractor_service.py`、`config_service.py` 和 `config_completion_service.py`
+
+ConfigExtractor 读取用户原文、最近三轮和项目配置，输出结构化增量。ConfigService 验证范围和来源，以 Workspace 的 `.chipflow/design-config.json` 保存目标配置，记录项目和配置项版本，并冻结 Run 快照。CompletionService 根据已应用 Patch、当前 RTL 或本轮绑定仿真结果推进实现状态。
+
 ### `app/services/memory_extractor_service.py` 与 `memory_service.py`
 
-前者只在高价值工程事件触发 proposed 候选，记录幂等事件和失败原因；后者负责真实来源校验、状态转换、冲突替代、可见性、来源级失效和两阶段检索。LLM 不直接更新 Memory 状态。
+前者在 Run 完成和最终回复落库后持久化 `run:<run_id>` 事件，并交给有界后台队列。`memory_extraction_context.py` 按 Run 读取对话、工程证据、相关记忆和可用配置摘要。MemoryService 校验作用域和来源，保存或更新 active 语义记忆，沿用词法检索和显式 Memory API。提取上下文通过 ConfigService 读取 Run 快照。两种提取器通过 `design_data_model.py` 复用已启用的 DeepSeek 主模型，固定目标地址并禁用重定向。
 
 ### `app/services/context_builder_service.py`
 

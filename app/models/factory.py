@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 
-from openai import OpenAI
+from openai import DefaultHttpxClient, OpenAI
 
 from app.config.model_settings import (
     ModelEndpointSettings,
@@ -26,9 +26,10 @@ class _ProviderKey:
     api_key: str
     timeout_seconds: int
     max_output_tokens: int
+    direct_only: bool
 
     @classmethod
-    def from_settings(cls, settings: ModelEndpointSettings) -> "_ProviderKey":
+    def from_settings(cls, settings: ModelEndpointSettings, direct_only: bool) -> "_ProviderKey":
         return cls(
             provider=settings.provider,
             api_style=settings.api_style,
@@ -37,6 +38,7 @@ class _ProviderKey:
             api_key=settings.api_key,
             timeout_seconds=settings.timeout_seconds,
             max_output_tokens=settings.max_output_tokens,
+            direct_only=direct_only,
         )
 
 
@@ -47,13 +49,15 @@ class _ClientKey:
     base_url: str
     api_key: str
     timeout_seconds: int
+    direct_only: bool
 
     @classmethod
-    def from_settings(cls, settings: ModelEndpointSettings) -> "_ClientKey":
+    def from_settings(cls, settings: ModelEndpointSettings, direct_only: bool) -> "_ClientKey":
         return cls(
             base_url=settings.base_url,
             api_key=settings.api_key,
             timeout_seconds=settings.timeout_seconds,
+            direct_only=direct_only,
         )
 
 
@@ -66,20 +70,22 @@ class ProviderFactory:
         self._clients: dict[_ClientKey, OpenAI] = {}
         settings_service.register_change_listener(self.clear)
 
-    def get(self, settings: ModelEndpointSettings) -> OpenAIModelProvider:
+    def get(self, settings: ModelEndpointSettings, *, direct_only: bool = False) -> OpenAIModelProvider:
         if not settings.api_key:
             raise ModelInvocationError("尚未配置 API Key")
-        key = _ProviderKey.from_settings(settings)
+        key = _ProviderKey.from_settings(settings, direct_only)
         with self._lock:
             provider = self._providers.get(key)
             if provider is None:
-                client_key = _ClientKey.from_settings(settings)
+                client_key = _ClientKey.from_settings(settings, direct_only)
                 client = self._clients.get(client_key)
                 if client is None:
+                    transport = {"http_client": DefaultHttpxClient(follow_redirects=False, trust_env=False)} if direct_only else {}
                     client = OpenAI(
                         api_key=settings.api_key,
                         base_url=settings.base_url,
                         timeout=settings.timeout_seconds,
+                        **transport,
                     )
                     self._clients[client_key] = client
                 provider = OpenAIModelProvider(settings, client=client)

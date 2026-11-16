@@ -170,19 +170,6 @@ class DocumentService:
         stored = self.get_version(version_id)
         if stored is None:
             raise RuntimeError("document version transaction committed without a readable version")
-        # 延迟导入避免 DocumentService/MemoryExtractor 的模块初始化环；提取失败只会
-        # 写入审计事件，不影响已原子提交的文档版本。
-        if self.db is database:
-            from app.services.memory_extractor_service import memory_extractor_service
-
-            memory_extractor_service.extract_from_event(
-                source_type="document_version",
-                source_id=version_id,
-                project_id=request.project_id,
-                module_name=request.module_name,
-                agent_role=None,
-                content=request.content[:20_000],
-            )
         return stored
 
     def get_version(self, version_id: str) -> StoredDocumentView | None:

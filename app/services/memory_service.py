@@ -67,10 +67,92 @@ def _terms(text: str) -> set[str]:
 
 
 class MemoryService:
-    """所有状态变更由确定性规则控制；模型只能提交 proposed 候选。"""
+    """保存语义记忆，并兼容旧记忆的显式治理与检索。"""
 
     def __init__(self, db: Database = database) -> None:
         self.db = db
+
+    def save_semantic_memory(
+        self,
+        project_id: str,
+        module_name: str,
+        content: str,
+        source_run_id: str,
+        *,
+        action: str = "add",
+        target_memory_id: str | None = None,
+        related_memories: dict[str, MemoryView] | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> str | None:
+        """返回保存或合并的 ID，跳过无效操作。Run 对话派生的记忆沿用角色私有边界。"""
+        if connection is None:
+            with self.db.transaction() as tx:
+                return self.save_semantic_memory(
+                    project_id, module_name, content, source_run_id, action=action,
+                    target_memory_id=target_memory_id, related_memories=related_memories,
+                    connection=tx,
+                )
+        content = content.strip()
+        if not content or not module_name or action not in {"add", "update"}:
+            return None
+        run = connection.execute(
+            """SELECT primary_agent FROM runs WHERE run_id = ? AND project_id = ?
+            AND module_name = ? AND status = 'completed'""",
+            (source_run_id, project_id, module_name),
+        ).fetchone()
+        if run is None or not run["primary_agent"]:
+            raise ValueError("semantic memory requires a completed source Run in the same scope")
+
+        agent_role = run["primary_agent"]
+        source = [{"source_type": "run", "source_id": source_run_id}]
+        rows = connection.execute(
+            """SELECT memory_id, kind, content, updated_at FROM memories
+            WHERE project_id = ? AND module_name = ? AND scope = 'module' AND status = 'active'
+            AND visibility = 'role_private' AND owner_agent_role = ? ORDER BY created_at, memory_id""",
+            (project_id, module_name, agent_role),
+        ).fetchall()
+        normalized = self._normalize_semantic_content(content)
+        duplicate = next((row for row in rows if
+                          self._normalize_semantic_content(row["content"]) == normalized), None)
+        now = utc_now()
+        if action == "update":
+            prior = (related_memories or {}).get(target_memory_id or "")
+            target = next((row for row in rows if row["memory_id"] == target_memory_id), None)
+            if (prior is None or target is None or target["kind"] != "semantic"
+                or (target["content"], target["updated_at"]) != (prior.content, prior.updated_at)):
+                return None
+            memory_id = target["memory_id"]
+            if duplicate is not None and duplicate["memory_id"] != memory_id:
+                return None
+            if duplicate is None:
+                connection.execute(
+                    "UPDATE memories SET content = ?, updated_at = ? WHERE memory_id = ?",
+                    (content, now, memory_id),
+                )
+                # 旧引用证明的是旧正文，当前提取结果不提供逐条来源复核。
+                connection.execute(
+                    """UPDATE memory_sources SET status = 'invalidated', invalidated_at = ?,
+                    invalidation_reason = 'semantic_content_updated'
+                    WHERE memory_id = ? AND status = 'active'""",
+                    (now, memory_id),
+                )
+        elif duplicate is not None:
+            memory_id = duplicate["memory_id"]
+        else:
+            memory_id = str(uuid4())
+            connection.execute(
+                """INSERT INTO memories
+                (memory_id, project_id, module_name, scope, kind, content, confidence,
+                 authority, visibility, owner_agent_role, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'module', 'semantic', ?, 5, 'agent', 'role_private', ?, 'active', ?, ?)""",
+                (memory_id, project_id, module_name, content, agent_role, now, now),
+            )
+        self._add_sources(connection, memory_id, source)
+        return memory_id
+
+    @staticmethod
+    def _normalize_semantic_content(content: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", content).split())
 
     def create(self, request: MemoryCreateRequest) -> MemoryView:
         # 自动提取使用稳定 extraction_key；事件重试即使越过上层幂等检查，
@@ -285,7 +367,7 @@ class MemoryService:
         project_id: str,
         module_name: str,
         query: str,
-        limit: int = 8,
+        limit: int = 5,
         *,
         agent_role: str | None = None,
         shared_only: bool = False,
@@ -297,15 +379,15 @@ class MemoryService:
             "m.status = 'active'",
         ]
         parameters: list[object] = [project_id, module_name]
-        if shared_only:
+        if shared_only or not agent_role:
             conditions.append("m.visibility = 'project_shared'")
-        elif agent_role:
+        else:
             conditions.append(
                 "(m.visibility = 'project_shared' OR (m.visibility = 'role_private' AND m.owner_agent_role = ?))"
             )
             parameters.append(agent_role)
         conditions.append(
-            """(m.kind NOT IN ('fact','decision') OR EXISTS (
+            """(m.kind NOT IN ('fact','decision','semantic') OR EXISTS (
                 SELECT 1 FROM memory_sources s
                 WHERE s.memory_id = m.memory_id AND s.status = 'active'))"""
         )

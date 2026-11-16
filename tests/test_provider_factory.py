@@ -1,5 +1,10 @@
+import httpx
+import pytest
+from openai import DefaultHttpxClient
+
 from app.config.model_settings import ModelEndpointSettings
 from app.models.factory import ProviderFactory
+from app.models.provider import ModelInvocationError
 
 
 class _SettingsService:
@@ -63,3 +68,29 @@ def test_factory_reuses_equal_configuration_and_invalidates_on_change(monkeypatc
     assert clients[0].closed is True
     assert factory.size == 0
     assert factory.get(_endpoint()) is not first
+
+
+def test_direct_provider_does_not_follow_redirect_or_reuse_normal_transport(monkeypatch):
+    requested = []
+
+    def respond(request):
+        requested.append(str(request.url))
+        if request.url.host == "api.example.test":
+            return httpx.Response(307, headers={"Location": "https://elsewhere.example.test/redirected"})
+        return httpx.Response(500)
+
+    def client(**kwargs):
+        assert kwargs == {"follow_redirects": False, "trust_env": False}
+        return DefaultHttpxClient(transport=httpx.MockTransport(respond), **kwargs)
+
+    monkeypatch.setattr("app.models.factory.DefaultHttpxClient", client)
+    factory = ProviderFactory(_SettingsService())
+    try:
+        direct = factory.get(_endpoint(), direct_only=True)
+        assert direct is factory.get(_endpoint(), direct_only=True)
+        assert direct.client is not factory.get(_endpoint()).client
+        with pytest.raises(ModelInvocationError):
+            direct.generate_json("Extract JSON", {"synthetic": "input"}, expected_shape='{"updates":[]}')
+        assert requested == ["https://api.example.test/v1/responses"]
+    finally:
+        factory.clear()

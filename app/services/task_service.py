@@ -15,11 +15,11 @@ class TaskService:
         self.db = db
         self._states: dict[str, dict[str, Any]] = {}
 
-    async def create_ds_task(self, request: CreateDSTaskRequest) -> TaskView:
+    async def create_ds_task(self, request: CreateDSTaskRequest, *, project_config: dict | None = None) -> TaskView:
         task_id = str(uuid4())
         initial_state = {
             "task_id": task_id,
-            "request": request.model_dump(mode="json"),
+            "request": {**request.model_dump(mode="json"), "_project_config": project_config or {}},
             "status": "requested",
             "events": [],
             "quality_warnings": [],

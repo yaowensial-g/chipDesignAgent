@@ -18,11 +18,19 @@ MAX_FILES = 96
 MAX_SOURCE_BYTES = 2_000_000
 
 
+class ConfigCheck(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    module: str = Field(pattern=f"^{IDENTIFIER}$")
+    parameter: str = Field(pattern=r"^[a-z_][a-z0-9_]*$")
+    value: int
+
+
 class Testcase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     top_module: str = Field(pattern=f"^{IDENTIFIER}$")
     sources: list[str] = Field(min_length=1, max_length=24)
     depends_on: list[str] = Field(default_factory=list, max_length=96)
+    config_checks: list[ConfigCheck] = Field(default_factory=list, max_length=32)
 
 
 class ProjectManifest(BaseModel):

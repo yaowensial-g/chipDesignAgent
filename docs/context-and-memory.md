@@ -10,7 +10,7 @@
 |---|---|---|---|
 | L0 当前执行状态 | 当前请求、Run、Observation、审批与执行进度 | 单次 Run | `runs`、`run_events` |
 | L1 短期记忆 | 最近 5 轮完整原文、较早 30 轮独立摘要 | Session | `conversation_messages`、`conversation_turn_summaries` |
-| L2 长期记忆 | 项目事实、设计约束、正式决策、工程经验 | Project / Module | `memories`、`memory_sources`、`memory_relations` |
+| L2 长期记忆 | 稳定偏好、长期约定、设计理由和经过验证的经验 | Project / Module | `memories`、`memory_sources`、`memory_relations` |
 | L3 原始证据 | 规格、RTL、Artifact、Tool 日志及版本 | 长期版本化保存 | `document_versions`、`document_chunks`、Workspace |
 
 LLM 生成的摘要、推断和专家建议不是正式事实。原始消息和历史证据不因摘要、文档换版或记忆替代而删除。
@@ -19,23 +19,20 @@ LLM 生成的摘要、推断和专家建议不是正式事实。原始消息和�
 
 ```mermaid
 flowchart TD
-    U[用户消息 / 工程事件] --> P[保存真实消息或事件]
-    P --> E[MemoryExtractorService 一次结构化判断]
-    E --> X{产生候选?}
-    X -- 否 --> C[ContextBuilder]
-    X -- 是 --> V[结构校验 + 真实来源校验]
-    V --> M[proposed / needs_review Memory]
-    M --> C
-    P --> C
-    P --> A[最终 Assistant Response 持久化]
-    A --> S[有界后台摘要队列]
-    S --> R[按 turn_id 生成独立摘要]
-    R -. 下轮读取 completed .-> C
-    D[版本化文档 / Chunk] --> C
-    C --> F[确定性过滤与两阶段检索]
-    F --> B[统一 Token 预算选择]
-    B --> Q[实际模型上下文]
-    B --> A[Context Manifest 审计]
+    U[用户请求] --> P[配置提取与增量校验]
+    P --> W[原子写入项目配置并固定 Run 快照]
+    W --> C[ContextBuilder]
+    D[版本化文档和 Chunk] --> C
+    M[相关 active 记忆] --> C
+    C --> R[Agent Run]
+    R --> F[Run 完成和最终回复落库]
+    F --> S[独立会话摘要队列]
+    F --> V[用工程证据检查配置实现状态]
+    V --> E[固定最终配置并投递 Worker]
+    E --> L[读取本 Run 对话与有限工程证据]
+    L --> J[语义提取模型]
+    J --> A[校验 ADD 或 UPDATE]
+    A --> M
 ```
 
 ## 3. 会话摘要
@@ -50,47 +47,27 @@ flowchart TD
 
 旧 `conversation_summaries` 和 `conversation_role_summaries` 均保留用于兼容和审计，但 ContextBuilder 不再读取或刷新它们。
 
-## 4. 自动长期记忆提取
+### 项目配置
 
-`MemoryExtractorService` 对每条新用户消息执行一次结构化模型判断，不再用关键词或时钟正则预筛选。模型判断当前消息是否明确新增、确认或修订了对后续工作有价值的事实、约束、决策、偏好或经验；纯提问、闲聊和未确认设想返回空候选。一条消息可以生成多个独立候选，因此自然语言描述的时钟、复位、接口、位宽、FIFO 深度和验证结论都走同一条路径。
+`ConfigExtractorService` 在 Legacy 和 Hierarchical Chat 构建上下文之前读取当前请求、同角色最近 3 轮完整对话、当前模块配置。模型只提出增量更新，后端校验项目、模块、用户原文证据和配置项 revision。项目配置存于已登记 Workspace 的 `.chipflow/design-config.json`。相同值保留原版本和实现状态。
 
-消息提取会携带最多 6 条当前角色可见的近期消息以及最多 6 条相关 active Memory，并设置独立 Token 上限。前文和旧记忆只能用于消解“第二种”“改成 32”等指代、识别修订和复用已有 `memory_key`，候选必须在当前消息中有依据。Run 的“按临时假设继续”会由后端强制降级为 `assumption`，不能形成 fact/decision。
+Run 固定自己读到的配置版本。完成检查只使用该 Run 关联的已应用 Patch、当前有效 RTL 快照或通过验收的工程与仿真证据。Lint 和未绑定要求的仿真最多支持 `implemented`。匹配配置目标的用例通过后可标为 `verified`。配置版本有变化时，旧 Run 的结果保留原有快照。
 
-正式文档版本、完成 Run 和 Delegate 结论继续复用同一个 `_model_candidates()`，但不携带会话前文。每个事件写入 `memory_extraction_events`，以 `source_type:source_id` 幂等；完成消息在准备上下文和调用模型之前直接复用已有结果，失败保存原因和尝试次数，可安全重试。
+## 4. Run 级长期记忆提取
 
-去重分为模型提示、单批候选和跨事件存储三层。Prompt 要求模型对同一工程属性只输出一个稳定的小写点分键；后端仍会对 `memory_key` 做 NFKC、大小写和 `-`/`_`/`.` 统一，对正文去除空白、标点及少量不改变事实的表述词。单批完全相同的候选只保留一条并吸收更高的置信度和重要性。不同消息、Run 或文档再次提取到同一候选时，`MemoryService` 复用原 Memory 并追加来源，不覆盖原正文、状态、authority 或评分。
+Legacy 聊天、Legacy Resume 和分层执行的完成路径在最终回复提交后调用 `enqueue_run()`。文档版本通过 RAG 管理，委派结论作为父 Run 的执行证据。
 
-这是一种保守的确定性精确去重，不使用模糊相似度或额外模型调用。相同规范化键但内容不同的候选不会合并，而是进入 `needs_review`；不同工程属性、不同知识类型以及不同 `role_private` owner 也不会误合并。候选 `extraction_key` 由事件、类型、规范化键和规范化正文生成，不依赖模型返回顺序，因此失败重试时调换候选顺序也不会重复入库。
+每个 Run 对应一条 `run:<run_id>` 事件。线程池默认有 2 个 Worker 和 32 个槽位，队满时事件保留为 `pending`。启动恢复和周期扫描会重新投递待处理、到期失败和租约过期的事件。空结果也会标记为 `completed`。事件与记忆写入同一事务。
 
-模型只返回候选字段，不能直接更新数据库。Service 会检查：
+Worker 读取同一 Run 的原始请求、恢复对话、最终答复、精选工程证据、最终配置快照和最多五条相关记忆。配置中可识别的精确重复项在入库前跳过。生产提取使用已启用的 DeepSeek 主模型，固定地址为 `https://api.deepseek.com`。端到端回归使用本地模型替身。
 
-- `memory_key` 格式、类型、置信度和重要性；
-- 来源 ID 在消息、文档、Run、Delegate 或 Patch 表中真实存在；
-- Run、Delegate、Patch 等权威来源已经处于对应完成/应用状态；
-- `extraction_key` 未被处理过，或规范化后的逻辑候选可安全合并来源。
+## 5. 语义记忆和来源
 
-自动提取结果始终是 `proposed`，与现有 active 事实冲突时进入 `needs_review`。
+ADD 在项目、模块和角色范围内比较规范化正文。重复项复用 Memory ID 并关联当前 Run。新记录直接保存为 `active`、`semantic`，使用来源 Run 的主角色作为私有记忆的 owner。
 
-## 5. 生命周期、冲突与权威性
+UPDATE 只允许操作传给模型、且正文版本未变化的同范围 active 语义记忆。如果正文变更，旧来源标为失效并保留历史，再追加当前 Run 来源。非法目标跳过。
 
-```mermaid
-stateDiagram-v2
-    [*] --> proposed
-    proposed --> active: 用户/正式来源确认
-    proposed --> needs_review: 与 active memory_key 冲突
-    needs_review --> active: 人工确认新约束
-    active --> stale: 全部有效来源被替代
-    active --> superseded: 更高权威的新事实生效
-    proposed --> rejected: 明确拒绝
-    stale --> active: 重新验证并绑定有效来源
-```
-
-`fact` 和 `decision` 成为 active 时必须有可追溯来源。自动提取、模型摘要、Agent 建议和 Delegate 结论不能自动成为 active。当前系统允许以下方式激活：
-
-- `POST /memories/{id}/promote`，并提供真实用户确认、正式文档、已完成 Run 或已应用 Patch 等来源；
-- 兼容旧 API 的显式 active 创建，但同样必须通过来源校验。
-
-同一 `memory_key` 的新事实正式生效时，旧 active 事实原子地变为 `superseded`，并在 `memory_relations` 中建立 `supersedes` 关系。默认检索不会同时返回冲突的新旧事实。
+历史数据和 `POST /memories`、查询与 `promote` 接口继续可用。显式治理中的同键冲突和替代仍沿用旧流程，历史候选保留原状态。
 
 ## 6. 文档换版与来源级失效
 
@@ -115,10 +92,10 @@ stateDiagram-v2
 - `project_id`、`module_name`；
 - 默认只允许 `active`；
 - `project_shared` 或当前 Agent 自己的 `role_private`；
-- active fact/decision 必须仍有 active 来源；
+- active semantic、fact 和 decision 必须仍有 active 来源；
 - Delegate 使用 `shared_only=True`，不会取得主 Agent 私有记忆。
 
-第二阶段计算关键词交集、importance、confidence、authority 和作用域匹配度。普通记忆必须达到最低关键词相关性，不会因为 `limit=8` 就填满八条无关内容；importance ≥ 9 的 active fact/decision 作为少量关键约束可强制候选。每条入选记忆在 Manifest 中记录分数和选择原因。
+第二阶段计算关键词交集、importance、confidence、authority 和作用域匹配度。默认取最多 5 条。普通记忆须满足最低关键词相关性，旧版高重要性 fact/decision 可作为关键约束参与排序。运行时只接收 ID、类型和正文，Manifest 记录分数和选择原因。
 
 ## 8. 统一 Token 预算
 
@@ -130,6 +107,7 @@ stateDiagram-v2
 | 当前请求与 Run | 3,000 |
 | 最近 5 轮完整原文 | 6,000 |
 | 较早 30 轮摘要/原文回退 | 6,000 |
+| 项目配置 | 2,500 |
 | 长期记忆 | 2,000 |
 | RAG 文档 | 12,000 |
 | 输出安全预留 | 3,000（至少） |
@@ -157,7 +135,7 @@ Manifest 描述实际发送给模型的上下文，包括：
 - 已批准项目事实和正式文档通过 `project_shared` 跨角色共享；
 - 私有 Memory 必须带 `owner_agent_role`；
 - Delegate 始终保留 `history: []`，只注入与 instruction 相关的共享 active Memory；
-- Expert 建议只作为 Observation 或 proposed Memory，不能直接覆盖正式事实；
+- Expert 建议由父 Run 提取器结合实际执行证据判断；
 - 主 Agent 始终保留控制权，不发生 Handoff。
 
 ## 11. 当前边界
@@ -165,4 +143,4 @@ Manifest 描述实际发送给模型的上下文，包括：
 - 关键词/本地语义检索仍基于 SQLite 与确定性特征，没有引入外部向量数据库；
 - 文档历史版本可审计，但显式恢复某个 superseded 版本尚无独立 API；
 - 多用户部署仍需在当前角色模型之前增加真实身份认证与项目 ACL；
-- 摘要模型可进一步独立配置或异步批处理，但当前复用主 Provider，只有消息移出窗口时才调用。
+- 独立摘要在完整轮次落库后生成，较早轮次进入上下文时才读取。

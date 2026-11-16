@@ -1,6 +1,5 @@
 import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -134,7 +133,7 @@ def executor_factory(tmp_path, monkeypatch):
             patches=PatchService(workspaces=workspaces, db=db),
         )
         contexts = ContextBuilderService(db, sessions, DocumentService(db), memories, summaries)
-        delegations = DelegationService(db, memories, SimpleNamespace(extract_from_event=lambda **kwargs: None))
+        delegations = DelegationService(db, memories)
         actions = TaskActionService(workspaces=workspaces, delegations=delegations, agent_runtime=agent)
         return TaskExecutorService(
             runs, OrchestrationRepository(db, sessions), contexts, ToolSelectorService(), actions,
@@ -532,23 +531,40 @@ async def test_hierarchical_uart_verifies_before_scheduling_downstream(executor_
 
 @pytest.mark.asyncio
 async def test_resume_wait_after_reopen_and_switch_disabled(executor_factory, monkeypatch):
+    from app.api import routes
+
     first = executor_factory(ScriptedRuntime(clarify=True))
+    enqueued = []
+
+    def on_completed(run):
+        messages = first.repo.sessions.run_messages(run.session_id, run.run_id, run.primary_agent.value)
+        enqueued.append((run.status.value, messages))
+
+    first.on_completed = on_completed
     request = request_for(first)
     initial = (await first.handle(request)).run
     assert initial.status.value == "waiting_for_user"
+    assert not enqueued
     wait = initial.pending_user_request
     task_id = wait["task_id"]
     assert first.repo.states(initial.run_id)[task_id].current_iteration == 1
 
     restarted = executor_factory(ScriptedRuntime())
+    restarted.on_completed = on_completed
+    monkeypatch.setattr(routes.run_service, "get", restarted.runs.get)
+    monkeypatch.setattr(orchestrator_service, "hierarchical", restarted)
     monkeypatch.delenv("CHIP_AGENT_HIERARCHICAL_ENABLED")
     decision = RunResumeRequest(
         action="provide_resolution", content="重点检查复位行为", wait_id=wait["wait_id"], client_request_id="answer-1",
     )
-    resumed = await restarted.resume(initial.run_id, decision)
+    resumed = await routes.resume_run(initial.run_id, decision)
     assert resumed.status.value == "completed"
-    repeated = await restarted.resume(initial.run_id, decision)
+    repeated = await routes.resume_run(initial.run_id, decision)
     assert repeated.status == resumed.status
+    [(status, messages)] = enqueued
+    assert status == "completed"
+    assert any(message.content == decision.content for message in messages)
+    assert messages[-1].role == "assistant"
     assert len(restarted.repo.decisions(initial.run_id)) == 1
     assert restarted.repo.states(initial.run_id)[task_id].current_iteration == 4
     with pytest.raises(ValueError, match="already used"):

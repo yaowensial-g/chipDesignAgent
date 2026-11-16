@@ -9,11 +9,15 @@ import pytest
 
 from app.domain.models import ChatRequest, PatchCreateRequest, PatchDecisionRequest, RunResumeRequest, ToolSelection, WorkspaceCreateRequest
 from app.domain.orchestration import ReflectionResult
+from app.services.config_completion_service import ConfigCompletionService
+from app.services.config_extractor_service import ConfigExtractorService
+from app.services.config_service import ConfigService
 from app.tools.adapters.base import EDAToolResult
 from app.tools.eda_inspection import module_hierarchy, signal_references, signal_trace
 from app.tools.project_manifest import read_project
 
 from test_hierarchical_run import ScriptedRuntime, executor_factory
+from test_verilator_stage import fake_verilator
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "uart_project"
@@ -92,6 +96,75 @@ async def test_project_inspection_uses_manifest_and_existing_task_chain(executor
     assert {"declaration", "assignment", "reference"} <= {
         item["kind"] for item in outputs["find_signal_references"]["references"]
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("tool", "tested_value", "edited_after_freeze", "expected"), [
+    ("run_testcase", 64, False, "verified"),
+    ("run_testcase", 32, False, "implemented"),
+    ("run_lint", 64, False, "implemented"),
+    ("run_testcase", 64, True, "pending"),
+])
+async def test_completion_requires_matching_current_rtl_and_targeted_simulation(
+    executor_factory, fake_verilator, monkeypatch, tool, tested_value, edited_after_freeze, expected,
+):
+    from app.services import task_action_service
+    from app.tools import eda_catalog
+    from app.tools.adapters import verilator_adapter
+
+    for module in (task_action_service, eda_catalog, verilator_adapter):
+        monkeypatch.setattr(module, "simulation_environment", lambda _: {"test": True})
+
+    def execute(name, executable, version, project, cases, seed, root, *, coverage=False):
+        return EDAToolResult(
+            tool_name=name, tool_version=version, input_hash=project.input_hash, status="PASS", exit_code=0,
+            commands=[[executable, "--cc" if cases else "--lint-only"]],
+            metrics={"testcases": [{"testcase": case, "status": "PASS", "exit_code": 0} for case in cases]},
+        ), "", "", {}
+
+    monkeypatch.setattr(verilator_adapter, "execute", execute)
+    executor = executor_factory(ProjectRuntime())
+    request, root = project_request(executor, [tool], eda_testcases=["uart_pass"] if tool != "run_lint" else [])
+    rtl = root / "rtl/uart_top.sv"
+    rtl.write_text(rtl.read_text(encoding="utf-8").replace(
+        "module uart_top (", "module uart_top #(parameter int FIFO_DEPTH = 64) (",
+    ), encoding="utf-8")
+    source = root / "chipdesign.json"
+    manifest = json.loads(source.read_text(encoding="utf-8"))
+    manifest["testcases"]["uart_pass"].update(
+        depends_on=["rtl/uart_top.sv"],
+        config_checks=[{"module": "uart_top", "parameter": "fifo_depth", "value": tested_value}],
+    )
+    source.write_text(json.dumps(manifest), encoding="utf-8")
+
+    configs = ConfigService(executor.runs.db, executor.actions.workspaces)
+    executor.config_extractor = ConfigExtractorService(configs, executor.repo.sessions,
+        lambda prompt, payload: {"updates": [{
+            "module": "uart_top", "parameter": "fifo_depth", "value": 64, "evidence": payload["current_request"],
+        }]},
+    )
+    completions = []
+    checker = ConfigCompletionService(configs)
+
+    def completed(run):
+        completions.append(run.run_id)
+        checker.complete(run.run_id)
+
+    executor.on_completed = completed
+    initial = (await executor.handle(request.model_copy(update={"message": "Set FIFO depth to 64 and check UART"}))).run
+    assert initial.status.value == "waiting_for_approval", initial.result
+    assert configs.get_pending_items("uart-eda", "uart_top")
+    assert not completions
+    if edited_after_freeze:
+        rtl.write_text(rtl.read_text(encoding="utf-8").replace("FIFO_DEPTH = 64", "FIFO_DEPTH = 128"), encoding="utf-8")
+    final = await drive_approved(executor, initial)
+    assert final.status.value == "completed", final.result
+    assert completions == [final.run_id]
+    item = configs.get_config("uart-eda", "uart_top").modules["uart_top"].parameters["fifo_depth"]
+    assert item.status == expected
+    if expected == "verified":
+        assert [reference.kind for reference in item.evidence_refs] == ["artifact", "tool_run"]
+        assert item.evidence_refs[-1].testcase == "uart_pass"
 
 
 def test_manifest_rejects_external_filelist_arguments_and_includes(executor_factory):

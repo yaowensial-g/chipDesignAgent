@@ -119,7 +119,7 @@ async def attach_request_id(request, call_next):
 |---|---|---:|---|---|
 | 当前请求 | 本轮用户消息、项目、模块、工作角色 | 用户输入 | 单次调用 | `ChatRequest`，同时写入消息表 |
 | 短期记忆 | 最近 5 轮完整原文、较早 30 轮独立摘要、Active Run | 系统维护 | 会话/角色级 | `conversation_messages`、`conversation_turn_summaries`、`conversations.active_run_id` |
-| 长期记忆 | 已确认项目事实、架构决策、有效假设 | 新消息经模型判断、正式事件可形成 proposed；active 必须有权威来源 | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
+| 长期记忆 | 稳定偏好、长期约定、设计理由和经验证的经验 | 已完成 Run 异步提取，来源关联到 Run | 项目/模块级 | `memories`、`memory_sources`、`memory_relations` |
 | 原始证据 | FS、AS、ICD、问题单、工具日志、Artifact | 原件不可由 Agent 随意改写 | 长期、版本化 | `document_versions`、`document_chunks`、Artifact、Raw Logs |
 
 这里最重要的边界是：**聊天里出现过一句话，不等于它已经成为长期事实；Agent
@@ -234,41 +234,15 @@ flowchart LR
 兼容旧前端时，`ChatRequest.documents` 中携带的正文也会在 ContextBuilder 开头自动入库；
 入库完成后，后续请求只需发送项目、模块和问题，不需要反复把整篇文档从浏览器传给模型。
 
-#### 2.2.6 第 5 步：长期记忆如何受控形成
+#### 2.2.6 第 5 步：长期记忆如何形成和进入上下文
 
-`MemoryService` 把长期记忆设计成显式状态对象，而不是把聊天记录整体向量化。典型状态流是：
+ContextBuilder 按项目、模块、角色、active 状态和有效来源过滤记忆，再按现有词法评分取最多 5 条。模型收到 ID、类型和正文，Context Manifest 保留分数和选择原因。旧版高重要性事实和决策仍可作为关键约束参与检索。
 
-```mermaid
-stateDiagram-v2
-    [*] --> proposed: Agent/用户提出候选事实
-    proposed --> active: 用户、问题单、审批或正式文档确认
-    proposed --> needs_review: 与 active 稳定键冲突
-    needs_review --> active: 人工确认新约束
-    active --> stale: 全部有效来源被替代
-    active --> superseded: 更高权威新事实生效
-    proposed --> rejected: 用户否决
-    stale --> active: 重新评估并绑定有效来源
-```
+聊天与 Resume 的最终回复落库后，完成的 Run 可生成一个 `run:<run_id>` 提取事件。分层编排的后台执行也使用同一个完成回调。Worker 按 Run ID 读取原始对话、恢复决策、有限工程证据、相关记忆及可获取的配置摘要，再交给结构化提取模型。文档入库和单次专家委派各自保留工程来源，由父 Run 提取统一判断。
 
-`MemoryExtractorService` 对每条新用户消息执行一次结构化判断，不再用关键词或时钟正则预筛选；
-少量角色可见前文和相关 active Memory 只用于消解指代、识别修订和复用稳定键。正式文档、完成 Run
-和 Delegate 等工程事件继续复用同一候选接口。所有自动结果只能进入 `proposed`，与现有事实冲突时
-进入 `needs_review`。事件以真实来源 ID 幂等记录，失败不影响主请求并可重试。
-候选在单次模型结果中按规范化 key、kind 和正文做保守精确去重；跨消息、文档或 Run 的相同候选
-复用同一 Memory 并追加真实来源。稳定候选键不包含模型返回序号，因此失败重试调换顺序仍然幂等。
-相同 key 的不同值、不同工程属性、不同 kind 或不同私有 owner 不会被相似度规则误合并。
-`promote()` 校验用户确认、正式文档、完成 Run 或应用 Patch 等真实来源后才允许进入 `active`。
+每项结果只需内容与 ADD 或 UPDATE 操作。服务校验来源、项目、模块和角色，保存 active 语义记忆或复用重复项。UPDATE 只改本轮提供给模型的、同一权限范围的 active 语义记忆。记忆写入与事件完成原子提交。历史 Memory API 和数据继续可读。
 
-检索分两阶段：先过滤项目、模块、角色可见性、active 状态和有效来源；再综合关键词、importance、
-confidence、authority 和作用域评分。普通记忆必须达到最低相关性，不会为了填满 limit 返回无关内容；
-importance ≥ 9 的少量 fact/decision 作为关键约束强制候选。相同 `memory_key` 的新事实正式生效时，
-旧事实原子变为 `superseded` 并建立替代关系。
-
-对应代码见：
-
-- [`MemoryExtractorService`](../app/services/memory_extractor_service.py)；
-- [`MemoryService`](../app/services/memory_service.py)；
-- [`POST /memories` 与 promote API](../app/api/routes.py#L253)。
+Config Manager 在 ContextBuilder 前读取并校验当前用户授权的增量修改。项目配置写入 Workspace 的 `.chipflow/design-config.json`，ContextBuilder 固定 Run 使用的版本，把目标规格作为单独的模型输入。Run 结束后，完成检查用同一版本的 RTL、Patch 或绑定到要求的仿真证据推进状态。Memory Worker 读取该 Run 的最终配置快照。生产提取复用主模型的结构化接口，发送地址固定为获授权的 `https://api.deepseek.com`。详见 [配置与长期记忆实现](context-memory-implementation.md#20-项目配置与端到端验证)。
 
 #### 2.2.7 第 6 步：文档混合检索如何计算
 
@@ -313,6 +287,7 @@ Provider 的预算估算，不用于替代厂商账单。
 | 当前请求与 Run | 强制保留；过大时明确报错 | 3,000 Token 起 |
 | 较早会话摘要 | 整体选择，不截掉末尾 | 参考 2,000 Token |
 | 近期会话原文 | 从新到旧选择，再恢复顺序 | 参考 6,000 Token |
+| 项目配置 | 当前模块，版本固定，先于长期记忆分配预算 | 上限 2,500 Token |
 | 长期记忆 | active、权限/来源过滤、关键约束优先 | 参考 2,000 Token |
 | 文档证据 | 混合分数排序；复用前区未用额度 | 参考 12,000 Token |
 | 模型输出 | 按模型设置动态预留 | 至少 3,000 Token |

@@ -25,12 +25,16 @@ logger = logging.getLogger("chipflow.errors")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     recovery = asyncio.create_task(orchestrator_service.hierarchical.run_background())
+    memory_recovery = asyncio.create_task(orchestrator_service.memory_extractor.run_background())
     try:
         yield
     finally:
         recovery.cancel()
+        memory_recovery.cancel()
         with suppress(asyncio.CancelledError):
             await recovery
+        with suppress(asyncio.CancelledError):
+            await memory_recovery
 
 
 app = FastAPI(

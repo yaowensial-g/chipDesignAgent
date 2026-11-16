@@ -8,6 +8,7 @@ import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from sqlite3 import Connection
 from uuid import uuid4
 
 from app.domain.models import (
@@ -20,6 +21,7 @@ from app.storage.database import Database, PROJECT_ROOT, database
 
 
 DEFAULT_WORKSPACE_ROOT = PROJECT_ROOT / "data" / "workspaces"
+DESIGN_CONFIG_PATH = ".chipflow/design-config.json"
 MAX_RTL_SOURCE_BYTES = 48_000
 
 
@@ -38,7 +40,7 @@ class WorkspaceService:
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
-    def create(self, request: WorkspaceCreateRequest) -> WorkspaceView:
+    def create(self, request: WorkspaceCreateRequest, *, connection: Connection | None = None) -> WorkspaceView:
         """创建独立目录和约定子目录，并把绝对根路径登记到数据库。"""
         workspace_id = str(uuid4())
         # project_id 可能含中文、空格或路径字符，先转换成安全目录片段；
@@ -51,7 +53,8 @@ class WorkspaceService:
             (path / directory).mkdir()
         created_at = utc_now()
         display_name = request.display_name or request.project_id
-        self.db.execute(
+        execute = self.db.execute if connection is None else connection.execute
+        execute(
             "INSERT INTO workspaces VALUES (?, ?, ?, ?, ?)",
             (workspace_id, request.project_id, display_name, str(path), created_at),
         )
@@ -100,6 +103,21 @@ class WorkspaceService:
     def write_text(self, workspace_id: str, relative_path: str, content: str) -> Path:
         """先写同目录临时文件，再 replace 目标，降低中途崩溃产生半文件的风险。"""
         target = self.resolve_path(workspace_id, relative_path)
+        managed = self.resolve_path(workspace_id, ".") / ".chipflow"
+        if target == managed or managed in target.parents:
+            raise ValueError("The design configuration directory is managed by ConfigService")
+        return self._write_text(target, content)
+
+    def write_design_config(self, workspace_id: str, content: str) -> Path:
+        root = self.resolve_path(workspace_id, ".")
+        self._assert_within_root(root)
+        target = self.resolve_path(workspace_id, DESIGN_CONFIG_PATH)
+        if target != root / DESIGN_CONFIG_PATH:
+            raise ValueError("Design configuration path cannot use symbolic links")
+        return self._write_text(target, content)
+
+    @staticmethod
+    def _write_text(target: Path, content: str) -> Path:
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
         temporary.write_text(content, encoding="utf-8")

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from app.domain.orchestration import (
     TaskPlanDraft, TaskState, VerificationResult,
 )
 from app.models.provider import ModelInvocationError
+from app.services.config_extractor_service import ConfigExtractorService
 from app.services.context_builder_service import ContextBuilderService
 from app.services.eda_workflow import eda_workflow
 from app.services.global_planner_service import GlobalPlannerService, InvalidPlan, PlanningPolicy
@@ -66,6 +68,8 @@ class TaskExecutorService:
         self, runs: RunService, repo: OrchestrationRepository, contexts: ContextBuilderService,
         selector: ToolSelectorService, actions: TaskActionService, *,
         planner: GlobalPlannerService | None = None, agent_runtime=runtime,
+        on_completed: Callable[[RunView], None] | None = None,
+        config_extractor: ConfigExtractorService | None = None,
     ) -> None:
         self.runs = runs
         self.repo = repo
@@ -75,6 +79,8 @@ class TaskExecutorService:
         self.actions.tools = runs.tools
         self.actions.patches = runs.patches
         self.runtime = agent_runtime
+        self.on_completed = on_completed
+        self.config_extractor = config_extractor
         self.planner = planner or GlobalPlannerService(actions.registry)
         self.replanner = ReplannerService(self.planner)
         self.verifier = TaskVerifierService(runs.tools)
@@ -184,6 +190,10 @@ class TaskExecutorService:
             return
         checkpoint = self.repo.checkpoint(run_id)
         request = ChatRequest.model_validate_json(checkpoint["request_json"])
+        if self.config_extractor and not checkpoint["context_id"] and self.config_extractor.configs.run_config(run_id) is None:
+            root = self.repo.sessions.get_message(checkpoint["root_message_id"])
+            config = await asyncio.to_thread(self.config_extractor.prepare, request, root, run.primary_agent.value)
+            self.config_extractor.configs.record_input(run_id, config)
         if not checkpoint["plan_json"]:
             if not await self._plan(run, request, checkpoint):
                 return
@@ -273,15 +283,18 @@ class TaskExecutorService:
             context = await asyncio.to_thread(
                 self.contexts.build, run.session_id, source_request, run.primary_agent.value,
                 root.message_id, before_sequence=root.sequence, pinned_version_ids=tuple(source_request.document_ids),
+                project_config=self.config_extractor.configs.run_config(run.run_id) if self.config_extractor else None,
             )
             manifest = self.contexts.save_manifest(run.session_id, run.run_id, run.primary_agent.value, context)
             snapshot = context.effective_request.model_dump(
                 mode="json", include={"history", "documents", "project_id", "module_name", "message"},
             )
             snapshot["_memory_context"] = context.memory_context
+            snapshot["_project_config"] = context.project_config
             snapshot["_context_manifest"] = {
                 "context_id": manifest.context_id, "message_ids": manifest.message_ids,
                 "memory_ids": manifest.memory_ids, "chunk_ids": manifest.chunk_ids,
+                "project_config": manifest.sections["project_config"],
             }
             self.repo.save_snapshot(run.run_id, manifest.context_id, snapshot)
         decisions = self.repo.decisions(run.run_id)
@@ -908,10 +921,13 @@ class TaskExecutorService:
             "output_guidance": "报告在 submit_task_output.text_outputs 提交，引用每份分析和 Lint 结果为 [artifact:ID]。",
         }
         if contract.assigned_agent == run.primary_agent:
+            snapshot = json.loads(self.repo.checkpoint(run.run_id)["snapshot"])
             payload["user_request"] = run.user_instruction
             payload["clarifications"] = [item["content"] for item in self.repo.decisions(run.run_id)]
             if request.orchestration_mode == "chat":
-                payload["conversation"] = json.loads(self.repo.checkpoint(run.run_id)["snapshot"])
+                payload["conversation"] = snapshot
+            else:
+                payload["project_configuration"] = snapshot.get("_project_config", {})
         else:
             payload["clarifications"] = [item["content"] for item in self.repo.decisions(run.run_id, contract.task_id)]
         if "real_rtl_lint" in contract.capability_requirements:
@@ -953,7 +969,12 @@ class TaskExecutorService:
              self.repo.db.dumps(snapshot.get("message_ids", [])), self.repo.db.dumps(snapshot.get("memory_ids", [])),
              self.repo.db.dumps(snapshot.get("chunk_ids", [])),
              self.repo.db.dumps([item.ref_id for item in evidence if item.kind == "observation"]),
-             self.repo.db.dumps({"decision": state.current_iteration}), now().isoformat(), state.task_id,
+             self.repo.db.dumps({
+                 "decision": state.current_iteration,
+                 "project_config": snapshot.get("project_config") or (
+                     {"revision": payload["project_configuration"].get("revision")} if payload.get("project_configuration") else {}
+                 ),
+             }), now().isoformat(), state.task_id,
              self.repo.db.dumps([item.ref_id for item in evidence if item.kind == "artifact"]),
              hashlib.sha256(encoded).hexdigest()),
         )
@@ -1017,6 +1038,11 @@ class TaskExecutorService:
             self.repo.update_run(conn, run.run_id, status, result=result)
             self.repo.post_response(conn, run.run_id, message)
             self.repo.event(conn, run.run_id, f"run_{status}", "Run 已结束。" if report_id else message)
+        if status == "completed" and self.on_completed:
+            try:
+                self.on_completed(self._run(run.run_id))
+            except Exception:
+                logger.exception("Could not notify completion for Run %s", run.run_id)
 
     def _project_results(self, run_id: str) -> list[dict]:
         return [
