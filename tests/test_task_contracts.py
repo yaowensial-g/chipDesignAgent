@@ -173,19 +173,21 @@ def test_combined_reflection_selection_checks_evidence_and_decision(monkeypatch,
         }
 
     agent = LLMChipDesignRuntime()
-    monkeypatch.setattr(agent, "_reflection_provider", lambda: (SimpleNamespace(choose_tool=choose_tool), True))
+    monkeypatch.setattr("app.services.llm_invocation_service.provider_factory.get",
+                        lambda endpoint, **kwargs: SimpleNamespace(choose_tool=choose_tool))
+    context = {"budget": {}, "observations": ["read"]}
     shortlist = [tool_registry.get("analyze_rtl_design").definition]
-    parsed, selection = agent.reflect_and_select(contract, {"observations": ["read"]}, shortlist, (evidence,))
+    parsed, selection = agent.reflect_and_select(contract, context, shortlist, (evidence,))
     assert isinstance(parsed, ReflectionResult) and selection.name == "analyze_rtl_design" and len(calls) == 1
     with pytest.raises(ValueError, match="unavailable evidence"):
-        agent.reflect_and_select(contract, {}, shortlist)
+        agent.reflect_and_select(contract, context, shortlist)
     reflection["decision"] = "submit"
     with pytest.raises(ValueError, match="does not match"):
-        agent.reflect_and_select(contract, {}, shortlist, (evidence,))
+        agent.reflect_and_select(contract, context, shortlist, (evidence,))
     reflection["decision"] = "continue"
     reflection["satisfied_criteria"] = ["deliver"]
     with pytest.raises(ValueError, match="classify each"):
-        agent.reflect_and_select(contract, {}, shortlist, (evidence,))
+        agent.reflect_and_select(contract, context, shortlist, (evidence,))
 
 
 def test_read_only_contract_rejects_candidate_write():

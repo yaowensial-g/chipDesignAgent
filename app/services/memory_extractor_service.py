@@ -9,13 +9,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+from app.domain.context import ContextBuildRequest, ContextPurpose
 from app.services.memory_extraction_context import (
     MemoryExtractionContext,
     MemoryExtractionContextBuilder,
     ProjectConfigReader,
 )
 from app.services.config_service import ConfigService, config_service
-from app.services.design_data_model import StructuredExtractor, deepseek_design_model
+from app.services.design_data_model import DeepSeekDesignModel, StructuredExtractor, deepseek_design_model, invoke_extractor
 from app.services.memory_service import MemoryService
 from app.services.session_service import SessionService
 from app.services.token_service import TokenCounter, token_counter
@@ -58,7 +59,7 @@ class MemoryExtractorService:
         tokens: TokenCounter = token_counter,
         *,
         read_project_config: ProjectConfigReader | None = None,
-        generate_memories: StructuredExtractor | None = None,
+        generate_memories: DeepSeekDesignModel | StructuredExtractor | None = None,
         configs: ConfigService | None = None,
         max_workers: int = 2,
         max_pending_tasks: int = 32,
@@ -229,7 +230,17 @@ class MemoryExtractorService:
             if mode in {"test", "mock", "deterministic"}:
                 return []
             raise RuntimeError("Run memory extraction has no configured model")
-        result = self.generate_memories(EXTRACTION_PROMPT, context.model_input())
+        from app.services.context_builder_service import ContextBuilderService
+
+        request = ContextBuildRequest(
+            ContextPurpose.MEMORY_EXTRACTION, project_id=context.project_id, module_name=context.module_name,
+            session_id=context.session_id, agent_role=context.agent_role, run_id=context.run_id,
+            task_input={"extraction": context},
+        )
+        result = invoke_extractor(
+            self.generate_memories, EXTRACTION_PROMPT, request,
+            ContextBuilderService(self.db, sessions=self.contexts.sessions, memories=self.memories, tokens=self.contexts.tokens),
+        )
         if not isinstance(result, dict) or not isinstance(result.get("memories"), list):
             raise ValueError("memory extraction output must contain a memories array")
         return result["memories"]

@@ -6,6 +6,8 @@ from langgraph.types import Command
 from app.domain.enums import TaskStatus
 from app.domain.models import CreateDSTaskRequest, TaskView, UserResolution
 from app.agents.runtime import runtime
+from app.services.context_builder_service import ContextBuilderService
+from app.services.llm_invocation_service import invocation_scope
 from app.storage.database import Database, database
 from app.workflows.ds_workflow import ds_workflow
 
@@ -13,6 +15,7 @@ from app.workflows.ds_workflow import ds_workflow
 class TaskService:
     def __init__(self, db: Database = database) -> None:
         self.db = db
+        self.contexts = ContextBuilderService(db)
         self._states: dict[str, dict[str, Any]] = {}
 
     async def create_ds_task(self, request: CreateDSTaskRequest, *, project_config: dict | None = None) -> TaskView:
@@ -26,7 +29,8 @@ class TaskService:
             "issues": [],
             "findings": [],
         }
-        result = await ds_workflow.ainvoke(initial_state, self._config(task_id))
+        with invocation_scope(self.contexts, default_task_id=task_id):
+            result = await ds_workflow.ainvoke(initial_state, self._config(task_id))
         self._states[task_id] = dict(result)
         self._persist(task_id, self._states[task_id])
         return self._to_view(task_id, self._states[task_id])
@@ -51,14 +55,15 @@ class TaskService:
         state = self._states[task_id]
         if "__interrupt__" not in state and not state.get("_pending_user_request"):
             raise ValueError("Task is not waiting for user input")
-        if "__interrupt__" in state:
-            result = await ds_workflow.ainvoke(
-                Command(resume=resolution.model_dump(mode="json")),
-                self._config(task_id),
-            )
-            self._states[task_id] = dict(result)
-        else:
-            self._states[task_id] = self._resume_persisted(state, resolution)
+        with invocation_scope(self.contexts, default_task_id=task_id):
+            if "__interrupt__" in state:
+                result = await ds_workflow.ainvoke(
+                    Command(resume=resolution.model_dump(mode="json")),
+                    self._config(task_id),
+                )
+                self._states[task_id] = dict(result)
+            else:
+                self._states[task_id] = self._resume_persisted(state, resolution)
         self._persist(task_id, self._states[task_id])
         return self._to_view(task_id, self._states[task_id])
 

@@ -6,18 +6,15 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from app.agents.definitions import AgentDefinition
-from app.config.model_settings import model_settings_service
-from app.models.factory import provider_factory
-from app.models.provider import OpenAIModelProvider
+from app.services.llm_invocation_service import llm_invocation_service
 
 
 class BaseAgent(ABC):
-    """封装角色 Prompt、模型端点选择和专业能力。"""
+    """封装角色 Prompt 和专业能力。"""
 
     definition: AgentDefinition
 
-    def provider(self) -> OpenAIModelProvider:
-        return provider_factory.get(model_settings_service.effective().main_endpoint())
+    invocations = llm_invocation_service
 
     @abstractmethod
     def execute(self, request: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:

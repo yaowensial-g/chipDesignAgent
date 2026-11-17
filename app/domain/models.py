@@ -416,7 +416,7 @@ class MemoryView(BaseModel):
 
 class ContextManifestView(BaseModel):
     context_id: str
-    session_id: str
+    session_id: str | None = None
     run_id: str | None = None
     agent_role: str
     token_budget: int
@@ -434,6 +434,10 @@ class ContextManifestView(BaseModel):
     excluded: list[dict[str, Any]] = Field(default_factory=list)
     prompt_hash: str | None = None
     context_version: int = 2
+    purpose: str = "CHAT_BASE"
+    base_context_id: str | None = None
+    profile_version: int = 1
+    invocation_id: str | None = None
     created_at: str
 
 

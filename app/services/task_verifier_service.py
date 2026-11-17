@@ -109,8 +109,9 @@ class TaskVerifierService:
             return False
         return False
 
-    def _snapshot(self, item: ArtifactPayload) -> RTLSourceSnapshot:
-        self._check_content(item)
+    @staticmethod
+    def _snapshot(item: ArtifactPayload) -> RTLSourceSnapshot:
+        TaskVerifierService._check_content(item)
         artifact = item.artifact
         return RTLSourceSnapshot(
             relative_path=artifact.metadata["relative_path"], content_ref=artifact.artifact_id,

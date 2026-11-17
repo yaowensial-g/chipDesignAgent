@@ -108,11 +108,12 @@ def test_connection_endpoint_uses_saved_settings(tmp_path: Path, monkeypatch) ->
         def __init__(self, settings):
             assert settings.model == "test-model"
 
-        def test_connection(self):
+        def test_connection(self, instructions, probe):
+            assert probe == "只回答 CHIP_AGENT_CONNECTION_OK"
             return "CHIP_AGENT_CONNECTION_OK"
 
     monkeypatch.setattr(
-        "app.api.routes.provider_factory.get",
+        "app.services.llm_invocation_service.provider_factory.get",
         lambda settings: FakeProvider(settings),
     )
     response = client.post("/api/v1/settings/model/test")

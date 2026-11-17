@@ -36,9 +36,9 @@ class AgentRegistry:
         self,
         agent_id: str,
         request: dict[str, Any],
-        context: dict[str, Any],
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.get(agent_id).execute(request, context)
+        return self.get(agent_id).execute(request, request if context is None else context)
 
     def call(self, agent_id: str, capability: str, *args, **kwargs):
         """调用 Agent 的公开专业能力。"""

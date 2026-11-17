@@ -53,7 +53,7 @@ from app.domain.models import (
     DelegationResult,
 )
 from app.domain.enums import AgentRole
-from app.models.factory import provider_factory
+from app.services.llm_invocation_service import llm_invocation_service
 from app.services.conversation_service import conversation_service
 from app.services.orchestrator_service import orchestrator_service
 from app.domain.orchestration import TaskPlan
@@ -118,7 +118,7 @@ async def test_model_connection(
         raise HTTPException(status_code=400, detail=f"请先保存 {label} API Key")
     # Provider 会把认证、限流、超时、网络和参数异常转换成结构化
     # ModelInvocationError；交给全局异常处理器返回统一 error JSON 和请求编号。
-    provider_factory.get(endpoint).test_connection()
+    llm_invocation_service.check_connection(endpoint)
     return ModelConnectionResult(
         ok=True,
         message="模型连接成功",

@@ -4,6 +4,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from app.domain.context import ContextBuildRequest, ContextPurpose
 from app.domain.orchestration import (
     AddedTask, ExecutionPolicy, InputSpec, PlanDelta, ReplacedTask, ReplanTrigger, TaskContract,
     TaskOutputRef, TaskPlan, TaskPlanDraft, TaskState, UpdatedDependencies,
@@ -16,10 +17,13 @@ class ReplannerService:
         self.planner = planner
 
     def propose(self, runtime, plan: TaskPlan, policy: PlanningPolicy, trigger: ReplanTrigger, context: dict) -> PlanDelta:
-        return PlanDelta.model_validate(runtime.propose_plan_delta({
-            "plan": plan.model_dump(mode="json"), "trigger": trigger.model_dump(mode="json"),
-            "catalog": self.planner._catalog(policy), "policy": policy.model_dump(mode="json"), **context,
-        }))
+        request = ContextBuildRequest(
+            ContextPurpose.REPLANNING, run_id=plan.run_id, task_id=trigger.task_id,
+            agent_role=policy.primary_agent.value, evidence_refs=trigger.evidence,
+            task_input={"plan": plan, "trigger": trigger, "catalog": self.planner._catalog(policy),
+                        "policy": policy, "execution": context},
+        )
+        return PlanDelta.model_validate(runtime.propose_plan_delta(request))
 
     def revise(
         self, plan: TaskPlan, delta: PlanDelta, policy: PlanningPolicy, states: dict[str, TaskState],

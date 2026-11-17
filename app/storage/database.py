@@ -350,7 +350,7 @@ class Database:
         -- 它是调试“模型为什么没看到某条规格”的关键审计对象。
         CREATE TABLE IF NOT EXISTS context_manifests (
             context_id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
+            session_id TEXT,
             run_id TEXT,
             agent_role TEXT NOT NULL,
             token_budget INTEGER NOT NULL,
@@ -365,6 +365,29 @@ class Database:
             created_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES conversations(session_id)
         );
+        CREATE TABLE IF NOT EXISTS llm_invocations (
+            invocation_id TEXT PRIMARY KEY,
+            context_id TEXT NOT NULL,
+            parent_invocation_id TEXT,
+            session_id TEXT,
+            run_id TEXT,
+            task_id TEXT,
+            purpose TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            status TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER,
+            error_code TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY(context_id) REFERENCES context_manifests(context_id),
+            FOREIGN KEY(parent_invocation_id) REFERENCES llm_invocations(invocation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_invocations_run ON llm_invocations(run_id, created_at);
         -- 每次跨专业 Delegate 都有独立记录，失败或超时也不会丢失审计线索。
         CREATE TABLE IF NOT EXISTS delegation_tasks (
             task_id TEXT PRIMARY KEY,
@@ -511,12 +534,35 @@ class Database:
                 "raw_turn_ids_json": "TEXT NOT NULL DEFAULT '[]'",
                 "orchestration_task_id": "TEXT",
                 "artifact_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+                "purpose": "TEXT NOT NULL DEFAULT 'CHAT_BASE'",
+                "base_context_id": "TEXT",
+                "profile_version": "INTEGER NOT NULL DEFAULT 1",
+                "invocation_id": "TEXT",
             }
             for column, declaration in manifest_migrations.items():
                 if column not in manifest_columns:
                     connection.execute(
                         f"ALTER TABLE context_manifests ADD COLUMN {column} {declaration}"
                     )
+            if any(
+                row[1] == "session_id" and row[3]
+                for row in connection.execute("PRAGMA table_info(context_manifests)")
+            ):
+                # Existing databases required a chat session. Preserve their rows and table
+                # shape while making room for unscoped health and maintenance calls.
+                table_sql = connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name='context_manifests'"
+                ).fetchone()[0]
+                connection.execute(
+                    table_sql.replace("context_manifests", "context_manifests_nullable", 1)
+                    .replace("session_id TEXT NOT NULL", "session_id TEXT", 1)
+                )
+                connection.execute("INSERT INTO context_manifests_nullable SELECT * FROM context_manifests")
+                connection.execute("DROP TABLE context_manifests")
+                connection.execute("ALTER TABLE context_manifests_nullable RENAME TO context_manifests")
+                connection.execute(
+                    "CREATE INDEX idx_context_run ON context_manifests(run_id, created_at)"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(project_id, module_name, memory_key, status)"
             )

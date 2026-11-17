@@ -49,6 +49,14 @@ class ModelInvocationError(RuntimeError):
         ]
 
 
+class InvalidJSONOutput(ModelInvocationError):
+    """Expose the first attempt to the invocation service for a single format repair."""
+
+    def __init__(self, operation: str, raw_output: str) -> None:
+        super().__init__(f"{operation}没有返回有效 JSON", code="MODEL_INVALID_JSON")
+        self.raw_output = raw_output
+
+
 class OpenAIModelProvider:
     """把不同 API 风格归一化成项目内部稳定接口。"""
     def __init__(self, settings: ModelEndpointSettings, *, client: OpenAI | None = None) -> None:
@@ -142,7 +150,7 @@ class OpenAIModelProvider:
                 parsed = None
         if parsed is None:
             if not repair_json:
-                raise ModelInvocationError(f"{operation}没有返回有效 JSON")
+                raise InvalidJSONOutput(operation, text)
             raise ModelInvocationError(
                 f"{operation}没有返回有效 JSON；自动提取和一次格式修复后仍无法解析"
             )
@@ -237,14 +245,13 @@ class OpenAIModelProvider:
         except Exception as exc:
             raise _model_error(exc, "模型 Tool Calling") from exc
 
-    def test_connection(self) -> str:
+    def test_connection(
+        self, instructions: str = "你是连接检查器。严格按要求回答。",
+        probe: str = "只回答 CHIP_AGENT_CONNECTION_OK",
+    ) -> str:
         """执行最小连接探针；成功只说明端点/Key/模型可响应。"""
-        result = self.generate_text(
-            "你是连接检查器。严格按要求回答。",
-            "只回答 CHIP_AGENT_CONNECTION_OK",
-        )
+        result = self.generate_text(instructions, probe)
         if "CHIP_AGENT_CONNECTION_OK" not in result:
-            print(result)
             raise ModelInvocationError("模型已响应，但未返回预期的连接检查结果")
         return result.strip()
 

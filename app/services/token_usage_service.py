@@ -40,6 +40,15 @@ class TokenUsageTracker:
         self._current: ContextVar[TokenUsage | None] = ContextVar(
             "chipflow_token_usage", default=None
         )
+        self._invocation: ContextVar[TokenUsage | None] = ContextVar(
+            "chipflow_invocation_usage", default=None
+        )
+
+    def start_invocation(self, usage: TokenUsage) -> Token:
+        return self._invocation.set(usage)
+
+    def finish_invocation(self, token: Token) -> None:
+        self._invocation.reset(token)
 
     def start(self) -> Token:
         """开始一个新的统计作用域，并返回用于恢复旧上下文的令牌。"""
@@ -63,15 +72,11 @@ class TokenUsageTracker:
         某些兼容端点或测试替身可能不返回 usage。此时仍记录一次模型调用，但不会用
         本地字符估算冒充厂商计费数据，因此 Token 数保持为 0。
         """
-        current = self._current.get()
-        if current is None:
+        targets = [item for item in (self._current.get(), self._invocation.get()) if item is not None]
+        if not targets:
             return
 
         usage = getattr(response, "usage", None)
-        current.model_calls += 1
-        if usage is None:
-            return
-
         input_tokens = _integer_attribute(usage, "input_tokens", "prompt_tokens")
         output_tokens = _integer_attribute(usage, "output_tokens", "completion_tokens")
         total_tokens = _integer_attribute(usage, "total_tokens")
@@ -79,9 +84,11 @@ class TokenUsageTracker:
         if total_tokens <= 0 and (input_tokens > 0 or output_tokens > 0):
             total_tokens = input_tokens + output_tokens
 
-        current.input_tokens += input_tokens
-        current.output_tokens += output_tokens
-        current.total_tokens += total_tokens
+        for target in targets:
+            target.model_calls += 1
+            target.input_tokens += input_tokens
+            target.output_tokens += output_tokens
+            target.total_tokens += total_tokens
 
 
 def _integer_attribute(value: Any, *names: str) -> int:

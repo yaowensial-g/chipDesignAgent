@@ -217,7 +217,10 @@ class ReplanningRuntime(ScriptedRuntime):
             }})
         return super().reflect_and_select(contract, context, shortlist, evidence)
 
-    def propose_plan_delta(self, payload):
+    def propose_plan_delta(self, request):
+        from app.services.context_builder_service import context_builder_service
+
+        payload = context_builder_service.build_invocation(request).payload
         self.proposals.append(payload)
         trigger = payload["trigger"]
         if self.broken_delta:
@@ -288,6 +291,12 @@ async def test_incremental_prerequisite_and_late_results(executor_factory, repla
     assert [name for name, _ in agent.calls] == ["design", "verification"]
     assert [item["generation"] for item in executor.repo.attempts(run.run_id, design)] == [1]
     assert [item["generation"] for item in executor.repo.attempts(run.run_id, review)] == [1, 2]
+    [proposal] = agent.proposals
+    by_id = {task["task_id"]: task for task in proposal["tasks"]}
+    assert len(by_id[design]["verified_outputs"]) == 2
+    assert len(by_id[review]["bound_inputs"]) == 2 and by_id[review]["observations"]
+    assert any(node["task_id"] == review and design in node["depends_on"] for node in proposal["plan"]["tasks"])
+    assert proposal["trigger"]["issue"]["related_artifact_ids"]
     assert executor.repo.action_history(review, 1)[0]["decision_sequence"] == executor.repo.action_history(review, 2)[0]["decision_sequence"] == 1
     assert [record["status"] for record in executor.repo.replan_history(run.run_id)] == ["applied"]
 
@@ -435,8 +444,9 @@ async def test_replan_cannot_expand_permissions_or_drop_acceptance(executor_fact
     agent = ReplanningRuntime(add_prerequisite=True)
     proposal = agent.propose_plan_delta
 
-    def forbidden(payload):
-        delta = proposal(payload)
+    def forbidden(request):
+        delta = proposal(request)
+        payload = agent.proposals[-1]
         if rejection == "unauthorized_capability":
             delta["operations"][0]["task"]["capability_requirements"] = ["apply_patch"]
         else:
@@ -549,7 +559,8 @@ async def test_hierarchical_uart_verifies_before_scheduling_downstream(executor_
         assert executor.repo.reflections(state.task_id)[-1].result.decision == "submit"
         assert executor.repo.verifications(state.task_id)[0]["result"]["passed"]
     manifest = executor.contexts.list_for_run(run.run_id)
-    assert any(item.orchestration_task_id and item.artifact_ids for item in manifest)
+    assert [item.purpose for item in manifest] == ["CHAT_BASE"]
+    assert not executor.repo.db.fetch_all("SELECT * FROM llm_invocations WHERE run_id=?", (run.run_id,))
     assert executor.artifact(run.run_id, run.result["final_artifact_id"]).content.startswith(b"UART review")
 
 

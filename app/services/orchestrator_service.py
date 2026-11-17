@@ -24,6 +24,7 @@ from app.services.config_completion_service import ConfigCompletionService
 from app.services.config_extractor_service import ConfigExtractorService
 from app.services.config_service import ConfigService
 from app.services.design_data_model import deepseek_design_model
+from app.services.llm_invocation_service import InvocationScope, invocation_scope
 from app.services.run_service import RunService, run_service
 from app.services.delegation_service import DelegationService, delegation_service
 from app.services.session_service import SessionService, session_service
@@ -168,6 +169,15 @@ class OrchestratorService:
             request.message,
             agent_role=primary_agent.value,
         )
+        with invocation_scope(
+            self.contexts, session_id=session_id, agent_role=primary_agent.value,
+            source_message_id=user_message.message_id,
+        ) as scope:
+            return await self._run_request(request, user_message, primary_agent, role_changed, scope)
+
+    async def _run_request(self, request: ChatRequest, user_message, primary_agent: AgentRole,
+                           role_changed: bool, scope: InvocationScope) -> ChatResponse:
+        session_id = user_message.session_id
         config = await asyncio.to_thread(self.config_extractor.prepare, request, user_message, primary_agent.value)
         context = self.contexts.build(
             session_id,
@@ -177,18 +187,7 @@ class OrchestratorService:
             project_config=config,
         )
         effective_request = context.effective_request
-        request_payload = effective_request.model_dump(mode="json")
-        # 这两个下划线字段是模型上下文而不是公共 ChatRequest 字段，因此不污染 API 契约。
-        request_payload["_memory_context"] = context.memory_context
-        request_payload["_project_config"] = context.project_config
-        request_payload["_context_manifest"] = {
-            "message_ids": context.message_ids,
-            "turn_summary_ids": context.turn_summary_ids,
-            "raw_turn_ids": context.raw_turn_ids,
-            "memory_ids": context.memory_ids,
-            "chunk_ids": context.chunk_ids,
-            "sections": context.sections,
-        }
+        request_payload = self.contexts.run_snapshot(context)
 
         # Intent Enricher 也只能看到当前角色有权使用的 Tool 名称，避免它在最早阶段
         # 就建议一个本角色永远无法执行的动作。
@@ -206,6 +205,7 @@ class OrchestratorService:
         manifest = self.contexts.save_manifest(
             session_id, run_id, primary_agent.value, context
         )
+        scope.attach_run(run_id, manifest.context_id)
         self.runs.append_event(
             run_id,
             "context_built",

@@ -29,25 +29,12 @@ class MemoryExtractionContext:
     project_config: dict | None
     related_memories: dict[str, MemoryView]
     configured_facts: frozenset[str] = frozenset()
+    message_ids: tuple[str, ...] = ()
+    session_id: str | None = None
+    agent_role: str | None = None
 
     def repeats_config(self, content: str) -> bool:
         return _fact_text(content) in self.configured_facts
-
-    def model_input(self) -> dict:
-        return {
-            "run_id": self.run_id,
-            "project_id": self.project_id,
-            "module_name": self.module_name,
-            "user_request": self.user_request,
-            "assistant_response": self.assistant_response,
-            "run_summary": self.run_summary,
-            "project_config": self.project_config,
-            "related_memories": [
-                {"memory_id": memory.memory_id, "content": memory.content}
-                for memory in self.related_memories.values()
-            ],
-        }
-
 
 class MemoryExtractionContextBuilder:
     def __init__(
@@ -115,6 +102,7 @@ class MemoryExtractionContextBuilder:
             config,
             {item.memory_id: item for item in related if self.tokens.count(item.content) <= 500},
             frozenset(facts),
+            tuple(item.message_id for item in messages), run["session_id"], role,
         )
 
     def _delegations(self, run_id: str, role: str) -> list[dict]:

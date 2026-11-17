@@ -17,7 +17,6 @@ from app.services.config_extractor_service import ConfigExtractorService
 from app.services.config_service import DESIGN_CONFIG_PATH, ConfigRevisionConflict, ConfigService
 from app.services.context_builder_service import ContextBuilderService
 from app.services.conversation_service import conversation_service
-from app.services import design_data_model
 from app.services.delegation_service import DelegationService
 from app.services.document_service import DocumentService
 from app.services.memory_extractor_service import MemoryExtractorService, memory_extractor_service
@@ -40,13 +39,15 @@ def config_system(tmp_path):
 
 
 def test_production_extractors_use_only_the_authorized_deepseek_endpoint(monkeypatch):
+    from app.domain.context import ContextBuildRequest, ContextPurpose
+
     endpoint = ModelEndpointSettings(
         enabled=True, provider="deepseek", api_style="responses", model="deepseek-flash",
         base_url="https://api.deepseek.com", api_key="synthetic-test-key",
         timeout_seconds=60, max_output_tokens=1000, api_key_source="test",
     )
     monkeypatch.setenv("CHIP_AGENT_RUNTIME_MODE", "production")
-    monkeypatch.setattr(design_data_model.model_settings_service, "effective",
+    monkeypatch.setattr("app.services.llm_invocation_service.model_settings_service.effective",
                         lambda: SimpleNamespace(main_endpoint=lambda: endpoint))
     calls = []
 
@@ -59,21 +60,28 @@ def test_production_extractors_use_only_the_authorized_deepseek_endpoint(monkeyp
 
         return SimpleNamespace(generate_json=generate)
 
-    monkeypatch.setattr(design_data_model.provider_factory, "get", get_provider)
-    config = orchestrator_service.config_extractor.generate
-    memory = memory_extractor_service.generate_memories
-    config("configuration test prompt", {"current_request": "synthetic config request"})
-    memory("memory test prompt", {"user_request": "synthetic Run"})
+    monkeypatch.setattr("app.services.llm_invocation_service.provider_factory.get", get_provider)
+    config = orchestrator_service.config_extractor.generate.generate
+    memory = memory_extractor_service.generate_memories.generate
+    config_request = ContextBuildRequest(ContextPurpose.CONFIG_EXTRACTION, task_input={
+        "current_request": "synthetic config request", "current_config": {}, "project_id": "test", "module_name": "test",
+    })
+    memory_request = ContextBuildRequest(ContextPurpose.MEMORY_EXTRACTION, task_input={
+        "run_id": "test", "project_id": "test", "module_name": "test", "user_request": "synthetic Run",
+        "assistant_response": "synthetic response", "run_summary": {}, "project_config": {},
+    })
+    config("configuration test prompt", config_request)
+    memory("memory test prompt", memory_request)
     assert [kwargs["expected_shape"] for _, kwargs in calls] == ['{"updates":[]}', '{"memories":[]}']
     assert all(not kwargs["repair_json"] for _, kwargs in calls)
 
     for base_url in ("http://api.deepseek.com", "https://api.deepseek.com.example.test", "https://proxy.example.test"):
         endpoint = replace(endpoint, base_url=base_url)
         with pytest.raises(RuntimeError, match="authorized only"):
-            memory("memory test prompt", {"user_request": "synthetic Run"})
+            memory("memory test prompt", memory_request)
     endpoint = replace(endpoint, base_url="https://api.deepseek.com", enabled=False)
     with pytest.raises(RuntimeError, match="not enabled"):
-        config("configuration test prompt", {})
+        config("configuration test prompt", config_request)
     assert len(calls) == 2
 
 

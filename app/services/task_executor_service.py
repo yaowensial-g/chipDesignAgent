@@ -12,6 +12,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from app.agents.runtime import runtime
+from app.domain.context import ContextPurpose as Purpose, RunBaseContext
 from app.domain.enums import AgentRole, Mutability, ToolRunStatus
 from app.domain.models import ChatRequest, ChatResponse, RunResumeRequest, RunView, TaskIntent, ToolRunRequest, ToolRunView, ToolSelection
 from app.domain.orchestration import (
@@ -22,8 +23,10 @@ from app.domain.orchestration import (
 from app.models.provider import ModelInvocationError
 from app.services.config_extractor_service import ConfigExtractorService
 from app.services.context_builder_service import ContextBuilderService
+from app.services.context_profiles import CONTEXT_PROFILES
 from app.services.eda_workflow import eda_workflow
 from app.services.global_planner_service import GlobalPlannerService, InvalidPlan, PlanningPolicy
+from app.services.llm_invocation_service import invocation_scope
 from app.services.replanner_service import ReplannerService
 from app.services.run_service import RunService
 from app.services.task_action_service import TaskActionService
@@ -34,7 +37,6 @@ from app.storage.orchestration_repository import OrchestrationRepository, StaleE
 from app.tools.builtin import verilator_available, verilator_enabled
 from app.tools.adapters.verilator_adapter import VERILATOR_TOOLS
 from app.tools.eda_catalog import EDA_TOOLS
-from app.tools.project_manifest import FrozenProject
 
 
 logger = logging.getLogger(__name__)
@@ -172,7 +174,13 @@ class TaskExecutorService:
             return self._run(run_id)
         self._driving.add(run_id)
         try:
-            await self._drive(run_id)
+            run = self._run(run_id)
+            checkpoint = self.repo.checkpoint(run_id)
+            with invocation_scope(
+                self.contexts, session_id=run.session_id, run_id=run_id, agent_role=run.primary_agent.value,
+                source_message_id=checkpoint["root_message_id"], base_context_id=checkpoint["context_id"],
+            ):
+                await self._drive(run_id)
         except StaleExecution:
             logger.info("Ignored superseded hierarchical execution: %s", run_id)
         except Exception:
@@ -199,6 +207,7 @@ class TaskExecutorService:
             if not await self._plan(run, request, checkpoint):
                 return
             checkpoint = self.repo.checkpoint(run_id)
+        base_context = self.contexts.run_base_context(checkpoint)
         while True:
             checkpoint = self.repo.checkpoint(run_id)
             plan = TaskPlan.model_validate_json(checkpoint["plan_json"])
@@ -213,8 +222,9 @@ class TaskExecutorService:
                 if not enabled:
                     self._finish(run, "failed", "当前 Run 的增量重规划不可用。", plan_id=plan.plan_id)
                     return
-                if not await self._replan(run, plan, policy, trigger):
-                    return
+                with invocation_scope(base_context_id=checkpoint["context_id"], task_id=trigger.task_id):
+                    if not await self._replan(run, plan, policy, trigger):
+                        return
                 continue
             states = self.repo.states(run_id)
             active_id = checkpoint["active_task_id"]
@@ -223,8 +233,14 @@ class TaskExecutorService:
                     self._finish(run, "failed", states[active_id].failure_reason or "交付件未通过独立验收。", plan_id=plan.plan_id)
                     return
                 contract = next(item for item in plan.tasks if item.task_id == active_id)
-                if not await self._step(run, request, plan, contract, states[active_id], limits, enabled):
-                    return
+                with invocation_scope(
+                    task_id=active_id, generation=states[active_id].generation,
+                    agent_role=contract.assigned_agent.value,
+                    base_context_id=checkpoint["context_id"] if contract.assigned_agent == run.primary_agent else None,
+                    source_message_id=checkpoint["root_message_id"] if contract.assigned_agent == run.primary_agent else None,
+                ):
+                    if not await self._step(run, request, plan, contract, states[active_id], limits, enabled, base_context):
+                        return
             elif all(states[task.task_id].status == "completed" for task in plan.tasks):
                 final = self.repo.local_outputs(plan.final_task_id, "verified", states[plan.final_task_id].generation)
                 report = next(item for item in final if item.artifact.artifact_type == "report")
@@ -287,23 +303,16 @@ class TaskExecutorService:
                 project_config=self.config_extractor.configs.run_config(run.run_id) if self.config_extractor else None,
             )
             manifest = self.contexts.save_manifest(run.session_id, run.run_id, run.primary_agent.value, context)
-            snapshot = context.effective_request.model_dump(
-                mode="json", include={"history", "documents", "project_id", "module_name", "message"},
-            )
-            snapshot["_memory_context"] = context.memory_context
-            snapshot["_project_config"] = context.project_config
-            snapshot["_context_manifest"] = {
-                "context_id": manifest.context_id, "message_ids": manifest.message_ids,
-                "memory_ids": manifest.memory_ids, "chunk_ids": manifest.chunk_ids,
-                "project_config": manifest.sections["project_config"],
-            }
+            snapshot = self.contexts.run_snapshot(context, manifest, hierarchical=True)
             self.repo.save_snapshot(run.run_id, manifest.context_id, snapshot)
+            checkpoint = self.repo.checkpoint(run.run_id)
         decisions = self.repo.decisions(run.run_id)
         payload = {**snapshot, "message": request.message, "clarifications": [item["content"] for item in decisions]}
         try:
-            intent = TaskIntent.model_validate(await asyncio.to_thread(
-                self.runtime.enrich_intent, payload, list(READ_ONLY_TOOLS[run.primary_agent]),
-            ))
+            with invocation_scope(base_context_id=checkpoint["context_id"]):
+                intent = TaskIntent.model_validate(await asyncio.to_thread(
+                    self.runtime.enrich_intent, payload, list(READ_ONLY_TOOLS[run.primary_agent]),
+                ))
         except ModelInvocationError:
             self._finish(run, "failed", "意图识别所需的模型当前不可用。", blocked=True)
             return False
@@ -346,11 +355,12 @@ class TaskExecutorService:
                     "Set read_only=false and allow only analysis and execution. Bind rtl_snapshot from Design, "
                     "output one required lint_result as application/json. Final report must depend on it and bind lint_result."
                 )
-        proposal = await asyncio.to_thread(
-            self.planner.plan, run.run_id, request, intent, payload, policy,
-            simple_question=not is_rtl,
-            validate_workflow=(lambda plan: self._validate_rtl_plan(plan, wants_lint=wants_lint)) if is_rtl else None,
-        )
+        with invocation_scope(base_context_id=checkpoint["context_id"]):
+            proposal = await asyncio.to_thread(
+                self.planner.plan, run.run_id, request, intent, payload, policy,
+                simple_question=not is_rtl,
+                validate_workflow=(lambda plan: self._validate_rtl_plan(plan, wants_lint=wants_lint)) if is_rtl else None,
+            )
         if proposal.plan is None:
             with self.repo.db.transaction() as conn:
                 for code in proposal.diagnostics:
@@ -456,7 +466,7 @@ class TaskExecutorService:
 
     async def _step(
         self, run: RunView, request: ChatRequest, plan: TaskPlan, contract: TaskContract, state: TaskState,
-        limits: RunExecutionPolicy, replanning_enabled: bool,
+        limits: RunExecutionPolicy, replanning_enabled: bool, base_context: RunBaseContext,
     ) -> bool:
         last = self.repo.last_action(state.task_id, state.generation)
         result = json.loads(last["result_json"]) if last and last["status"] == "done" else {}
@@ -507,7 +517,7 @@ class TaskExecutorService:
             return False
 
         state, action_id = self.repo.reserve(state)
-        observations = self.repo.observations(state.task_id, state.generation)[-12:]
+        observations = self.repo.observations(state.task_id, state.generation)[-CONTEXT_PROFILES[Purpose.REFLECTION].max_observations:]
         candidates = tuple({
             item.artifact.output_key: item for item in self.repo.local_outputs(state.task_id, "staged", state.generation)
         }.values())
@@ -516,14 +526,14 @@ class TaskExecutorService:
         for item in inputs:
             self.verifier._check_content(item)
         verification = self.repo.last_verification(state.task_id, state.generation)
-        payload = self._decision_context(
-            run, request, plan, contract, state, observations, inputs, candidates, verification, limits, replanning_enabled,
+        payload = self.contexts.reflection_inputs(
+            self.repo, run, request, plan, contract, state, observations, inputs, candidates, verification,
+            limits, replanning_enabled, base_context,
         )
         evidence = (
             *(EvidenceRef(kind="observation", ref_id=item.observation_id) for item in observations),
             *(EvidenceRef(kind="artifact", ref_id=item.artifact.artifact_id) for item in (*inputs, *candidates)),
         )
-        self._save_task_manifest(run, state, contract, payload, evidence)
         task_budget, run_budget = payload["budget"]["task"], payload["budget"]["run"]
         repair_exhausted = self._repair_exhausted(state, contract, verification)
         controls_only = (
@@ -721,12 +731,9 @@ class TaskExecutorService:
         states = self.repo.states(run.run_id)
         delta = None
         try:
-            delta = await asyncio.to_thread(self.replanner.propose, self.runtime, plan, policy, trigger, {
-                "raw_request": run.user_instruction, "module_name": request.module_name, "rtl_path": request.rtl_path,
-                "clarifications": [item["content"] for item in self.repo.decisions(run.run_id) if item["action"] == "provide_resolution"],
-                "validation_feedback": feedback,
-                "tasks": [self._replan_task_context(states[task.task_id]) for task in plan.tasks],
-            })
+            context = self.contexts.replanning_inputs(self.repo, run, request, plan, states, feedback)
+            with invocation_scope(generation=states[trigger.task_id].generation):
+                delta = await asyncio.to_thread(self.replanner.propose, self.runtime, plan, policy, trigger, context)
             with self.repo.db.transaction() as conn:
                 def consumers_of(keys: set[str]) -> set[str]:
                     outputs = self.repo.dependencies.outputs(conn, run.run_id, keys)
@@ -748,17 +755,6 @@ class TaskExecutorService:
             return True
         self.repo.publish_replan(plan, revision, number, delta, trigger, reruns, removed)
         return True
-
-    def _replan_task_context(self, state: TaskState) -> dict:
-        verification = self.repo.last_verification(state.task_id, state.generation)
-        return {
-            "task_id": state.task_id, "status": state.status, "failure_reason": state.failure_reason,
-            "observations": [item.model_dump(mode="json") for item in self.repo.observations(state.task_id, state.generation)[-3:]],
-            "bound_inputs": self.repo.input_bindings(state.task_id, state.generation),
-            "verification_feedback": json.loads(verification["result_json"]) if verification else None,
-            "verified_outputs": [item.artifact.model_dump(mode="json")
-                                 for item in self.repo.local_outputs(state.task_id, "verified", state.generation)],
-        }
 
     def _resolve_task_failure(
         self, run: RunView, plan: TaskPlan, contract: TaskContract, state: TaskState, action: dict,
@@ -965,179 +961,6 @@ class TaskExecutorService:
     @staticmethod
     def _submission(items: Iterable[ArtifactPayload]) -> frozenset[tuple[str, str]]:
         return frozenset((item.artifact.output_key, item.artifact.content_hash) for item in items)
-
-    def _decision_context(
-        self, run: RunView, request: ChatRequest, plan: TaskPlan, contract: TaskContract, state: TaskState,
-        observations: tuple[Observation, ...], inputs: tuple[ArtifactPayload, ...], candidates: tuple[ArtifactPayload, ...],
-        verification: dict | None, limits: RunExecutionPolicy, replanning_enabled: bool,
-    ) -> dict:
-        actions, decisions = self.repo.usage(run.run_id)
-        task_limits = contract.execution_policy
-        tokens = self.contexts.tokens
-        payload = {
-            "message": contract.goal,
-            "rtl_path": request.rtl_path if "read_rtl" in contract.capability_requirements else None,
-            "observations": [
-                {**item.model_dump(mode="json"), "summary": tokens.trim(item.summary, 180)}
-                for item in observations
-            ],
-            "artifacts": [item.artifact.model_dump(mode="json") for item in (*inputs, *candidates)],
-            "verification_feedback": json.loads(verification["result_json"]) if verification else None,
-            "replanning_enabled": replanning_enabled,
-            "plan_tasks": [{"task_id": task.task_id, "title": task.title} for task in plan.tasks],
-            "budget": {
-                "task": self._budget(
-                    action=(state.action_count, task_limits.max_action_steps),
-                    decision=(state.current_iteration, task_limits.max_decisions),
-                    repair=(state.repair_attempts, task_limits.max_repair_attempts),
-                ),
-                "run": self._budget(
-                    action=(actions, limits.max_run_actions), decision=(decisions, limits.max_run_decisions),
-                    replan=(self.repo.replan_count(run.run_id), limits.max_replans),
-                ),
-            },
-            "output_guidance": "报告在 submit_task_output.text_outputs 提交，引用每份分析和 Lint 结果为 [artifact:ID]。",
-        }
-        if state.generation > 1:
-            previous_generation = state.generation - 1
-            previous = self.repo.last_verification(state.task_id, previous_generation)
-            attempt = next((item for item in reversed(self.repo.attempts(run.run_id, state.task_id))
-                            if item["generation"] == previous_generation), {})
-            feedback = self.repo.db.loads(previous["result_json"], {}) if previous else {}
-            reason = attempt.get("failure_reason")
-            if (feedback and not feedback.get("passed")) or reason:
-                payload["previous_attempt_feedback"] = {
-                    "failed_criteria": feedback.get("failed_criteria", ()),
-                    "suggestions": feedback.get("suggestions", ()),
-                    "failure_reason": tokens.trim(reason, 200) if reason else None,
-                }
-        if contract.assigned_agent == run.primary_agent:
-            snapshot = json.loads(self.repo.checkpoint(run.run_id)["snapshot"])
-            payload["user_request"] = run.user_instruction
-            payload["clarifications"] = [item["content"] for item in self.repo.decisions(run.run_id)]
-            if request.orchestration_mode == "chat":
-                payload["conversation"] = snapshot
-            else:
-                payload["project_configuration"] = snapshot.get("_project_config", {})
-        else:
-            payload["clarifications"] = [item["content"] for item in self.repo.decisions(run.run_id, contract.task_id)]
-        if "real_rtl_lint" in contract.capability_requirements:
-            payload["verilator_lint_arguments"] = {
-                "files": [request.rtl_path], "top_module": request.lint_top_module or request.module_name,
-            }
-        if request.orchestration_mode == "eda_project":
-            payload["eda_arguments"] = eda_workflow(request, run.primary_agent)[1]
-            payload["output_guidance"] = "提交 result。最终报告用 [artifact:ID] 引用每份证据，并照录实际 EDA 状态。"
-            if "propose_eda_patch" in contract.capability_requirements:
-                project = next(item for item in inputs if item.artifact.artifact_type == "project_manifest")
-                files = FrozenProject.model_validate_json(project.content).files
-                payload["repair_source"] = files.get(request.eda_repair_path, "")[:65_000]
-        remaining = min(4_000, max(0, self.contexts.token_budget - tokens.count(self.repo.db.dumps(payload))))
-        query = " ".join((
-            contract.goal, payload.get("user_request", ""), *(criterion.description for criterion in contract.acceptance_criteria),
-            *(item.summary for item in observations[-2:]),
-        ))
-        artifacts = zip(payload["artifacts"], (*inputs, *candidates), strict=True)
-        for view, item in sorted(artifacts, key=lambda pair: pair[1].artifact.artifact_type != "rtl_snapshot"):
-            if item.artifact.artifact_type == "rtl_snapshot":
-                source = self._rtl_excerpt(item, query, min(1_800, remaining) - 8)
-                fields = {"rtl_source": source} if source is not None else {}
-            else:
-                summary = self._artifact_summary(item, min(1_000, remaining))
-                fields = {"text": summary} if summary is not None else {}
-            if fields:
-                view.update(fields)
-                remaining -= tokens.count(self.repo.db.dumps(fields))
-        return payload
-
-    def _rtl_excerpt(self, item: ArtifactPayload, query: str, limit: int) -> dict | None:
-        try:
-            source = self.verifier._snapshot(item)
-        except (KeyError, ValueError):
-            return None
-        content = item.content.decode("utf-8")
-        lines = content.splitlines()
-        excerpts = [{"start_line": 1, "end_line": len(lines), "text": content}]
-        details = {
-            "relative_path": source.relative_path, "content_hash": source.content_hash,
-            "total_lines": source.line_count, "truncated": False, "excerpts": excerpts,
-        }
-        tokens = self.contexts.tokens
-        if tokens.count(self.repo.db.dumps(details)) <= limit:
-            return details
-        details["truncated"] = True
-        excerpts.clear()
-        if tokens.count(self.repo.db.dumps(details)) > limit:
-            return None
-        terms = set(re.findall(r"[a-z_][a-z_0-9]{2,}", query.lower()))
-        windows = [(start, "\n".join(lines[start:start + 24])) for start in range(0, len(lines), 24)]
-        windows.sort(key=lambda part: -len(terms.intersection(re.findall(r"[a-z_][a-z_0-9]{2,}", part[1].lower()))))
-        for start, body in windows:
-            excerpts.append({"start_line": start + 1, "end_line": min(len(lines), start + 24), "text": body})
-            if tokens.count(self.repo.db.dumps(details)) > limit:
-                excerpts.pop()
-            if len(excerpts) == 3:
-                break
-        excerpts.sort(key=lambda part: part["start_line"])
-        return details
-
-    @staticmethod
-    def _budget(**usage: tuple[int, int]) -> dict[str, int]:
-        return {
-            f"{name}_{field}": value for name, (used, limit) in usage.items()
-            for field, value in (("used", used), ("limit", limit), ("remaining", max(0, limit - used)))
-        }
-
-    def _artifact_summary(self, item: ArtifactPayload, limit: int) -> str | None:
-        tokens = self.contexts.tokens
-        if limit <= 40:
-            return None
-        try:
-            self.verifier._check_content(item)
-            content = item.content.decode("utf-8")
-            if item.artifact.artifact_type == "project_manifest":
-                project = FrozenProject.model_validate_json(item.content)
-                content = self.repo.db.dumps({
-                    "manifest": project.manifest.model_dump(mode="json"), "input_hash": project.input_hash,
-                    "file_hashes": project.hashes,
-                })
-            elif item.artifact.artifact_type == "eda_result":
-                receipt = json.loads(content)
-                result = receipt["result"]
-                fields = ("tool_name", "tool_version", "status", "exit_code", "input_hash", "metrics")
-                content = self.repo.db.dumps({
-                    "tool_run_id": receipt["tool_run_id"], "result": {key: result[key] for key in fields if key in result},
-                })
-        except (KeyError, TypeError, ValueError):
-            return None
-        summary = tokens.trim(content, limit - 24)
-        if tokens.count(self.repo.db.dumps({"text": summary})) > limit:
-            summary = tokens.trim(content, (limit - 24) // 2)
-        return summary if tokens.count(self.repo.db.dumps({"text": summary})) <= limit else None
-
-    def _save_task_manifest(self, run, state, contract, payload, evidence) -> None:
-        snapshot = payload.get("conversation", {}).get("_context_manifest", {})
-        encoded = self.repo.db.dumps(payload).encode()
-        self.repo.db.execute(
-            """INSERT INTO context_manifests(
-               context_id, session_id, run_id, agent_role, token_budget, estimated_tokens, message_ids_json,
-               memory_ids_json, chunk_ids_json, observation_ids_json, sections_json, created_at,
-               orchestration_task_id, artifact_ids_json, prompt_hash, context_version
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 4)""",
-            (str(uuid4()), run.session_id, state.run_id, contract.assigned_agent.value,
-             self.contexts.token_budget, self.contexts.tokens.count(encoded.decode()),
-             self.repo.db.dumps(snapshot.get("message_ids", [])), self.repo.db.dumps(snapshot.get("memory_ids", [])),
-             self.repo.db.dumps(snapshot.get("chunk_ids", [])),
-             self.repo.db.dumps([item.ref_id for item in evidence if item.kind == "observation"]),
-             self.repo.db.dumps({
-                 "decision": state.current_iteration,
-                 "project_config": snapshot.get("project_config") or (
-                     {"revision": payload["project_configuration"].get("revision")} if payload.get("project_configuration") else {}
-                 ),
-             }), now().isoformat(), state.task_id,
-             self.repo.db.dumps([item.ref_id for item in evidence if item.kind == "artifact"]),
-             hashlib.sha256(encoded).hexdigest()),
-        )
 
     def _check_workspace(self, request: ChatRequest) -> None:
         if request.workspace_id:

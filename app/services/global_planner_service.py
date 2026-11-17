@@ -8,6 +8,7 @@ from uuid import uuid4
 from pydantic import Field, ValidationError
 
 from app.agents.runtime import runtime
+from app.domain.context import ContextBuildRequest, ContextPurpose
 from app.domain.enums import AgentRole, Mutability
 from app.domain.models import ChatRequest, TaskIntent
 from app.domain.orchestration import (
@@ -25,6 +26,7 @@ from app.domain.orchestration import (
     TaskPlanDraft,
 )
 from app.models.provider import ModelInvocationError
+from app.services.context_builder_service import context_builder_service
 from app.services.delegation_service import ALLOWED_EXPERTS
 from app.tools.builtin import register_builtin_tools
 from app.tools.eda_catalog import register_eda_tools
@@ -87,28 +89,21 @@ class GlobalPlannerService:
         diagnostics: list[str] = []
         for _ in range(1 if simple_question or fixed_draft is not None else 2):
             try:
-                raw = (
-                    fixed_draft if fixed_draft is not None else self._single_task(intent, policy)
-                    if simple_question
-                    else (self.propose or runtime.propose_task_plan)(
-                        {
-                            "raw_request": request.message,
-                            "intent": intent.model_dump(mode="json"),
-                            "context": context,
-                            "project_id": request.project_id,
-                            "module_name": request.module_name,
-                            "primary_agent": policy.primary_agent.value,
-                            "catalog": catalog,
-                            "input_types": policy.input_types,
-                            "rule_ids": policy.rule_ids,
-                            "schema_ids": policy.schema_ids,
-                            "user_constraint_ids": policy.user_constraint_ids,
-                            "allowed_mutability": policy.allowed_mutability,
-                            "max_tasks": policy.run_limits.max_plan_tasks,
-                            "validation_feedback": diagnostics[-1:],
-                        }
+                if fixed_draft is not None:
+                    raw = fixed_draft
+                elif simple_question:
+                    raw = self._single_task(intent, policy)
+                else:
+                    proposal = ContextBuildRequest(
+                        ContextPurpose.GLOBAL_PLANNING, project_id=request.project_id, module_name=request.module_name,
+                        run_id=run_id, agent_role=policy.primary_agent.value, query=request.message,
+                        task_input={"intent": intent, "base": context, "policy": policy, "catalog": catalog,
+                                    "validation_feedback": diagnostics[-1:]},
                     )
-                )
+                    if self.propose is not None:
+                        raw = self.propose(context_builder_service.build_invocation(proposal).payload)
+                    else:
+                        raw = runtime.propose_task_plan(proposal)
                 draft = TaskPlanDraft.model_validate(raw)
                 self._validate(draft, policy, catalog)
                 if validate_workflow is not None:

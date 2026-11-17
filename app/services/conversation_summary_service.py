@@ -12,7 +12,8 @@ from uuid import uuid4
 
 from app.config.model_settings import model_settings_service
 from app.domain.models import ConversationTurnSummaryView
-from app.models.factory import provider_factory
+from app.domain.context import ContextBuildRequest, ContextPurpose
+from app.services.llm_invocation_service import LLMInvocationService
 from app.services.session_service import ConversationTurn, SessionService, session_service
 from app.services.token_service import TokenCounter, token_counter
 from app.services.workspace_service import utc_now
@@ -204,9 +205,12 @@ class ConversationSummaryService:
             return self._deterministic_summary(turn), "deterministic_turn"
         if not settings.ready:
             raise RuntimeError("turn summary model is unavailable")
-        result = provider_factory.get(settings.main_endpoint()).generate_json(
+        result = self._invoker().generate_json(
+            ContextBuildRequest(
+                ContextPurpose.CONVERSATION_SUMMARY, session_id=turn.session_id, agent_role=turn.agent_role,
+                run_id=turn.assistant.run_id, source_message_id=turn.user.message_id, task_input={"turn": turn},
+            ),
             """你是芯片设计项目的单轮对话摘要器。只总结输入中的这一条 User Request 和对应的最终 Assistant Response，不读取也不合并任何旧摘要。输出严格 JSON，字段为 topic、module、user_intent、key_information、decisions、constraints、assumptions、inferences、open_questions、keywords。目标 150-250 Token，绝不超过 500 Token。严格区分用户明确确认的信息与 Assistant 建议：decisions 和 constraints 中每项使用 {\"content\":\"...\",\"source_message_ids\":[\"...\"],\"confirmation_status\":\"user_confirmed|assistant_suggestion|unconfirmed|historical\"}；只有用户消息明确确认才能标 user_confirmed。被本轮新决定替代的旧信息标 historical，不得当作当前约束。不得编造；无内容字段使用空字符串或空数组。""",
-            self._turn_payload(turn),
             operation="单轮会话摘要",
             expected_shape='{"topic":"","module":"","user_intent":"","key_information":[],"decisions":[],"constraints":[],"assumptions":[],"inferences":[],"open_questions":[],"keywords":[]}',
         )
@@ -221,9 +225,13 @@ class ConversationSummaryService:
             raise ValueError("deterministic turn summary unexpectedly exceeded hard limit")
         if not settings.ready:
             raise RuntimeError("turn summary compression model is unavailable")
-        result = provider_factory.get(settings.main_endpoint()).generate_json(
+        result = self._invoker().generate_json(
+            ContextBuildRequest(
+                ContextPurpose.SUMMARY_COMPRESSION, session_id=turn.session_id, agent_role=turn.agent_role,
+                run_id=turn.assistant.run_id, source_message_id=turn.user.message_id,
+                task_input={"summary": summary, "source_message_ids": [turn.user.message_id, turn.assistant.message_id]},
+            ),
             """压缩给定单轮结构化摘要，保持原字段和事实极性，不新增信息，不改变 confirmation_status。删除冗余表述，使完整 JSON 不超过 500 Token，优先达到 150-250 Token。""",
-            {"summary": summary, "source_message_ids": [turn.user.message_id, turn.assistant.message_id]},
             operation="压缩单轮会话摘要",
             expected_shape='{"topic":"","module":"","user_intent":"","key_information":[],"decisions":[],"constraints":[],"assumptions":[],"inferences":[],"open_questions":[],"keywords":[]}',
         )
@@ -286,15 +294,12 @@ class ConversationSummaryService:
             "inferences": [], "open_questions": [], "keywords": [],
         }
 
-    @staticmethod
-    def _turn_payload(turn: ConversationTurn) -> dict[str, Any]:
-        return {
-            "turn_id": turn.turn_id,
-            "user": {"message_id": turn.user.message_id, "content": turn.user.content},
-            "assistant": {
-                "message_id": turn.assistant.message_id, "content": turn.assistant.content,
-            },
-        }
+    def _invoker(self) -> LLMInvocationService:
+        from app.services.context_builder_service import ContextBuilderService
+
+        return LLMInvocationService(ContextBuilderService(
+            self.db, sessions=self.sessions, summaries=self, tokens=self.tokens,
+        ))
 
     def _view(self, row: dict[str, Any]) -> ConversationTurnSummaryView:
         payload = dict(row)

@@ -238,8 +238,12 @@ def test_delegate_receives_shared_memory_but_not_private_history(services) -> No
         parent_run_id="run", from_agent=AgentRole.DESIGN,
         to_agent=AgentRole.VERIFICATION, task_type="review", instruction="检查 UART clock",
     )
-    scoped = service._scoped_context(
-        {"project_id": "project", "module_name": "uart", "history": ["secret"]}, contract
+    from app.domain.context import ContextBuildRequest, ContextPurpose
+
+    scoped = service.contexts.specialist_scope(
+        ContextBuildRequest(ContextPurpose.SPECIALIST_ANALYSIS, project_id="project", module_name="uart",
+                            agent_role="verification", task_input={"request": {"history": ["secret"]}}),
+        contract,
     )
     assert scoped["history"] == []
     assert [item["memory_key"] for item in scoped["_memory_context"]] == ["uart.clock_frequency"]

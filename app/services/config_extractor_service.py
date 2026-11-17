@@ -2,12 +2,12 @@
 
 import logging
 
-from app.domain.design_config import ConfigChanges, ProjectDesignConfig, normalize_module
+from app.domain.context import ContextBuildRequest, ContextPurpose
+from app.domain.design_config import ConfigChanges, ProjectDesignConfig
 from app.domain.models import ChatRequest, ConversationMessageView
-from app.services.config_service import ConfigService, config_context
-from app.services.design_data_model import StructuredExtractor
+from app.services.config_service import ConfigService
+from app.services.design_data_model import DeepSeekDesignModel, StructuredExtractor, invoke_extractor
 from app.services.session_service import SessionService
-from app.services.token_service import token_counter
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,8 @@ CONFIG_PROMPT = """你是数字芯片项目的配置提取器。识别 current_r
 
 class ConfigExtractorService:
     def __init__(
-        self, configs: ConfigService, sessions: SessionService, generate: StructuredExtractor | None = None,
+        self, configs: ConfigService, sessions: SessionService,
+        generate: DeepSeekDesignModel | StructuredExtractor | None = None,
     ) -> None:
         self.configs = configs
         self.sessions = sessions
@@ -36,20 +37,16 @@ class ConfigExtractorService:
         baseline = self.configs.get_config(request.project_id, request.module_name, workspace_id=request.workspace_id)
         if self.generate is None:
             return baseline
+        from app.services.context_builder_service import ContextBuilderService
+
         try:
-            turns = self.sessions.completed_turns(
-                source.session_id, agent_role=role, before_sequence=source.sequence, limit=3,
+            context = ContextBuildRequest(
+                ContextPurpose.CONFIG_EXTRACTION, project_id=request.project_id, module_name=request.module_name,
+                session_id=source.session_id, agent_role=role, source_message_id=source.message_id,
+                task_input={"source": source, "baseline": baseline},
             )
-            current, _ = config_context(baseline, request.module_name, source.content, token_counter, 4_000)
-            result = self.generate(CONFIG_PROMPT, {
-                "project_id": request.project_id,
-                "module_name": normalize_module(request.module_name),
-                "current_request": source.content,
-                "recent_turns": [
-                    {"user": turn.user.content, "assistant": turn.assistant.content} for turn in turns
-                ],
-                "current_config": current or baseline.context(request.module_name),
-            })
+            contexts = ContextBuilderService(self.sessions.db, sessions=self.sessions)
+            result = invoke_extractor(self.generate, CONFIG_PROMPT, context, contexts)
             changes = ConfigChanges.model_validate(result)
             return self.configs.apply_updates(
                 request.project_id, request.module_name, changes.updates,

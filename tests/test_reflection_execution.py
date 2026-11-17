@@ -41,7 +41,7 @@ def test_reflection_and_selection_share_one_provider_call(monkeypatch, decision,
                 "reflection": reflection.model_dump(mode="json"), "tool_arguments": selection.arguments,
             }}
 
-    monkeypatch.setattr(runtime, "_reflection_provider", lambda: (Provider(), True))
+    monkeypatch.setattr("app.services.llm_invocation_service.provider_factory.get", lambda endpoint, **kwargs: Provider())
     context = {"budget": {"task": {"repair_remaining": 0}}, "replanning_enabled": True}
     result, picked = runtime.reflect_and_select(contract, context, [tool_registry.get(tool_name).definition])
     assert result == reflection and picked == selection
@@ -89,7 +89,7 @@ def test_reflection_sends_expanded_evidence_only_to_approved_endpoint(monkeypatc
         assert settings is endpoint and direct_only is approved
         return SimpleNamespace(choose_tool=choose_tool)
 
-    monkeypatch.setattr("app.agents.runtime.provider_factory.get", get_provider)
+    monkeypatch.setattr("app.services.llm_invocation_service.provider_factory.get", get_provider)
     context = {
         "replanning_enabled": True,
         "budget": {"task": {"repair_remaining": 0}},

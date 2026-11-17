@@ -8,10 +8,12 @@ Delegate 不是把整个会话交给另一个 Agent，也不是简单地再调�
 from __future__ import annotations
 
 import asyncio
+from contextvars import ContextVar
 from typing import Any, Callable
 from uuid import uuid4
 
 from app.agents.runtime import runtime
+from app.domain.context import ContextBuildRequest, ContextPurpose
 from app.domain.enums import AgentRole, DelegationStatus
 from app.domain.models import (
     DelegationArtifactRef,
@@ -20,6 +22,8 @@ from app.domain.models import (
 )
 from app.services.workspace_service import utc_now
 from app.services.memory_service import MemoryService, memory_service
+from app.services.context_builder_service import ContextBuilderService
+from app.services.llm_invocation_service import invocation_scope
 from app.storage.database import Database, database
 
 
@@ -29,6 +33,7 @@ MAX_DELEGATIONS_PER_RUN = 3
 # 模型或网络故障不能永久占住一次用户请求。超时后将任务标为 timed_out，
 # 主 Agent 可以把失败状态反馈给用户，而不是无限等待。
 DELEGATION_TIMEOUT_SECONDS = 90
+_in_delegation: ContextVar[bool] = ContextVar("chipflow_in_delegation", default=False)
 
 # 白名单表示“谁可以向谁求助”。Architecture 只作为专家存在，不能作为发起者，
 # 因而天然禁止专家继续嵌套委派。
@@ -47,7 +52,7 @@ class DelegationService:
         memories: MemoryService = memory_service,
     ) -> None:
         self.db = db
-        self.memories = memories
+        self.contexts = ContextBuilderService(db, memories=memories)
 
     async def delegate(
         self,
@@ -69,7 +74,7 @@ class DelegationService:
         最后调用专家。这样即使模型调用失败，数据库中仍能看到失败发生在哪一步。
         """
         # 不能因为主 Agent 在 Prompt 中声称“需要某专家”，就跳过后端白名单。
-        if to_agent not in ALLOWED_EXPERTS.get(from_agent, set()):
+        if _in_delegation.get() or to_agent not in ALLOWED_EXPERTS.get(from_agent, set()):
             raise PermissionError(
                 f"{from_agent.value} cannot delegate to {to_agent.value}"
             )
@@ -114,16 +119,23 @@ class DelegationService:
             )
         self._set_status(task_id, DelegationStatus.RUNNING)
 
-        # 专家只得到完成任务所需的最小上下文。完整聊天历史可能含有主 Agent
-        # 的私有推理或无关信息，因此在 _scoped_context 中明确置空。
+        token = _in_delegation.set(True)
         try:
-            scoped = self._scoped_context(request_payload, delegation)
-            # Runtime 当前是同步调用；to_thread 避免它阻塞 FastAPI 事件循环，
-            # wait_for 则给这次委派增加明确的时间边界。
-            analysis = await asyncio.wait_for(
-                asyncio.to_thread(analyze or self._expert_callable(to_agent), scoped),
-                timeout=DELEGATION_TIMEOUT_SECONDS,
+            context = ContextBuildRequest(
+                ContextPurpose.SPECIALIST_ANALYSIS, project_id=request_payload["project_id"],
+                module_name=request_payload["module_name"], run_id=parent_run_id, agent_role=to_agent.value,
+                task_input={"request": request_payload},
             )
+            scoped = self.contexts.specialist_scope(context, delegation)
+            parent = self.db.fetch_one("SELECT session_id FROM runs WHERE run_id=?", (parent_run_id,))
+            with invocation_scope(
+                self.contexts, session_id=parent["session_id"], run_id=parent_run_id, agent_role=to_agent.value,
+                base_context_id=None, source_message_id=None, default_task_id=task_id,
+            ):
+                analysis = await asyncio.wait_for(
+                    asyncio.to_thread(analyze or self._expert_callable(to_agent), scoped),
+                    timeout=DELEGATION_TIMEOUT_SECONDS,
+                )
             conclusion = str(analysis.get("summary", "专家分析已完成。"))
             evidence = self._evidence(analysis, artifacts)
             # 统一成稳定结果契约。未来专家换模型或拆成 Worker，调用方仍只依赖这些字段。
@@ -147,6 +159,8 @@ class DelegationService:
             self._fail(task_id, DelegationStatus.TIMED_OUT, "Expert delegation timed out")
         except Exception as exc:
             self._fail(task_id, DelegationStatus.FAILED, str(exc)[:1000])
+        finally:
+            _in_delegation.reset(token)
         return self.get(task_id)
 
     def reconcile_interrupted(self, run_id: str, action_id: str) -> str | None:
@@ -196,40 +210,6 @@ class DelegationService:
             (run_id,),
         )
         return [self.get(row["task_id"]) for row in rows]
-
-    def _scoped_context(
-        self,
-        request_payload: dict[str, Any], delegation: DelegationRequest
-    ) -> dict[str, Any]:
-        """构造专家最小上下文，避免无边界复制主 Agent 私有历史。"""
-        shared_memories = self.memories.retrieve(
-            request_payload["project_id"],
-            request_payload["module_name"],
-            delegation.instruction,
-            agent_role=delegation.to_agent.value,
-            shared_only=True,
-        )
-        return {
-            "project_id": request_payload["project_id"],
-            "module_name": request_payload["module_name"],
-            "message": delegation.instruction,
-            "instruction": delegation.instruction,
-            "documents": request_payload.get("documents", []),
-            "history": [],
-            "_memory_context": [
-                {
-                    "memory_id": item.memory_id,
-                    "memory_key": item.memory_key,
-                    "kind": item.kind,
-                    "content": item.content,
-                    "authority": item.authority,
-                    "sources": item.source_refs,
-                }
-                for item in shared_memories
-            ],
-            "workspace_id": request_payload.get("workspace_id"),
-            "delegation": delegation.model_dump(mode="json"),
-        }
 
     @staticmethod
     def _expert_callable(role: AgentRole) -> Callable[[dict[str, Any]], dict[str, Any]]:
