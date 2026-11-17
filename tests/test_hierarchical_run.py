@@ -53,6 +53,7 @@ class ScriptedRuntime:
         self.exhaust = exhaust
         self.clarify = clarify
         self.calls = []
+        self.source_path = None
 
     @staticmethod
     def enrich_intent(payload, _):
@@ -60,11 +61,29 @@ class ScriptedRuntime:
 
     def reflect_and_select(self, contract, context, shortlist, evidence):
         references = {item["artifact_type"]: item["artifact_id"] for item in context["artifacts"]}
+        names = {tool.name for tool in shortlist}
+        if self.exhaust and "read_rtl" in contract.capability_requirements:
+            budget = context["budget"]["task"]
+            feedback = context["verification_feedback"]
+            if feedback and not budget["repair_remaining"]:
+                assert names == {"ask_user", "report_task_failure"}
+                return self._reflection(
+                    contract, evidence, "report_task_failure", {"reason": "Repair attempts exhausted"},
+                    "replan" if context["replanning_enabled"] else "fail",
+                )
+            initial_reads = budget["action_limit"] - budget["repair_remaining"]
+            if budget["action_used"] < initial_reads or (feedback and "submit_task_output" not in names):
+                if feedback:
+                    # Keep each repaired candidate materially distinct while leaving the missing output unresolved.
+                    self.source_path.write_bytes(UART.read_bytes() + f"\n// repair {budget['action_used']}\n".encode())
+                return self._reflection(
+                    contract, evidence, "read_rtl_source", {"relative_path": context["rtl_path"]}, "continue",
+                )
         if self.clarify and not context["clarifications"]:
             name, arguments = "ask_user", {"question": "请补充验收关注点。"}
         elif "read_rtl" in contract.capability_requirements:
             reads = sum(item["tool_name"] == "read_rtl_source" for item in context["observations"])
-            if not reads or (self.exhaust and reads < 8):
+            if not reads:
                 name, arguments = "read_rtl_source", {"relative_path": context["rtl_path"]}
             elif "design_analysis" not in references and not self.exhaust:
                 name, arguments = "analyze_rtl_design", {"snapshot_ref": references["rtl_snapshot"]}
@@ -85,9 +104,15 @@ class ScriptedRuntime:
             arguments = {"output_keys": [key], "text_outputs": {key: text}}
         assert name in {tool.name for tool in shortlist}
         decision = {"submit_task_output": "submit", "ask_user": "ask_user"}.get(name, "continue")
+        return self._reflection(contract, evidence, name, arguments, decision)
+
+    @staticmethod
+    def _reflection(contract, evidence, name, arguments, decision):
+        criteria = tuple(item.criterion_id for item in contract.acceptance_criteria)
         return ReflectionResult(
-            progress="in_progress", progress_summary="Test decision", satisfied_criteria=(),
-            unmet_criteria=tuple(item.criterion_id for item in contract.acceptance_criteria),
+            progress="ready_to_submit" if decision == "submit" else "in_progress",
+            progress_summary="Test decision", satisfied_criteria=criteria if decision == "submit" else (),
+            unmet_criteria=() if decision == "submit" else criteria,
             issues=(), decision=decision, reason="Use fixed test workflow", evidence=evidence,
         ), ToolSelection(name=name, arguments=arguments)
 
@@ -145,7 +170,9 @@ def executor_factory(tmp_path, monkeypatch):
 
 def request_for(executor, *, with_path=True):
     workspace = executor.actions.workspaces.create(WorkspaceCreateRequest(project_id="chip"))
-    executor.actions.workspaces.resolve_path(workspace.workspace_id, "rtl/uart.sv").write_bytes(UART.read_bytes())
+    source = executor.actions.workspaces.resolve_path(workspace.workspace_id, "rtl/uart.sv")
+    source.write_bytes(UART.read_bytes())
+    executor.runtime.source_path = source
     return ChatRequest(
         project_id="chip", module_name="uart", message="Review the UART RTL",
         orchestration_mode="rtl_analysis", workspace_id=workspace.workspace_id,
@@ -165,12 +192,8 @@ class ReplanningRuntime(ScriptedRuntime):
 
     @staticmethod
     def _select(contract, evidence, name, arguments):
-        decision = "fail" if name == "report_task_failure" else "submit"
-        return ReflectionResult(
-            progress="in_progress", progress_summary="Test replan decision", satisfied_criteria=(),
-            unmet_criteria=tuple(item.criterion_id for item in contract.acceptance_criteria),
-            issues=(), decision=decision, reason="Use persisted evidence", evidence=evidence,
-        ), ToolSelection(name=name, arguments=arguments)
+        decision = "replan" if name == "report_task_failure" else "submit"
+        return ScriptedRuntime._reflection(contract, evidence, name, arguments, decision)
 
     def reflect_and_select(self, contract, context, shortlist, evidence):
         if "previous_attempt_feedback" in context:
@@ -178,7 +201,7 @@ class ReplanningRuntime(ScriptedRuntime):
         review = "rtl_verification_assessment" in contract.capability_requirements
         if self.repair and review and not context["observations"]:
             return self._select(contract, evidence, "submit_task_output", {"output_keys": ["verification_assessment"]})
-        plan_available = "plan_tasks" in context
+        plan_available = context["replanning_enabled"]
         prerequisite = self.add_prerequisite and review and len(context.get("plan_tasks", ())) == 3
         invalidating = (self.invalidate and contract.title == "report"
                         and len(self.proposals) == int(self.add_prerequisite))
@@ -353,7 +376,8 @@ async def test_exhausted_repair_remains_exhausted_after_rerun(executor_factory, 
     first, second = executor.repo.attempts(run.run_id, task_id)
     assert first["repair_attempts"] == second["repair_attempts"] == 3
     assert first["action_count"] == second["action_count"] == 8
-    assert first["current_iteration"] == 12 and second["current_iteration"] == 9
+    assert first["current_iteration"] == 13 and second["current_iteration"] == 10
+    assert executor.repo.reflections(task_id, first["generation"])[-1].result.decision == "replan"
     assert len(agent.proposals) == 1 and agent.proposals[0]["trigger"]["kind"] == "repair_exhausted"
     assert "missing:design_analysis" in agent.retry_feedback[0]["failed_criteria"]
 
@@ -592,6 +616,7 @@ async def test_repair_budget_never_resets_action_budget_and_blocks_downstream(ex
     failed = next(state for state in states.values() if state.status == "failed")
     assert failed.action_count == 8 and failed.repair_attempts == 3
     assert len(executor.repo.verifications(failed.task_id)) == 4
+    assert executor.repo.reflections(failed.task_id)[-1].result.decision == "fail"
     assert all(state.status in {"failed", "blocked"} for state in states.values())
     assert not executor.repo.local_outputs(failed.task_id, "verified")
     candidate = executor.repo.local_outputs(failed.task_id, "staged")[0]

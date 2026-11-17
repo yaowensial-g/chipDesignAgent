@@ -48,7 +48,8 @@ class LintRuntime(ScriptedRuntime):
             name, decision, arguments = "report_task_failure", "fail", {"reason": "Lint unavailable"}
         return ReflectionResult(
             progress="in_progress", progress_summary="Prepare or submit Lint evidence",
-            satisfied_criteria=(), unmet_criteria=("deliver",), issues=(),
+            satisfied_criteria=("deliver",) if decision == "submit" else (),
+            unmet_criteria=() if decision == "submit" else ("deliver",), issues=(),
             decision=decision, reason="Use the approved frozen input", evidence=evidence,
         ), ToolSelection(name=name, arguments=arguments)
 

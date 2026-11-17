@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -15,7 +15,7 @@ from app.agents.runtime import runtime
 from app.domain.enums import AgentRole, Mutability, ToolRunStatus
 from app.domain.models import ChatRequest, ChatResponse, RunResumeRequest, RunView, TaskIntent, ToolRunRequest, ToolRunView, ToolSelection
 from app.domain.orchestration import (
-    TASK_CONTROLS, Artifact, ArtifactPayload, AuthorizedAction, EvidenceRef, LintResult, Observation, ProfessionalRef, ReflectionRecord,
+    TASK_CONTROLS, Artifact, ArtifactPayload, AuthorizedAction, EvidenceRef, LintResult, Observation, PlanIssue, ProfessionalRef, ReflectionRecord,
     ReplanTrigger, RunExecutionPolicy, TaskActionContext, TaskActionResult, TaskContract, TaskOutputRef, TaskPlan,
     TaskPlanDraft, TaskState, VerificationResult,
 )
@@ -41,11 +41,12 @@ logger = logging.getLogger(__name__)
 TERMINAL = {"completed", "failed", "cancelled"}
 TERMINAL_ACTION_ERRORS = {
     "capability_gap", "interrupted_unknown", "approval_rejected", "approval_target_changed", "invalidation_rejected", "run_action_budget",
+    "tool_unavailable", "task_scope_denied", "expert_scope_denied", "workspace_scope_denied", "workspace_required",
+    "rtl_path_scope_denied", "lint_scope_denied", "eda_scope_denied", "protected_tool_argument", "stale_action",
+    "action_permission_denied",
 }
 NON_REPLAN_ERRORS = {
-    "tool_unavailable", "task_scope_denied", "expert_scope_denied", "workspace_scope_denied", "workspace_required",
-    "rtl_path_scope_denied", "rtl_source_missing", "analysis_unavailable", "lint_scope_denied", "eda_scope_denied",
-    "protected_tool_argument", "confirmed_ds_required", "action_budget", "stale_action",
+    "rtl_source_missing", "analysis_unavailable", "confirmed_ds_required", "action_budget", "lint_failed",
 } | TERMINAL_ACTION_ERRORS
 REPLAYABLE = {"read_rtl_source", *TASK_CONTROLS}
 READ_ONLY_TOOLS = {
@@ -480,14 +481,11 @@ class TaskExecutorService:
                 ))
                 return True
         if state.phase == "verifying":
-            return self._verify(run, plan, contract, state, last, replanning_enabled)
+            return self._verify(run, plan, contract, state, last)
         if error_code == "task_failure_reported":
-            if result.get("plan_issue") and replanning_enabled:
-                handled = self._handle_plan_issue(plan, state, last["action_id"], TaskActionResult.model_validate(result), inputs or (), limits)
-                if handled is not None:
-                    return handled
-            self._finish(run, "failed", result["summary"], plan_id=plan.plan_id)
-            return False
+            return self._resolve_task_failure(
+                run, plan, contract, state, last, TaskActionResult.model_validate(result), inputs or (), limits, replanning_enabled,
+            )
         if last and last["status"] in {"selecting", "selected", "dispatching"}:
             if last["status"] == "selecting":
                 self._record(state, last["action_id"], "decision", "unknown", "模型决策在服务中断前未写入。")
@@ -503,59 +501,66 @@ class TaskExecutorService:
                 self._finish(run, "failed", message)
                 return False
             return await self._dispatch(run, request, contract, state, last, limits)
-        used_actions, used_decisions = self.repo.usage(run.run_id)
+        _, used_decisions = self.repo.usage(run.run_id)
         if state.current_iteration >= contract.execution_policy.max_decisions or used_decisions >= limits.max_run_decisions:
             self._finish(run, "failed", "任务或 Run 决策额度已耗尽，交付件未通过验收。", plan_id=plan.plan_id)
             return False
 
         state, action_id = self.repo.reserve(state)
-        observations = self.repo.observations(state.task_id, state.generation)
-        candidates = self.repo.local_outputs(state.task_id, "staged", state.generation)
+        observations = self.repo.observations(state.task_id, state.generation)[-12:]
+        candidates = tuple({
+            item.artifact.output_key: item for item in self.repo.local_outputs(state.task_id, "staged", state.generation)
+        }.values())
         if inputs is None:
             inputs = self.repo.bound_inputs(state.task_id, state.generation)
-        for item in (*inputs, *candidates):
+        for item in inputs:
             self.verifier._check_content(item)
         verification = self.repo.last_verification(state.task_id, state.generation)
-        payload = self._decision_context(run, request, contract, observations, inputs, candidates, verification)
-        if replanning_enabled:
-            payload["plan_issue_guidance"] = (
-                "有确切工程证据显示当前计划缺少前置、依赖错误或路径不可行时，"
-                "可在 report_task_failure 中附带 plan_issue。仅引用可见的当前证据。"
-                "怀疑已验收输入错误时提供 artifact_invalid 和具体输入 Artifact ID。"
-            )
-            payload["plan_tasks"] = [{"task_id": task.task_id, "title": task.title} for task in plan.tasks]
-            if state.generation > 1:
-                previous = self.repo.last_verification(state.task_id, state.generation - 1)
-                if previous:
-                    feedback = VerificationResult.model_validate_json(previous["result_json"])
-                    if not feedback.passed:
-                        payload["previous_attempt_feedback"] = {
-                            "failed_criteria": feedback.failed_criteria, "suggestions": feedback.suggestions,
-                        }
+        payload = self._decision_context(
+            run, request, plan, contract, state, observations, inputs, candidates, verification, limits, replanning_enabled,
+        )
         evidence = (
             *(EvidenceRef(kind="observation", ref_id=item.observation_id) for item in observations),
             *(EvidenceRef(kind="artifact", ref_id=item.artifact.artifact_id) for item in (*inputs, *candidates)),
         )
         self._save_task_manifest(run, state, contract, payload, evidence)
-        permitted = self._permitted_tools(contract)
+        task_budget, run_budget = payload["budget"]["task"], payload["budget"]["run"]
+        repair_exhausted = self._repair_exhausted(state, contract, verification)
         controls_only = (
-            state.current_iteration >= contract.execution_policy.max_decisions
-            or state.action_count >= contract.execution_policy.max_action_steps
-            or used_actions >= limits.max_run_actions
+            not task_budget["decision_remaining"] or not run_budget["decision_remaining"]
+            or not task_budget["action_remaining"] or not run_budget["action_remaining"]
+            or repair_exhausted
             or ("real_rtl_lint" in contract.capability_requirements and state.action_count > 0)
             or (bool(VERILATOR_TOOLS.intersection(contract.capability_requirements)) and state.action_count > 0)
             or ("propose_eda_patch" in contract.capability_requirements and bool(candidates))
         )
-        try:
-            shortlist, _ = await asyncio.to_thread(
-                self.selector.select_for_task, contract, payload, permitted_tools=permitted, controls_only=controls_only,
+        allow_submit = not verification or (
+            not repair_exhausted and (
+                any(spec.artifact_type == "report" and spec.media_type.startswith("text/") for spec in contract.outputs)
+                or self._submission(candidates) not in self.repo.failed_submissions(state.task_id, state.generation)
             )
+        )
+        shortlist, _ = self.selector.select_for_task(
+            contract, payload, permitted_tools=self._permitted_tools(contract),
+            controls_only=controls_only, allow_submit=allow_submit,
+        )
+        try:
             reflection, selection = await asyncio.to_thread(
                 self.runtime.reflect_and_select, contract, payload, shortlist, evidence,
             )
-            reflection.validate_decision(contract, selection.name, evidence)
+            reflection.validate_decision(contract, selection.name, evidence, tool_arguments=selection.arguments)
             if selection.name not in {tool.name for tool in shortlist}:
                 raise ValueError("Selected tool is outside shortlist")
+            if reflection.decision == "replan":
+                issue = selection.arguments.get("plan_issue")
+                if not replanning_enabled or (issue is None and not repair_exhausted):
+                    raise ValueError("Replanning requires current PlanIssue evidence or exhausted repairs")
+                if issue is not None:
+                    issue = PlanIssue.model_validate(issue)
+                    if not set(issue.evidence) <= set(evidence) or not set(issue.related_artifact_ids) <= {
+                        ref.ref_id for ref in evidence if ref.kind == "artifact"
+                    }:
+                        raise ValueError("PlanIssue cites unavailable evidence")
         except (ValueError, TimeoutError, ModelInvocationError):
             self._record(state, action_id, "decision", "denied", "模型决策或工具选择未通过校验。")
             return True
@@ -578,6 +583,17 @@ class TaskExecutorService:
             result = TaskActionResult(outcome="failed", summary="Run 工具动作额度已耗尽。", error_code="run_action_budget")
             self._record(state, action["action_id"], name, "denied", result.summary, result=result)
             return True
+        if not replay:
+            last_verification = self.repo.last_verification(state.task_id, state.generation)
+            repair_exhausted = self._repair_exhausted(state, contract, last_verification)
+            if (repair_exhausted and (counted or name == "submit_task_output")) or (
+                counted and (state.current_iteration >= contract.execution_policy.max_decisions
+                             or self.repo.usage(run.run_id)[1] >= limits.max_run_decisions)
+            ):
+                result = TaskActionResult(outcome="failed", summary="当前预算仅允许可用的控制动作。",
+                                          error_code="task_decision_budget")
+                self._record(state, action["action_id"], name, "denied", result.summary, result=result)
+                return True
         lint = name == "verilator_lint"
         eda = name in VERILATOR_TOOLS
         external = lint or eda
@@ -636,6 +652,12 @@ class TaskExecutorService:
                 return item.artifact
 
             result = await self.actions.execute_task_action(context, result, stage)
+        if name == "submit_task_output" and result.outcome == "observed":
+            submitted = set(result.candidate_artifact_ids)
+            signature = self._submission(item for item in (*context.inputs, *staged) if item.artifact.artifact_id in submitted)
+            if signature in self.repo.failed_submissions(state.task_id, state.generation):
+                result = TaskActionResult(outcome="failed", summary="请先修正已经验收失败的交付件。",
+                                          error_code="unchanged_submission")
         if result.outcome == "observed" and staged:
             provenance = result.evidence or tuple(
                 EvidenceRef(kind="artifact", ref_id=item.artifact.artifact_id)
@@ -737,6 +759,39 @@ class TaskExecutorService:
             "verified_outputs": [item.artifact.model_dump(mode="json")
                                  for item in self.repo.local_outputs(state.task_id, "verified", state.generation)],
         }
+
+    def _resolve_task_failure(
+        self, run: RunView, plan: TaskPlan, contract: TaskContract, state: TaskState, action: dict,
+        result: TaskActionResult, inputs: tuple[ArtifactPayload, ...], limits: RunExecutionPolicy, enabled: bool,
+    ) -> bool:
+        reflection = self.repo.db.loads(action["reflection_json"], {}).get("result", {})
+        # Older checkpoints expressed a PlanIssue through report_task_failure + fail.
+        wants_replan = reflection.get("decision") == "replan" or result.plan_issue is not None
+        if enabled and wants_replan:
+            used_actions, used_decisions = self.repo.usage(run.run_id)
+            if used_actions >= limits.max_run_actions or used_decisions >= limits.max_run_decisions:
+                self._finish(run, "failed", f"Run 执行预算已耗尽。{result.summary}", plan_id=plan.plan_id)
+                return False
+            if self.repo.replan_count(run.run_id) >= limits.max_replans:
+                self._finish(run, "failed", f"重规划提案额度已耗尽。{result.summary}", plan_id=plan.plan_id)
+                return False
+            if result.plan_issue is not None:
+                handled = self._handle_plan_issue(plan, state, action["action_id"], result, inputs, limits)
+                if handled is not None:
+                    return handled
+            else:
+                verification = self.repo.last_verification(state.task_id, state.generation)
+                if self._repair_exhausted(state, contract, verification) and not any(
+                    item.error in NON_REPLAN_ERRORS for item in self.repo.observations(state.task_id, state.generation)
+                ):
+                    feedback = VerificationResult.model_validate_json(verification["result_json"])
+                    if feedback.repairable and not feedback.passed:
+                        self.repo.request_replan(plan, state, ReplanTrigger(
+                            kind="repair_exhausted", task_id=state.task_id, reason=result.summary, evidence=feedback.evidence,
+                        ))
+                        return True
+        self._finish(run, "failed", result.summary, plan_id=plan.plan_id)
+        return False
 
     def _handle_plan_issue(
         self, plan: TaskPlan, state: TaskState, action_id: str, result: TaskActionResult,
@@ -865,7 +920,7 @@ class TaskExecutorService:
             raise StaleExecution(action_id)
 
     def _verify(
-        self, run: RunView, plan: TaskPlan, contract: TaskContract, state: TaskState, action: dict, replanning_enabled: bool,
+        self, run: RunView, plan: TaskPlan, contract: TaskContract, state: TaskState, action: dict,
     ) -> bool:
         result = TaskActionResult.model_validate_json(action["result_json"])
         ids = set(result.candidate_artifact_ids)
@@ -877,6 +932,9 @@ class TaskExecutorService:
             self.verifier.verify(contract, submitted, inputs, plan.success_criteria)
             if verification.passed and state.task_id == plan.final_task_id else None
         )
+        if (state.repair_attempts < contract.execution_policy.max_repair_attempts
+            and self.repo.last_verification(state.task_id, state.generation) and result.error_code != "lint_failed"):
+            state = state.model_copy(update={"repair_attempts": state.repair_attempts + 1})
         if verification.passed and (global_result is None or global_result.passed):
             completed = state.model_copy(update={
                 "status": "completed", "phase": None, "completed_at": now(),
@@ -886,40 +944,73 @@ class TaskExecutorService:
                 raise StaleExecution(action["action_id"])
             return True
         failure = global_result if global_result is not None and not global_result.passed else verification
-        if result.error_code != "lint_failed" and failure.repairable and state.repair_attempts < contract.execution_policy.max_repair_attempts and state.current_iteration < contract.execution_policy.max_decisions:
-            repaired = state.model_copy(update={"phase": "repairing", "repair_attempts": state.repair_attempts + 1})
+        if result.error_code != "lint_failed" and failure.repairable:
+            repaired = state.model_copy(update={"phase": "repairing"})
             if not self.repo.record_verification(repaired, action["action_id"], verification, tuple(ids), global_result=global_result):
                 raise StaleExecution(action["action_id"])
             return True
         failed = state.model_copy(update={
             "status": "failed", "phase": None, "completed_at": now(), "failure_reason": "交付件未通过独立验收。",
         })
-        message = result.summary if result.error_code == "lint_failed" else "交付件未通过独立验收，修正额度已耗尽。"
-        trigger = None
-        if (replanning_enabled and result.error_code != "lint_failed" and failure.repairable
-            and state.repair_attempts >= contract.execution_policy.max_repair_attempts
-            and state.current_iteration < contract.execution_policy.max_decisions
-            and not any(item.error in NON_REPLAN_ERRORS for item in self.repo.observations(state.task_id, state.generation))):
-            trigger = ReplanTrigger(kind="repair_exhausted", task_id=state.task_id, reason=message, evidence=failure.evidence)
-        if not self.repo.record_verification(failed, action["action_id"], verification, tuple(ids), global_result=global_result, trigger=trigger):
+        message = result.summary if result.error_code == "lint_failed" else "交付件未通过确定性验收。"
+        if not self.repo.record_verification(failed, action["action_id"], verification, tuple(ids), global_result=global_result):
             raise StaleExecution(action["action_id"])
-        if trigger:
-            return True
         self._finish(run, "failed", message, plan_id=plan.plan_id)
         return False
 
-    def _decision_context(self, run, request, contract, observations, inputs, candidates, verification) -> dict:
+    @staticmethod
+    def _repair_exhausted(state: TaskState, contract: TaskContract, verification: dict | None) -> bool:
+        return verification is not None and state.repair_attempts >= contract.execution_policy.max_repair_attempts
+
+    @staticmethod
+    def _submission(items: Iterable[ArtifactPayload]) -> frozenset[tuple[str, str]]:
+        return frozenset((item.artifact.output_key, item.artifact.content_hash) for item in items)
+
+    def _decision_context(
+        self, run: RunView, request: ChatRequest, plan: TaskPlan, contract: TaskContract, state: TaskState,
+        observations: tuple[Observation, ...], inputs: tuple[ArtifactPayload, ...], candidates: tuple[ArtifactPayload, ...],
+        verification: dict | None, limits: RunExecutionPolicy, replanning_enabled: bool,
+    ) -> dict:
+        actions, decisions = self.repo.usage(run.run_id)
+        task_limits = contract.execution_policy
+        tokens = self.contexts.tokens
         payload = {
             "message": contract.goal,
             "rtl_path": request.rtl_path if "read_rtl" in contract.capability_requirements else None,
-            "observations": [item.model_dump(mode="json") for item in observations],
-            "artifacts": [{
-                **item.artifact.model_dump(mode="json"),
-                "text": self._artifact_summary(item),
-            } for item in (*inputs, *candidates)],
+            "observations": [
+                {**item.model_dump(mode="json"), "summary": tokens.trim(item.summary, 180)}
+                for item in observations
+            ],
+            "artifacts": [item.artifact.model_dump(mode="json") for item in (*inputs, *candidates)],
             "verification_feedback": json.loads(verification["result_json"]) if verification else None,
+            "replanning_enabled": replanning_enabled,
+            "plan_tasks": [{"task_id": task.task_id, "title": task.title} for task in plan.tasks],
+            "budget": {
+                "task": self._budget(
+                    action=(state.action_count, task_limits.max_action_steps),
+                    decision=(state.current_iteration, task_limits.max_decisions),
+                    repair=(state.repair_attempts, task_limits.max_repair_attempts),
+                ),
+                "run": self._budget(
+                    action=(actions, limits.max_run_actions), decision=(decisions, limits.max_run_decisions),
+                    replan=(self.repo.replan_count(run.run_id), limits.max_replans),
+                ),
+            },
             "output_guidance": "报告在 submit_task_output.text_outputs 提交，引用每份分析和 Lint 结果为 [artifact:ID]。",
         }
+        if state.generation > 1:
+            previous_generation = state.generation - 1
+            previous = self.repo.last_verification(state.task_id, previous_generation)
+            attempt = next((item for item in reversed(self.repo.attempts(run.run_id, state.task_id))
+                            if item["generation"] == previous_generation), {})
+            feedback = self.repo.db.loads(previous["result_json"], {}) if previous else {}
+            reason = attempt.get("failure_reason")
+            if (feedback and not feedback.get("passed")) or reason:
+                payload["previous_attempt_feedback"] = {
+                    "failed_criteria": feedback.get("failed_criteria", ()),
+                    "suggestions": feedback.get("suggestions", ()),
+                    "failure_reason": tokens.trim(reason, 200) if reason else None,
+                }
         if contract.assigned_agent == run.primary_agent:
             snapshot = json.loads(self.repo.checkpoint(run.run_id)["snapshot"])
             payload["user_request"] = run.user_instruction
@@ -941,19 +1032,88 @@ class TaskExecutorService:
                 project = next(item for item in inputs if item.artifact.artifact_type == "project_manifest")
                 files = FrozenProject.model_validate_json(project.content).files
                 payload["repair_source"] = files.get(request.eda_repair_path, "")[:65_000]
+        remaining = min(4_000, max(0, self.contexts.token_budget - tokens.count(self.repo.db.dumps(payload))))
+        query = " ".join((
+            contract.goal, payload.get("user_request", ""), *(criterion.description for criterion in contract.acceptance_criteria),
+            *(item.summary for item in observations[-2:]),
+        ))
+        artifacts = zip(payload["artifacts"], (*inputs, *candidates), strict=True)
+        for view, item in sorted(artifacts, key=lambda pair: pair[1].artifact.artifact_type != "rtl_snapshot"):
+            if item.artifact.artifact_type == "rtl_snapshot":
+                source = self._rtl_excerpt(item, query, min(1_800, remaining) - 8)
+                fields = {"rtl_source": source} if source is not None else {}
+            else:
+                summary = self._artifact_summary(item, min(1_000, remaining))
+                fields = {"text": summary} if summary is not None else {}
+            if fields:
+                view.update(fields)
+                remaining -= tokens.count(self.repo.db.dumps(fields))
         return payload
 
-    @staticmethod
-    def _artifact_summary(item: ArtifactPayload) -> str | None:
-        if item.artifact.artifact_type == "rtl_snapshot":
+    def _rtl_excerpt(self, item: ArtifactPayload, query: str, limit: int) -> dict | None:
+        try:
+            source = self.verifier._snapshot(item)
+        except (KeyError, ValueError):
             return None
-        if item.artifact.artifact_type == "project_manifest":
-            project = FrozenProject.model_validate_json(item.content)
-            return json.dumps({
-                "manifest": project.manifest.model_dump(mode="json"), "input_hash": project.input_hash,
-                "file_hashes": project.hashes,
-            }, ensure_ascii=False)[:16_000]
-        return item.content.decode("utf-8")[:16_000]
+        content = item.content.decode("utf-8")
+        lines = content.splitlines()
+        excerpts = [{"start_line": 1, "end_line": len(lines), "text": content}]
+        details = {
+            "relative_path": source.relative_path, "content_hash": source.content_hash,
+            "total_lines": source.line_count, "truncated": False, "excerpts": excerpts,
+        }
+        tokens = self.contexts.tokens
+        if tokens.count(self.repo.db.dumps(details)) <= limit:
+            return details
+        details["truncated"] = True
+        excerpts.clear()
+        if tokens.count(self.repo.db.dumps(details)) > limit:
+            return None
+        terms = set(re.findall(r"[a-z_][a-z_0-9]{2,}", query.lower()))
+        windows = [(start, "\n".join(lines[start:start + 24])) for start in range(0, len(lines), 24)]
+        windows.sort(key=lambda part: -len(terms.intersection(re.findall(r"[a-z_][a-z_0-9]{2,}", part[1].lower()))))
+        for start, body in windows:
+            excerpts.append({"start_line": start + 1, "end_line": min(len(lines), start + 24), "text": body})
+            if tokens.count(self.repo.db.dumps(details)) > limit:
+                excerpts.pop()
+            if len(excerpts) == 3:
+                break
+        excerpts.sort(key=lambda part: part["start_line"])
+        return details
+
+    @staticmethod
+    def _budget(**usage: tuple[int, int]) -> dict[str, int]:
+        return {
+            f"{name}_{field}": value for name, (used, limit) in usage.items()
+            for field, value in (("used", used), ("limit", limit), ("remaining", max(0, limit - used)))
+        }
+
+    def _artifact_summary(self, item: ArtifactPayload, limit: int) -> str | None:
+        tokens = self.contexts.tokens
+        if limit <= 40:
+            return None
+        try:
+            self.verifier._check_content(item)
+            content = item.content.decode("utf-8")
+            if item.artifact.artifact_type == "project_manifest":
+                project = FrozenProject.model_validate_json(item.content)
+                content = self.repo.db.dumps({
+                    "manifest": project.manifest.model_dump(mode="json"), "input_hash": project.input_hash,
+                    "file_hashes": project.hashes,
+                })
+            elif item.artifact.artifact_type == "eda_result":
+                receipt = json.loads(content)
+                result = receipt["result"]
+                fields = ("tool_name", "tool_version", "status", "exit_code", "input_hash", "metrics")
+                content = self.repo.db.dumps({
+                    "tool_run_id": receipt["tool_run_id"], "result": {key: result[key] for key in fields if key in result},
+                })
+        except (KeyError, TypeError, ValueError):
+            return None
+        summary = tokens.trim(content, limit - 24)
+        if tokens.count(self.repo.db.dumps({"text": summary})) > limit:
+            summary = tokens.trim(content, (limit - 24) // 2)
+        return summary if tokens.count(self.repo.db.dumps({"text": summary})) <= limit else None
 
     def _save_task_manifest(self, run, state, contract, payload, evidence) -> None:
         snapshot = payload.get("conversation", {}).get("_context_manifest", {})

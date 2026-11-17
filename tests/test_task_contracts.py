@@ -173,7 +173,7 @@ def test_combined_reflection_selection_checks_evidence_and_decision(monkeypatch,
         }
 
     agent = LLMChipDesignRuntime()
-    monkeypatch.setattr(agent, "_provider", lambda: SimpleNamespace(choose_tool=choose_tool))
+    monkeypatch.setattr(agent, "_reflection_provider", lambda: (SimpleNamespace(choose_tool=choose_tool), True))
     shortlist = [tool_registry.get("analyze_rtl_design").definition]
     parsed, selection = agent.reflect_and_select(contract, {"observations": ["read"]}, shortlist, (evidence,))
     assert isinstance(parsed, ReflectionResult) and selection.name == "analyze_rtl_design" and len(calls) == 1

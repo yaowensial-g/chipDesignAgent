@@ -1,4 +1,4 @@
-"""Deterministic acceptance checks for the read-only task engine."""
+"""Deterministic artifact, format, provenance and contract checks; semantic review belongs to Reflection."""
 
 from hashlib import sha256
 import json
@@ -27,6 +27,11 @@ class TaskVerifierService:
         failed = []
         snapshots: dict[str, RTLSourceSnapshot] = {}
 
+        for item in inputs:
+            try:
+                self._check_content(item)
+            except ValueError:
+                failed.append("invalid_input")
         for item in (*inputs, *submitted):
             if item.artifact.artifact_type == "rtl_snapshot":
                 try:

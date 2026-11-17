@@ -356,7 +356,9 @@ class TaskActionService:
             return self._failure("analysis_unavailable", "RTL 分析模型当前无法完成请求。")
         except TimeoutError:
             return self._failure("analysis_unavailable", "RTL 分析模型当前无法完成请求。")
-        except (PermissionError, ValueError, KeyError, OSError):
+        except PermissionError:
+            return self._failure("action_permission_denied", "工程动作被文件或资源访问权限拒绝。")
+        except (ValueError, KeyError, OSError):
             return self._failure("invalid_action_input_or_output", "工具输入或输出未通过检查。")
         return self._failure("capability_gap", "当前任务执行入口尚未接入该工具。")
 

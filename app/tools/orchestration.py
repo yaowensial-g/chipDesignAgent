@@ -191,7 +191,7 @@ def register_orchestration_tools() -> None:
              },
          },
          ["output_keys"], "compose_report", roles),
-        ("report_task_failure", "报告无法继续执行的原因",
+        ("report_task_failure", "终止当前任务，或在 Reflection 选择 replan 时报告规划问题或修复耗尽",
          {"reason": {"type": "string", "minLength": 1, "maxLength": 4000}, "plan_issue": plan_issue},
          ["reason"], None, roles),
         ("analyze_rtl_design", "依据绑定的 RTL 快照分析设计并引用源码行",

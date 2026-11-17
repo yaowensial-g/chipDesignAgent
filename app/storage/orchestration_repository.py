@@ -613,7 +613,7 @@ class OrchestrationRepository:
 
     def record_verification(
         self, state: TaskState, action_id: str, result: VerificationResult, artifact_ids: tuple[str, ...],
-        *, global_result: VerificationResult | None = None, trigger: ReplanTrigger | None = None,
+        *, global_result: VerificationResult | None = None,
     ) -> bool:
         with self.db.transaction() as conn:
             stored = conn.execute(
@@ -641,7 +641,6 @@ class OrchestrationRepository:
                     self._audit_late(conn, state, action_id, {"verification": result.model_dump(mode="json"), "artifact_id": artifact_id})
                     result = VerificationResult(passed=False, failed_criteria=("approval_target_changed",))
                     global_result = None
-                    trigger = None
                     state = state.model_copy(update={"status": "failed", "phase": None, "artifact_ids": (),
                                                      "failure_reason": "外部结果的审批已失效，未发布交付件。", "completed_at": now()})
                     break
@@ -681,8 +680,6 @@ class OrchestrationRepository:
             self.event(conn, state.run_id, event, "独立验收通过。" if passed else "交付件未通过独立验收。", task_id=state.task_id)
             if passed:
                 self.event(conn, state.run_id, "task_completed", "任务交付件已发布。", task_id=state.task_id)
-            if trigger is not None:
-                self._set_trigger(conn, state.run_id, trigger)
             return True
 
     def last_verification(self, task_id: str, generation: int = 1) -> dict | None:
@@ -690,6 +687,23 @@ class OrchestrationRepository:
             """SELECT v.* FROM orchestration_verifications v JOIN orchestration_actions a ON a.action_id=v.action_id
                WHERE a.task_id=? AND a.generation=? ORDER BY a.generation_sequence DESC, v.scope LIMIT 1""", (task_id, generation),
         )
+
+    def failed_submissions(self, task_id: str, generation: int) -> set[frozenset[tuple[str, str]]]:
+        """Compare rejected output keys and bytes even when a tool stages a new Artifact ID."""
+        rows = self.db.fetch_all(
+            """SELECT v.action_id, a.output_key, a.content_hash
+               FROM orchestration_verifications v JOIN orchestration_actions d USING(action_id)
+               LEFT JOIN json_each(v.artifact_ids_json) ids
+               LEFT JOIN orchestration_artifacts a ON a.artifact_id=ids.value
+               WHERE d.task_id=? AND d.generation=? AND json_extract(v.result_json,'$.passed')=0""",
+            (task_id, generation),
+        )
+        submissions: dict[str, set[tuple[str, str]]] = {}
+        for row in rows:
+            outputs = submissions.setdefault(row["action_id"], set())
+            if row["output_key"] is not None:
+                outputs.add((row["output_key"], row["content_hash"]))
+        return {frozenset(outputs) for outputs in submissions.values()}
 
     def verifications(self, task_id: str, generation: int = 1) -> list[dict]:
         rows = self.db.fetch_all(

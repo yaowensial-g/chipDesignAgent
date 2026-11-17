@@ -37,7 +37,7 @@ flowchart TD
     GP --> PV["Python · 权限、契约和 DAG 校验"]
     PV --> TE["TaskExecutorService · 串行调度 READY 节点"]
     TE --> TC["任务上下文 · 固定输入版本与角色范围"]
-    TC --> LR["Local ReAct · Selector → Reflection 与下一步决策"]
+    TC --> LR["Local ReAct · Registry 筛选 → 单次 Reflection 与动作决策"]
     LR --> GATE["执行闸 · Registry / Schema / 约束 / 审批"]
     GATE --> X["_execute · 单动作分发"]
     X --> P["DS Workflow / RTL Patch / ToolRun / Delegate / Mock"]
@@ -76,14 +76,17 @@ flowchart TD
 
 ### Local ReAct 与执行闸
 
-每轮传入 `TaskContract`、当前代次 `TaskState`、绑定的 Artifact 正文片段、角色可见上下文、新 Observation 和上轮验收结果。Selector 先从 `Registry.for_role(assigned_agent)` 与任务允许的能力和副作用范围交集筛选。Runtime 用一次 Function Calling 同时返回结构化 Reflection 与下一步动作。任务模式下，将各候选函数的参数包装为 `{reflection, tool_arguments}`，后端拆包为 `ReflectionResult` 和现有 `ToolSelection`，再按 Registry 原始 Schema 验证 `tool_arguments`。旧路径保留既有函数格式。
+每轮根据 Registry、任务能力、角色、Mutability 和状态确定性筛选工具。一次 Function Calling 同时返回 `ReflectionResult` 和 `ToolSelection`，后端按 Registry Schema 校验参数。Reflection 根据目标、候选和绑定产物、近期 Observation、验收反馈及预算判断工作进度和语义质量。预算来自任务代次和 Run 的持久化计数，决策剩余额度已扣除当前决策。Legacy 对话继续使用轻量 Selector。
+
+任务上下文从当前代次绑定或暂存的 RTL 快照生成源码片段，带相对路径、行号、总行数、SHA-256 和截断标记。预算充足时保留小文件正文，大文件按与任务目标、验收条件及近期 Observation 的相关词选择行段。RTL 片段与产物摘要共用最多 4,000 Token 的预算。新增源码片段和上一代的扩展失败反馈只发送至获授权的 `https://api.deepseek.com`，复用禁用重定向和环境代理的模型客户端。其他主模型端点保留原有证据范围。
 
 | Reflection 决策 | 绑定动作与后端行为 |
 | --- | --- |
 | `continue` | 选择一个经筛选的任务工具。后端校验、检查预算，再派发。 |
-| `submit` | 对应 `submit_task_output`，提交交付草稿或待验 Artifact 引用，进入独立验收。 |
+| `submit` | 对应 `submit_task_output`。模型须将全部验收条件判断为已满足，随后进入确定性验收。 |
+| `replan` | 对应 `report_task_failure`。有证据的 PlanIssue 或本代修复额度耗尽可以请求增量重规划。 |
 | `ask_user` | 对应 `ask_user`，提交明确问题及所缺输入。后端确认等待条件，专家问题经主 Agent 转达。 |
-| `fail` | 对应 `report_task_failure`，返回缺口或无法推进的证据，由后端选择阻塞、失败或恢复路径。 |
+| `fail` | 对应 `report_task_failure`，记录失败并结束该路径。 |
 
 首次决策可基于契约和已绑定输入，后续决策关联触发它的 Observation 或验收记录。后端验证条件 ID 属于当前契约，已满足与未满足集合互斥并覆盖验收条件，证据属于本次任务的可见输入，且决策与工具一致。持久化进度摘要、条件 ID、问题、决策和简短业务理由。反思是 Agent 的阶段性判断，验收表记录 Verifier 的结论。Reflection 与对应决策事件同事务落库，再派发工具，重启可恢复到该决策。格式非法、直接文本或越权选择计入决策额度并记录拒绝原因。若结果刚落库而预算已耗尽，保留 Observation 并写明后端停止原因。
 
@@ -102,8 +105,8 @@ flowchart TD
 | 后端配置 | 默认值 | 计数边界 |
 | --- | --- | --- |
 | `max_action_steps` | 8 | 每 Task 执行代次。首次领取并准备派发 `action_id` 时计数，执行失败也计。审批前挂起、恢复同一动作、轮询和重复回调无需另计。额度耗尽仍可提交验收、提问或报告失败。 |
-| `max_repair_attempts` | 3 | 每 Task 执行代次。验收失败后，只有可修复且后端进入修正时才递增。首次验收加最多三轮修正，共享该代次剩余动作与决策额度。 |
-| `max_decisions` | 16 | 每 Task 执行代次。每次发起合并的 Reflection 与动作选择前计数，包括无效返回和模型调用错误。最后一个决策槽仅允许提交、提问或报告失败。Selector 与 Verifier 调用计入 Run 总模型用量。 |
+| `max_repair_attempts` | 3 | 首次验收失败后，实际进入确定性验收的不同提交计入修复额度。重规划时保留已用次数。当前代次验收失败且修复用尽后仅提供可用控制工具，禁止普通修复和重复提交。 |
+| `max_decisions` | 16 | 每 Task 执行代次。Reflection 前预留，包括无效返回和模型调用错误。任务或 Run 的最后一个决策槽只提供控制工具。决策耗尽后运行时停止发起 Reflection。 |
 | `max_replans` | 2 | 每 Run。调用前记账，非法提案和中断也计入。串行 RTL 路径的启用方式见第 13 节。 |
 | `max_plan_tasks` | 8 | 每个候选计划版本校验节点总量，重规划同样受限。 |
 
@@ -126,7 +129,7 @@ flowchart TD
 
 `TaskVerifierService.verify(contract, state, observations, candidates)` 先验证引用范围、来源动作、可读取性和内容哈希，再检查必需输出的存在性、数量、类型、结构与工程状态。验收规则由后端注册，契约引用规则 ID 和受限配置，例如 JSON Pydantic 模型、DS Markdown 章节、工作区快照、批准应用的 Patch 状态与结果哈希、真实 EDA ToolRun 的退出状态与日志。启用并获审批的 Verilator 通过已有 ToolRun 产出语法证据；Verifier 消费该证据，缺少时返回失败或可修复建议。Mock 输出仅能满足模拟链路验收。
 
-复杂分析采用独立评审调用，明确要求引用已提供的证据 ID，后端校验引用归属、范围、完整性以及硬性验收结果。状态、审批、只读约束依据服务记录与动作账本校验。评审输出异常、缺证据或规则未知均不得放行。结构化结果包含 `passed/failed_criteria/repairable/suggestions/evidence`，随执行代次和待验 Artifact 集落库。通过后将输出标记为可消费并完成任务，两个变更在同一事务；失败保留候选与原因作为修正输入。
+Reflection 负责对实现质量、逻辑、功能覆盖和语义证据作出判断。Verifier 以同一代次的 Artifact 和 ToolRun 记录执行确定性校验，结果包含 `passed/failed_criteria/repairable/suggestions/evidence`。验收通过后原子发布产物并完成任务。可修复失败保留候选和原因，任务进入 `running/repairing`。对候选的输出键和内容哈希去重，包括新 ID 但内容相同的候选。真实 Lint 和仿真的证明仍须来自受审批的实际工具结果。
 
 ### Replanner 与 Delegate
 
@@ -265,7 +268,7 @@ class ReflectionResult(ContractModel):
     satisfied_criteria: tuple[Key, ...]
     unmet_criteria: tuple[Key, ...]
     issues: tuple[Text, ...]
-    decision: Literal["continue", "submit", "ask_user", "fail"]
+    decision: Literal["continue", "submit", "replan", "ask_user", "fail"]
     reason: Text
     evidence: tuple[EvidenceRef, ...] = ()
 
@@ -615,7 +618,7 @@ async def aggregate_and_finish(state):
 | 中途补充信息 | 现有普通 `ask_user` 的等待无通用 Resume 分支。新路径由等待项和 Run 输入修订提供通用恢复，用户决定先落库再运行。已完成或失败的终态 Run 保持可审计，新指令创建可引用其 Artifact 的新 Run。 |
 | 并发 Session / Workspace | 当前 `active_run_id` 只有一个，事件序号也存在读写竞争。用 Run ID、计划版本、代次、输入快照与事务隔离；跨 Run 的真实文件写入仍按目标路径竞争控制。会话角色切换只影响后续 Run，恢复授权由原 Run 和当前后端权限共同决定。 |
 | 旧 API 与前端 | 旧历史 Run 保持 `RunView`、原 `RunType`、单值 `legacy_task_id/tool_run_id/patch_id` 和已有恢复分支。新 Run 固定 `run_type=orchestration`，多专业对象在任务视图展开；旧兼容字段仅对存在唯一对应对象的 Run 投影。当前 `frontend/src/App.tsx:714` 按 `rtl_implementation` 显示审批卡，`:377` 依赖 `legacy_task_id` 选择 DS Resume 路径。阶段 4 改为以当前等待项的类型和专业引用渲染，继续支持旧视图。新路径的获取接口只读，旧 ToolRun GET 投影保留到独立迁移。 |
-| 延迟与调用成本 | 全局规划、独立验收和重规划新增模型调用。简单问答保持单任务，并以确定性检查验收输出。串行调度首版使用明确模型决策和总预算、分阶段 Manifest，以及可恢复异步处理，避免延长单次 HTTP 到整个工程任务完成。 |
+| 延迟与调用成本 | 全局规划、局部 Reflection 和重规划分别消耗其阶段的模型预算。任务工具筛选与工程验收通过后端规则执行。简单问答保持单任务。 |
 
 ## 9. 基线验证
 
@@ -716,8 +719,8 @@ $env:CHIP_AGENT_VERILATOR_PATH = 'C:\tools\verilator\bin\verilator_bin.exe'
 
 ### 触发与验收
 
-- 独立 Verifier 先验收候选产物，失败时优先使用局部 Repair。Repair 用尽后，执行器根据失败类别和剩余额度决定是否排队重规划。
-- `report_task_failure` 可以携带 `PlanIssue`。后端核对当前任务、计划节点、实际 Observation 和可见产物。缺少必要输入、权限不足、审批拒绝、工具缺失和未知外部结果均按原流程等待或结束。
+- Verifier 写入可修复的失败结果后返回 Reflection。Repair 用尽时由 Reflection 决定 `replan` 或 `fail`，运行时复核开关、原因和预算，再接受触发请求。
+- `replan` 和 `report_task_failure` 可携带 `PlanIssue`。后端核对当前任务、计划节点、实际 Observation 和可见产物。省略 `PlanIssue` 时必须已有本代验收失败且 Repair 用尽。权限不足、审批拒绝、工具缺失和未知外部结果继续按安全策略终止。后端仍独立处理已验收 Blob 的确定性损坏。
 - 已验收 Artifact 的失效需要独立 Verifier 的确定性证据，或用户对指定 Artifact ID 的明确确认。Hash 用于检查已存字节与已记录版本是否一致。模型报告语义问题时，若规则无法证实，Run 进入 `artifact_invalidation` 等待。通过 `/runs/{run_id}/resume` 带 `wait_id` 批准或拒绝。用户确认失效后，后端沿当前代次的真实 Artifact 绑定计算生产者和递归消费者，并在同一事务中标记失效与持久化触发事件。
 - `ReplannerService` 向主模型请求一个 `PlanDelta`，支持新增、替换、移除未执行节点、调整依赖与输入、建议重跑和调整交付节点。新增节点使用提案内别名。后端生成 ID 和版本，用原 `PlanningPolicy` 复验角色、能力、工具、约束、验收、节点上限、DAG 和 UART 必需交付链。辅助节点可使用获准的只读 RTL 快照和报告能力。下游领取任务时绑定当前生产代次已验证的产物。
 - 保留无关的已完成代次及其绑定。仅增加控制边时，已有成果可沿用。已确认失效的输出及其实际消费者输出标记为 `invalidated`。新版本验证通过后替代的旧产物标记为 `superseded`。显式重跑或实质变更契约时，按已有输出绑定保守重跑数据消费者。重新执行的任务可读取本任务上一代的验收诊断，交付与证据引用使用当前代次的绑定。

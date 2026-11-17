@@ -44,8 +44,9 @@ class ProjectRuntime(ScriptedRuntime):
         assert name in {item.name for item in shortlist}
         decision = {"submit_task_output": "submit", "report_task_failure": "fail"}.get(name, "continue")
         return ReflectionResult(
-            progress="in_progress", progress_summary="Project operation", satisfied_criteria=(),
-            unmet_criteria=("evidence",), issues=(), decision=decision,
+            progress="in_progress", progress_summary="Project operation",
+            satisfied_criteria=("evidence",) if decision == "submit" else (),
+            unmet_criteria=() if decision == "submit" else ("evidence",), issues=(), decision=decision,
             reason="Use only requested project arguments", evidence=evidence,
         ), ToolSelection(name=name, arguments=arguments)
 

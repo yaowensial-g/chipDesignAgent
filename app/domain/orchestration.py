@@ -206,19 +206,25 @@ class ReflectionResult(ContractModel):
     satisfied_criteria: tuple[Key, ...]
     unmet_criteria: tuple[Key, ...]
     issues: tuple[Text, ...]
-    decision: Literal["continue", "submit", "ask_user", "fail"]
+    decision: Literal["continue", "submit", "replan", "ask_user", "fail"]
     reason: Text
     evidence: tuple[EvidenceRef, ...] = ()
 
     def validate_decision(
         self, contract: TaskContract, tool_name: str, visible_evidence: tuple[EvidenceRef, ...],
+        *, tool_arguments: dict | None = None,
     ) -> None:
         reported = (*self.satisfied_criteria, *self.unmet_criteria)
         expected = {criterion.criterion_id for criterion in contract.acceptance_criteria}
         if set(reported) != expected or len(reported) != len(expected):
             raise ValueError("Reflection must classify each criterion once")
-        if self.decision != TASK_CONTROLS.get(tool_name, "continue"):
+        allowed = {"fail", "replan"} if tool_name == "report_task_failure" else {TASK_CONTROLS.get(tool_name, "continue")}
+        if self.decision not in allowed:
             raise ValueError("Reflection decision does not match the selected tool")
+        if self.decision == "submit" and self.unmet_criteria:
+            raise ValueError("Cannot submit with unmet acceptance criteria")
+        if tool_arguments and "plan_issue" in tool_arguments and self.decision != "replan":
+            raise ValueError("PlanIssue requires an explicit replan decision")
         if any(item not in visible_evidence for item in self.evidence):
             raise ValueError("Reflection refers to unavailable evidence")
 
